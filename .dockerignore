@@ -1,0 +1,26 @@
+# Keep the build context small and deterministic.
+# .git in particular is large, changes every commit (busting the layer cache),
+# and on Windows forces OneDrive-style placeholder hydration on upload.
+
+.git
+.gitignore
+.gitattributes
+.github
+
+bin/
+*.exe
+*.test
+*.out
+coverage.*
+covdata/
+
+.dev/
+docs/
+deploy/k8s/
+deploy/compose/
+
+.idea/
+.vscode/
+.DS_Store
+desktop.ini
+Thumbs.db

@@ -1,0 +1,30 @@
+# Build output
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.test
+*.out
+coverage.*
+/covdata/
+
+# Local dev material written by `go run ./cmd/devkeys`.
+# Never commit signing keys, even dev ones — a committed dev key is a real key
+# the moment someone deploys with AUTH_MODE=dev by accident.
+/.dev/
+
+# Editor and OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
+desktop.ini
+Thumbs.db
+
+# The template is deliberately single-module. A fork that splits it adds this back.
+go.work
+go.work.sum

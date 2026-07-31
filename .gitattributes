@@ -1,0 +1,38 @@
+# This file is COMMIT #1, deliberately, before any generated file exists.
+#
+# Why it is load-bearing: on Windows `core.autocrlf=true` is a common default. Without
+# these rules, git checks out CRLF while every generator (buf, protoc-gen-go, gofmt)
+# writes LF. That silently breaks:
+#   - tools/codegen_uptodate_test.go  (regenerates to a temp dir and byte-compares)
+#   - every golden-file test
+#   - gofmt -l / golangci-lint in CI
+# The failure is red on a fresh clone for a reason the cloner cannot diagnose.
+#
+# test/repohygiene_test.go asserts no tracked text file contains CRLF, so this file
+# cannot silently stop working.
+
+* text=auto eol=lf
+
+*.go        text eol=lf
+*.mod       text eol=lf
+*.sum       text eol=lf
+*.proto     text eol=lf
+*.sql       text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+*.txt       text eol=lf
+Dockerfile  text eol=lf
+
+# Generated code: collapse in PR diffs and exclude from language statistics.
+gen/** linguist-generated=true
+
+# Golden files are byte-exact contracts. Never let git touch their bytes.
+*.golden           -text
+testdata/golden/** -text
+
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.binpb binary
