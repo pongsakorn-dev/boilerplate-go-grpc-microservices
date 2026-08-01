@@ -10,6 +10,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -25,14 +26,16 @@ func main() {
 		os.Exit(2)
 	}
 
+	ctx := context.Background()
+
 	var err error
 	switch os.Args[1] {
 	case "doctor":
-		err = doctor()
+		err = doctor(ctx)
 	case "clean":
-		err = clean()
+		err = clean(ctx)
 	case "race":
-		err = race()
+		err = race(ctx)
 	default:
 		usage()
 		os.Exit(2)
@@ -54,7 +57,7 @@ func usage() {
 
 // clean removes build output. In Go rather than `rm -rf` so it behaves the same on
 // Windows, and scoped to known paths so a typo cannot delete the repository.
-func clean() error {
+func clean(ctx context.Context) error {
 	targets := []string{"bin", "covdata", "coverage.out", "coverage.html"}
 	for _, t := range targets {
 		if err := os.RemoveAll(t); err != nil {
@@ -63,7 +66,7 @@ func clean() error {
 	}
 
 	// The build and test caches are owned by the toolchain, so ask the toolchain.
-	cmd := exec.Command("go", "clean", "-testcache")
+	cmd := exec.CommandContext(ctx, "go", "clean", "-testcache")
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("go clean -testcache: %w", err)
@@ -83,7 +86,7 @@ func clean() error {
 // This is a permanent limitation of the race detector (it links the C++ ThreadSanitizer
 // runtime), not a configuration gap, so the honest move is to detect it and offer the two
 // real options rather than emit a confusing toolchain error.
-func race() error {
+func race(ctx context.Context) error {
 	if _, err := exec.LookPath("gcc"); err != nil {
 		if runtime.GOOS == "windows" {
 			return errors.New(strings.TrimSpace(`
@@ -108,7 +111,7 @@ windows-latest CI leg proves compilation and non-race correctness only.`))
 		return errors.New("no C compiler found on PATH; the race detector requires cgo")
 	}
 
-	cmd := exec.Command("go", "test", "-race", "./...")
+	cmd := exec.CommandContext(ctx, "go", "test", "-race", "./...")
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=1")
 	return cmd.Run()
@@ -117,7 +120,7 @@ windows-latest CI leg proves compilation and non-race correctness only.`))
 // doctor reports what this machine can run. It never fails the build -- a machine without
 // Docker is a perfectly good machine for the default test tier, and saying so plainly is
 // more useful than a red X.
-func doctor() error {
+func doctor(ctx context.Context) error {
 	fmt.Printf("go            %s %s/%s\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
 
 	reportTool("docker", "integration and e2e tiers")
@@ -137,7 +140,7 @@ func doctor() error {
 	// contexts. On Docker Desktop the active context is usually desktop-linux, whose pipe
 	// is dockerDesktopLinuxEngine -- so a perfectly healthy daemon can be invisible to
 	// testcontainers, and the integration tier skips for a reason nobody can guess.
-	if out, err := exec.Command("docker", "context", "show").Output(); err == nil {
+	if out, err := exec.CommandContext(ctx, "docker", "context", "show").Output(); err == nil {
 		ctxName := strings.TrimSpace(string(out))
 		fmt.Printf("docker ctx    %s\n", ctxName)
 		if ctxName != "default" && os.Getenv("DOCKER_HOST") == "" {

@@ -5,7 +5,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"io/fs"
+	"os"
 	"strings"
 	"testing"
 
@@ -34,34 +34,48 @@ func usd(t *testing.T, units int64, nanos int32) order.Money {
 func TestNoFloatingPointInMoneyPath(t *testing.T) {
 	t.Parallel()
 
-	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
-		// Skip test files: this very file mentions "float64" as a string literal, and
-		// fixtures are allowed to be looser than the code they guard.
-		return !strings.HasSuffix(fi.Name(), "_test.go")
-	}, 0)
+	// parser.ParseFile over an explicit file list rather than parser.ParseDir: ParseDir is
+	// deprecated as of Go 1.25 because it ignores build tags when grouping files into
+	// packages. Listing the files here keeps the guard dependency-free and makes the
+	// exclusion rule visible.
+	entries, err := os.ReadDir(".")
 	if err != nil {
-		t.Fatalf("parse package: %v", err)
-	}
-	if len(pkgs) == 0 {
-		t.Fatal("parsed no packages -- the guard would silently pass forever")
+		t.Fatalf("read package directory: %v", err)
 	}
 
-	for _, pkg := range pkgs {
-		for _, file := range pkg.Files {
-			ast.Inspect(file, func(n ast.Node) bool {
-				id, ok := n.(*ast.Ident)
-				if !ok {
-					return true
-				}
-				if id.Name == "float32" || id.Name == "float64" {
-					t.Errorf("%s: %s appears in the domain package. Money must never touch "+
-						"floating point -- use Money's integer arithmetic instead.",
-						fset.Position(id.Pos()), id.Name)
-				}
-				return true
-			})
+	fset := token.NewFileSet()
+	scanned := 0
+
+	for _, entry := range entries {
+		name := entry.Name()
+		// Skip test files: this very file mentions "float64" as a string literal, and
+		// fixtures are allowed to be looser than the code they guard.
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
 		}
+
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		scanned++
+
+		ast.Inspect(file, func(n ast.Node) bool {
+			id, ok := n.(*ast.Ident)
+			if !ok {
+				return true
+			}
+			if id.Name == "float32" || id.Name == "float64" {
+				t.Errorf("%s: %s appears in the domain package. Money must never touch "+
+					"floating point -- use Money's integer arithmetic instead.",
+					fset.Position(id.Pos()), id.Name)
+			}
+			return true
+		})
+	}
+
+	if scanned == 0 {
+		t.Fatal("scanned no source files -- the guard would silently pass forever")
 	}
 }
 

@@ -1,0 +1,74 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  # The standard set, plus a small number of additions chosen because each one catches a
+  # class of bug that review reliably misses. A template that enables 60 linters gets its
+  # config deleted by the first person who forks it.
+  default: standard
+
+  enable:
+    # errors.Is/As instead of == and type assertions. Directly protects the domain error
+    # model: comparing with == silently stops working the moment an error is wrapped, and
+    # the failure is a mis-mapped gRPC code rather than a compile error.
+    - errorlint
+
+    # A returned error that is checked and then not returned. Almost always a bug, almost
+    # never spotted in review.
+    - nilerr
+
+    # HTTP request without a context. Un-cancellable outbound calls are how a graceful
+    # shutdown turns into a hung pod.
+    - noctx
+
+    # Unclosed response bodies leak connections.
+    - bodyclose
+
+    - copyloopvar
+    - unconvert
+    - usestdlibvars
+    - wastedassign
+    - misspell
+
+  settings:
+    errcheck:
+      # check-blank stays FALSE so that `_ = f()` is the explicit, greppable way to say
+      # "this error is deliberately ignored". Turning it on removes that escape hatch and
+      # leaves no way to express the intent except a nolint comment, which is worse:
+      # nolint suppresses the whole line, including errors added to it later.
+      check-blank: false
+
+    govet:
+      # `shadow` is deliberately NOT enabled.
+      #
+      # It flags `err` redeclared inside a closure or an if-scope, which is the single most
+      # idiomatic pattern in Go -- every `if err := f(); err != nil` inside a function that
+      # already has an `err` trips it. In this repo it produced five findings, all of them
+      # harmless and all of them made WORSE by the fix (renaming to getErr, updErr).
+      #
+      # A linter that mostly cries wolf trains people to add nolint comments, and a nolint
+      # comment suppresses the whole line including errors added to it later. Enabling it
+      # would make this template's linting less effective, not more.
+      enable-all: false
+
+  exclusions:
+    generated: lax
+    rules:
+      # Generated code is not ours to lint.
+      - path: ^gen/
+        linters: [errcheck, errorlint, govet, revive, staticcheck, unused]
+
+      # Tests legitimately ignore errors in setup and use long table literals.
+      - path: _test\.go
+        linters: [errcheck, noctx, bodyclose]
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/example/gomicro

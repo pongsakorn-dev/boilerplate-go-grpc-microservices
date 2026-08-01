@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: '1.26'
+
+jobs:
+  # The default tier, on BOTH platforms.
+  #
+  # Windows is not decoration here. This template's central claim is that it works on a
+  # machine with no make, no protoc and no C compiler, and the only way that claim stays
+  # true is if it is tested on the platform where it would break.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # buf breaking compares against main, which needs history.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
+
+  # -race is Linux-only, and that is a permanent constraint rather than an oversight.
+  #
+  # The race detector links the C++ ThreadSanitizer runtime, so it needs cgo and therefore
+  # a C toolchain. Requiring one on the Windows runner would misrepresent what a contributor
+  # can reproduce locally. The honest split: Windows proves it compiles and passes;
+  # Linux proves it is race-free.
+  race:
+    name: race (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - run: go test -race ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+
+  # Proto contract checks.
+  #
+  # buf breaking IS the contract test for a gRPC API. Consumer-driven contract tooling
+  # (Pact and friends) solves a problem that a schema plus a breaking-change detector
+  # already solves for protobuf, with far less machinery.
+  proto:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # buf is deliberately NOT a go.mod tool dependency -- see Taskfile.yml for why.
+      # This version string must match Taskfile.yml and tools/codegen_uptodate_test.go;
+      # test/toolpins_test.go asserts all three are identical.
+      - name: buf lint
+        run: go run github.com/bufbuild/buf/cmd/buf@v1.72.0 lint
+
+      - name: buf breaking (against main)
+        if: github.event_name == 'pull_request'
+        run: go run github.com/bufbuild/buf/cmd/buf@v1.72.0 breaking --against '.git#branch=origin/main'
+
+      # Committed generated code is only safe with this gate. Without it, gen/ silently
+      # rots the first time someone edits a .proto and forgets to regenerate.
+      - name: generated code is up to date
+        run: go test -tags=codegen ./tools/...
+
+  vuln:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
