@@ -41,11 +41,11 @@ const (
 // and structured logging. Covering only one of the three is the usual mistake.
 type Secret string
 
-func (s Secret) String() string                { return "[REDACTED]" }
-func (s Secret) GoString() string              { return "[REDACTED]" }
-func (s Secret) MarshalJSON() ([]byte, error)  { return []byte(`"[REDACTED]"`), nil }
-func (s Secret) LogValue() any                 { return "[REDACTED]" }
-func (s Secret) Reveal() string                { return string(s) }
+func (s Secret) String() string               { return "[REDACTED]" }
+func (s Secret) GoString() string             { return "[REDACTED]" }
+func (s Secret) MarshalJSON() ([]byte, error) { return []byte(`"[REDACTED]"`), nil }
+func (s Secret) LogValue() any                { return "[REDACTED]" }
+func (s Secret) Reveal() string               { return string(s) }
 
 // Config is the full runtime configuration.
 type Config struct {

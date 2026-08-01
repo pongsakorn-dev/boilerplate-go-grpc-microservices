@@ -156,7 +156,11 @@ func (a *App) MarkServing() {
 
 // Run binds the listeners and blocks until ctx is cancelled, then drains.
 func (a *App) Run(ctx context.Context) error {
-	grpcLn, err := net.Listen("tcp", a.cfg.GRPCAddr)
+	// ListenConfig rather than net.Listen: it takes a context, so a shutdown signal
+	// arriving mid-bind cancels the bind instead of leaving a socket open that nothing
+	// will ever close.
+	var lc net.ListenConfig
+	grpcLn, err := lc.Listen(ctx, "tcp", a.cfg.GRPCAddr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", a.cfg.GRPCAddr, err)
 	}

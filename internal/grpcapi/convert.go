@@ -29,7 +29,24 @@ func fromProtoMoney(m *orderv1.Money) (order.Money, error) {
 	if m == nil {
 		return order.Money{}, fmt.Errorf("%w: money is required", order.ErrInvalidItem)
 	}
-	return order.NewMoney(m.GetCurrencyCode(), m.GetUnits(), m.GetNanos())
+
+	// Validate the wire values EXACTLY as sent, rather than going through order.NewMoney.
+	//
+	// NewMoney normalizes first -- it uppercases the currency code and folds out-of-range
+	// nanos into units. That is the right behaviour for constructing money inside the
+	// domain, and the wrong behaviour at the boundary: it would silently accept "usd" and
+	// nanos=2000000000, both of which the .proto contract explicitly forbids via
+	// protovalidate. Two layers disagreeing about what is valid is how you get input that
+	// passes the handler and fails three services downstream.
+	money := order.Money{
+		CurrencyCode: m.GetCurrencyCode(),
+		Units:        m.GetUnits(),
+		Nanos:        m.GetNanos(),
+	}
+	if err := money.Validate(); err != nil {
+		return order.Money{}, err
+	}
+	return money, nil
 }
 
 func toProtoStatus(s order.Status) orderv1.OrderStatus {

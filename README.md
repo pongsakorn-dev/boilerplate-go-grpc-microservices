@@ -29,7 +29,8 @@ time than one that ships less.
 | In-memory store (`STORE_DRIVER=memory`) | ✅ Done | Same contract the Postgres adapter will satisfy |
 | Error model (`apperr`) | ✅ Done | One `Kind → gRPC code → HTTP status` table |
 | bufconn test harness | ✅ Done | Tests drive the **production** server |
-| Repo/import/toolchain guard tests | ⬜ M2 | CRLF, import boundaries, build-tag tiers, tool pins |
+| Repo/import/toolchain guard tests | ✅ Done | CRLF, import boundaries, build-tag tiers, tool pins, Taskfile portability |
+| CI (Linux + Windows), golangci-lint | ✅ Done | Lint is at 0 issues; `-race` runs on Linux |
 | Full interceptor chain + observability | ⬜ M3 | Metrics, tracing, logging, admission, validation |
 | Postgres via GORM + goose migrations | ⬜ M4 | `STORE_DRIVER=postgres` currently returns an explicit error |
 | Real auth (OIDC/JWKS) + default-deny policy | ⬜ M5 | **See the security note below** |
@@ -221,12 +222,34 @@ compile-time guarantee. That is the only way `go test ./...` is safe with Docker
 
 | Tier | Command | Infra | Measured on this machine |
 |---|---|---|---|
-| Default | `go tool task verify` | none | **2.8s** cold cache, **0.7s** cached |
+| Default | `go tool task verify` | none | **10.5s** cold cache, **0.9s** cached |
+| Codegen | `go tool task verify:codegen` | network | **17.6s** — regenerates and byte-compares |
 | Integration *(M4)* | `go tool task verify:int` | Docker | — |
 | End-to-end *(M10)* | `go tool task verify:e2e` | Docker + compose | — |
-| Codegen *(M2)* | `go tool task verify:codegen` | network | — |
 
-Current: **13 test functions across 4 files**, many table-driven with a dozen or more cases.
+Current: **42 test functions across 13 files**, many table-driven with a dozen or more cases.
+
+### Guard tests
+
+`test/` and `tools/` hold tests that assert nothing about business behaviour — they exist to
+stop the template rotting. Each has been verified to actually **fail** when violated, not
+merely to pass today:
+
+| Guard | Catches |
+|---|---|
+| `TestNoCRLFInTrackedFiles` | Line endings that would break codegen diffs and golden files |
+| `TestDomainImportsNothingHeavy` | The domain reaching for gRPC, GORM, protobuf, OTel |
+| `TestPlatformDoesNotImportServices` | `platform/` becoming order-service helpers |
+| `TestOnlyConfigReadsTheEnvironment` | A stray `os.Getenv` three layers down |
+| `TestBannedToolsAreNotToolDependencies` | buf/golangci-lint entering the `tool` directive |
+| `TestBufVersionIsConsistent` | The three buf pins drifting apart |
+| `TestNoForbiddenShellCommands` | A Taskfile line that only works on Unix |
+| `TestFilePathsAreQuoted` | Unquoted paths breaking on `C:\Program Files\...` |
+| `TestDefaultTierNeedsNoDocker` | Docker deps leaking into the default tier |
+| `TestTaggedTestsHaveAValidConstraint` | A `//go:build` missing its blank line, silently ignored |
+| `TestSynctestIsNotUsedWithRealNetworking` | A synctest bubble that would hang forever |
+| `TestGeneratedCodeIsUpToDate` | Committed `gen/` drifting from the `.proto` |
+| `TestAllProtoFieldsAreAcknowledged` | A new proto field silently never mapped |
 
 ### The pattern worth stealing: one contract, two implementations
 
