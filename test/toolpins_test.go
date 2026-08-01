@@ -69,7 +69,7 @@ var bufPinRE = regexp.MustCompile(`github\.com/bufbuild/buf/cmd/buf@(v[0-9]+\.[0
 var pinnedFiles = []string{
 	"Taskfile.yml",
 	".github/workflows/ci.yml",
-	"tools/codegen_uptodate_test.go",
+	"test/codegen_uptodate_test.go",
 }
 
 // TestBufVersionIsConsistent stops the three copies of the buf pin from drifting.

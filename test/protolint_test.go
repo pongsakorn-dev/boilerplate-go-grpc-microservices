@@ -1,6 +1,6 @@
 //go:build codegen
 
-package tools
+package test
 
 import (
 	"os/exec"

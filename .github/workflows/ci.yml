@@ -102,7 +102,7 @@ jobs:
       # Committed generated code is only safe with this gate. Without it, gen/ silently
       # rots the first time someone edits a .proto and forgets to regenerate.
       - name: generated code is up to date
-        run: go test -tags=codegen ./tools/...
+        run: go test -tags=codegen ./test/...
 
   vuln:
     name: govulncheck

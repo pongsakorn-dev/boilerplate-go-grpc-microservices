@@ -1,13 +1,11 @@
 //go:build codegen
 
-// Package tools holds guards that exec the proto toolchain.
+// Guards that exec the proto toolchain.
 //
-// Everything here is behind the `codegen` build tag because it needs the network (to
-// resolve buf on a cold module cache) and takes tens of seconds. Keeping it out of the
-// default tier is what lets `go test ./...` stay fast and offline.
-//
-// Run with: go tool task verify:codegen
-package tools
+// Behind the `codegen` build tag because they need the network (to resolve buf on a cold
+// module cache) and take tens of seconds. Keeping them out of the default tier is what lets
+// `go test ./...` stay fast and offline. Run with: task verify:codegen
+package test
 
 import (
 	"os"

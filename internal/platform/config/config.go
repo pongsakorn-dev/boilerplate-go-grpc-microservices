@@ -53,15 +53,14 @@ type Config struct {
 	ServiceName string
 	Version     string
 
-	// Three listeners, deliberately.
+	// Two listeners today; M6 adds the gateway.
 	//
-	// GRPCAddr and GatewayAddr are public. AdminAddr is NOT: it carries /metrics and
+	// GRPCAddr is public. AdminAddr is NOT: it carries /metrics and
 	// /debug/pprof, and net/http/pprof registers itself on http.DefaultServeMux in an
 	// init() function. Serving that on the ingress port hands anyone a heap dumper and a
 	// CPU-profiler trigger. observability/admin_test.go asserts the split.
-	GRPCAddr    string
-	GatewayAddr string
-	AdminAddr   string
+	GRPCAddr  string
+	AdminAddr string
 
 	LogLevel  string
 	LogFormat string
@@ -71,9 +70,6 @@ type Config struct {
 
 	AuthMode string
 	OIDC     OIDCConfig
-
-	Redis RedisConfig
-	NATS  NATSConfig
 
 	Telemetry TelemetryConfig
 	Server    ServerConfig
@@ -114,28 +110,6 @@ type OIDCConfig struct {
 	JWKSURL   string
 	// Leeway tolerates clock skew between this service and the identity provider.
 	Leeway time.Duration
-}
-
-type RedisConfig struct {
-	Addr     string
-	Password Secret
-	DB       int
-
-	CacheTTL       time.Duration
-	CacheTTLJitter time.Duration
-
-	RateLimitPerMinute int
-	RateLimitBurst     int
-}
-
-type NATSConfig struct {
-	URL        string
-	StreamName string
-	Subject    string
-
-	// Durable names the JetStream consumer. It must be stable across restarts, otherwise
-	// every deploy creates a fresh consumer and replays the whole stream.
-	Durable string
 }
 
 type ServerConfig struct {
@@ -188,9 +162,8 @@ func Parse(env map[string]string) (Config, error) {
 		ServiceName: p.str("SERVICE_NAME", "orderd"),
 		Version:     p.str("VERSION", "dev"),
 
-		GRPCAddr:    p.str("GRPC_ADDR", ":50051"),
-		GatewayAddr: p.str("GATEWAY_ADDR", ":8080"),
-		AdminAddr:   p.str("ADMIN_ADDR", "127.0.0.1:9090"),
+		GRPCAddr:  p.str("GRPC_ADDR", ":50051"),
+		AdminAddr: p.str("ADMIN_ADDR", "127.0.0.1:9090"),
 
 		LogLevel:  p.str("LOG_LEVEL", "info"),
 		LogFormat: p.str("LOG_FORMAT", "json"),
@@ -211,23 +184,6 @@ func Parse(env map[string]string) (Config, error) {
 			Audience:  p.str("OIDC_AUDIENCE", ""),
 			JWKSURL:   p.str("OIDC_JWKS_URL", ""),
 			Leeway:    p.dur("OIDC_LEEWAY", 30*time.Second),
-		},
-
-		Redis: RedisConfig{
-			Addr:               p.str("REDIS_ADDR", ""),
-			Password:           Secret(p.str("REDIS_PASSWORD", "")),
-			DB:                 p.intVal("REDIS_DB", 0),
-			CacheTTL:           p.dur("REDIS_CACHE_TTL", time.Minute),
-			CacheTTLJitter:     p.dur("REDIS_CACHE_TTL_JITTER", 10*time.Second),
-			RateLimitPerMinute: p.intVal("RATE_LIMIT_PER_MINUTE", 600),
-			RateLimitBurst:     p.intVal("RATE_LIMIT_BURST", 60),
-		},
-
-		NATS: NATSConfig{
-			URL:        p.str("NATS_URL", ""),
-			StreamName: p.str("NATS_STREAM", "ORDERS"),
-			Subject:    p.str("NATS_SUBJECT", "orders.events"),
-			Durable:    p.str("NATS_DURABLE", "orders-worker"),
 		},
 
 		Telemetry: TelemetryConfig{

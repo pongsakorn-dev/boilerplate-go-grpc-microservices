@@ -10,7 +10,7 @@ Clone it, run one command, and you have a working service. No `make`, no `protoc
 ```bash
 git clone git@github.com:pongsakorn-dev/boilerplate-go-grpc-microservices.git
 cd boilerplate-go-grpc-microservices
-go tool task verify   # the whole default test tier, no Docker needed
+go test ./...         # the whole default test tier -- no Docker, no protoc, no make
 go run ./cmd/orderd   # gRPC on :50051, admin on :9090
 ```
 
@@ -63,11 +63,27 @@ time than one that ships less.
 **Requirements:** Go 1.26+. That is the entire list.
 
 ```bash
-go tool task verify
+go test ./...
 ```
 
-Runs `go build`, `go vet`, and the full default test tier. It passes with the Docker daemon
-stopped, no network (once the module cache is warm), and no C compiler.
+That is the whole default tier. It passes with the Docker daemon stopped, no network once
+the module cache is warm, and no C compiler.
+
+### The task runner
+
+Richer targets live in [`Taskfile.yml`](Taskfile.yml). go-task is deliberately **not** a
+`go.mod` tool dependency. It declares requirements on grpc, protobuf and `x/net`, so it
+would participate in module version selection for the runtime your service ships — the exact
+pattern `test/toolpins_test.go` bans buf for. Removing it took `go.sum` from **352 modules to
+114** and `go.mod` from **129 indirect requirements to 26**. Invoke it the way buf and
+golangci-lint are:
+
+```bash
+go run github.com/go-task/task/v3/cmd/task@v3.52.0 --list-all
+```
+
+The rest of this README abbreviates that as `task`. Alias it, or just read `Taskfile.yml` —
+every target is one or two plain `go` commands.
 
 ```bash
 go run ./cmd/orderd
@@ -80,7 +96,7 @@ instead of an empty page.
 |---|---|---|
 | gRPC | `:50051` | The API. Reflection and `grpc.health.v1` are registered |
 | Admin | `127.0.0.1:9090` | `/healthz`, `/metrics`, `/debug/pprof`. **Bound privately on purpose** |
-| Gateway | `:8080` | REST/JSON — arrives in M6 |
+| Gateway | — | REST/JSON arrives in M6, along with its `GATEWAY_ADDR` setting |
 
 Poke it (install [grpcurl](https://github.com/fullstorydev/grpcurl) first — reflection means
 you need no `.proto` file):
@@ -97,11 +113,11 @@ Other tasks — run `go tool task` to see them all:
 
 | Command | What it does |
 |---|---|
-| `go tool task gen` | Regenerate protobuf code (no protoc needed) |
-| `go tool task proto:lint` | Lint `.proto` files |
-| `go tool task doctor` | Report what this machine can run, and why it can't run the rest |
-| `go tool task test:race` | Race detector, or a clear explanation if cgo is unavailable |
-| `go tool task lint` | golangci-lint v2 |
+| `task gen` | Regenerate protobuf code (no protoc needed) |
+| `task proto:lint` | Lint `.proto` files |
+| `task doctor` | Report what this machine can run, and why it can't run the rest |
+| `task test:race` | Race detector, or a clear explanation if cgo is unavailable |
+| `task lint` | golangci-lint v2 |
 
 ---
 
@@ -155,7 +171,7 @@ internal/
     observability/            slog+TraceHandler, Prometheus, OTel traces, admin mux
   testutil/                 bufconn harness that boots the real server
 
-test/                       cross-cutting guards only, never business tests
+test/                       ALL cross-cutting guards, incl. proto toolchain and Taskfile
 ```
 
 ---
@@ -245,10 +261,10 @@ compile-time guarantee. That is the only way `go test ./...` is safe with Docker
 
 | Tier | Command | Infra | Measured on this machine |
 |---|---|---|---|
-| Default | `go tool task verify` | none | **13.3s** cold cache, **1.0s** cached |
-| Codegen | `go tool task verify:codegen` | network | **17.6s** — regenerates and byte-compares |
-| Integration *(M4)* | `go tool task verify:int` | Docker | — |
-| End-to-end *(M10)* | `go tool task verify:e2e` | Docker + compose | — |
+| Default | `go test ./...` | none | **8.2s** cold cache, **1.1s** cached |
+| Codegen | `task verify:codegen` | network | **17.6s** — regenerates and byte-compares |
+| Integration *(M4)* | `task verify:int` | Docker | — |
+| End-to-end *(M10)* | not yet — arrives with the compose stack | Docker + compose | — |
 
 ### Guard tests
 
@@ -281,6 +297,8 @@ merely to pass today:
 | `TestAdmissionReleasesSlotOnPanic` | A panicking handler permanently consuming a slot |
 | `TestCommentsDoNotCiteMissingTests` | A comment claiming a proof that does not exist |
 | `TestVendoredProtosKeepTheirLicenseHeaders` | Apache-2.0 attribution being stripped from vendored protos |
+| `TestTaskTargetsReferenceRealPaths` | A task target pointing at a file that does not exist |
+| `TestBannedToolsAreNotToolDependencies` | A build tool entering the production module graph |
 | `TestErrorsAreMappedBeforeLoggingObservesThem` | Interceptor order regressing to `codes.Unknown` |
 
 ### The pattern worth stealing: one contract, two implementations
@@ -334,6 +352,11 @@ misconfigured deploy into five rollout attempts.
 | `GRPC_ADDR` | `:50051` | |
 | `ADMIN_ADDR` | `127.0.0.1:9090` | Keep it private — it serves pprof from M3 |
 | `STORE_DRIVER` | `memory` | `memory` \| `postgres` (M4) |
+
+Settings for subsystems that do not exist yet (Redis, NATS, the gateway) are deliberately
+**absent** rather than present-and-ignored — a config field that reads as wired and is not is
+the same class of problem as a proto field that validates and is then dropped.
+
 | `AUTH_MODE` | `dev` | **Refused when `APP_ENV=production`** |
 | `POSTGRES_MAX_OPEN_CONNS` | `10` | Explicit on purpose: pool defaults read the *node's* CPU count, not the cgroup limit, so 20 replicas exhaust `max_connections` |
 | `GRPC_MAX_CONCURRENT_STREAMS` | `250` | grpc-go's default is effectively unbounded — this is a DoS control |
@@ -348,7 +371,7 @@ escapes. Covering only one is the usual mistake.
 
 ## Toolchain notes
 
-**No `protoc`.** buf compiles `.proto` files with a pure-Go compiler. `go tool task gen`
+**No `protoc`.** buf compiles `.proto` files with a pure-Go compiler. `task gen`
 works on a machine that has only Go.
 
 **No `make`.** Windows does not ship it. [`Taskfile.yml`](Taskfile.yml) commands may invoke
@@ -358,7 +381,7 @@ only `go`, `docker`, `kubectl`, and `git`, because Task's embedded shell has no 
 
 **`go test -race` will not run on stock Windows.** The race detector links the C++
 ThreadSanitizer runtime, so it requires cgo and therefore a C compiler. This is a permanent
-limitation, not a configuration gap. `go tool task test:race` detects it and prints the two
+limitation, not a configuration gap. `task test:race` detects it and prints the two
 real options (a container, or WinLibs + `CGO_ENABLED=1`) instead of a bare
 `-race requires cgo`. CI runs `-race` on Linux.
 
@@ -370,7 +393,7 @@ every generator writes LF, which silently breaks the codegen diff test, golden f
 **Docker Desktop + testcontainers:** testcontainers resolves the daemon via
 `~/.testcontainers.properties`, `DOCKER_HOST`, then the *default* named pipe — it does not
 read Docker contexts. On Docker Desktop the active context is usually `desktop-linux`, so a
-healthy daemon can be invisible. `go tool task doctor` detects and explains this.
+healthy daemon can be invisible. `task doctor` detects and explains this.
 
 ---
 
@@ -381,7 +404,7 @@ The module path is the placeholder `github.com/example/gomicro`.
 `cmd/rename` (M11) will rewrite `go.mod`, every import, `buf.gen.yaml`'s
 `go_package_prefix`, and the image references in one command, then delete itself. Until it
 lands, change `go.mod` and the `go_package_prefix` in [`buf.gen.yaml`](buf.gen.yaml), then
-run `go tool task gen`.
+run `task gen`.
 
 Because managed mode owns `go_package`, **no `.proto` file hard-codes an import path** —
 forking is one line in `buf.gen.yaml`, not one line per proto.
@@ -390,7 +413,7 @@ forking is one line in `buf.gen.yaml`, not one line per proto.
 
 1. Add it to [`proto/order/v1/order.proto`](proto/order/v1/order.proto) with a
    `google.api.http` binding and protovalidate rules.
-2. `go tool task gen`
+2. `task gen`
 3. Implement the business rule in `internal/order` and add a case to the store contract if
    it touches persistence.
 4. Add the thin adapter method in [`internal/grpcapi/server.go`](internal/grpcapi/server.go).
@@ -406,4 +429,4 @@ M2 toolchain guard tests · M3 interceptors + observability · M4 Postgres/GORM/
 M5 OIDC auth + default-deny policy · M6 REST edge · M7 Redis · M8 outbox + JetStream ·
 M9 second service · M10 deploy + e2e · M11 rename/scaffold/ADRs
 
-Each milestone lands on its own branch and ends with a green `go tool task verify`.
+Each milestone lands on its own branch and ends with a green `task verify`.

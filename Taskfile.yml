@@ -1,6 +1,6 @@
 version: '3'
 
-# Rules enforced by internal/devtools/taskfile_test.go:
+# Rules enforced by test/taskfile_test.go:
 #
 #   1. Every cmds: line's first token must be one of {go, docker, kubectl, git}.
 #      Task's embedded shell (mvdan.cc/sh) has NO rm/cp/mv/sed/awk/jq builtins on
@@ -9,6 +9,18 @@ version: '3'
 #      "C:\Program Files\Go" -- an unquoted path with a space silently splits into two args.
 
 vars:
+  # go-task is invoked the same way buf and golangci-lint are, and for the same reason.
+  #
+  # It used to sit in the go.mod `tool` directive, which put it in module version selection
+  # for the production runtime: it declares requirements on google.golang.org/grpc,
+  # google.golang.org/protobuf and golang.org/x/net, so a future task release could silently
+  # float the gRPC runtime version that every fork of this template ships. It also dragged in
+  # hashicorp/go-getter and the AWS SDK.
+  #
+  # Removing it took go.sum from 352 modules to 114, and go.mod from 129 indirect
+  # requirements to 26. test/toolpins_test.go bans it from the tool directive by name.
+  TASK: github.com/go-task/task/v3/cmd/task@v3.52.0
+
   # buf is deliberately NOT in the go.mod `tool` directive.
   #
   # Buf's own docs say not to install it via tools.go or `go tool`, because that resolves
@@ -31,7 +43,7 @@ tasks:
   default:
     desc: Show available tasks
     cmds:
-      - go tool task --list-all
+      - go run {{.TASK}} --list-all
     silent: true
 
   setup:
@@ -67,15 +79,11 @@ tasks:
     cmds:
       - go test -tags=integration ./...
 
-  verify:e2e:
-    desc: End-to-end tier -- builds the real image and runs the compose stack
-    cmds:
-      - go test -tags=e2e ./test/e2e/...
 
   verify:codegen:
     desc: Assert the committed generated code still matches the protos
     cmds:
-      - go test -tags=codegen ./tools/...
+      - go test -tags=codegen ./test/...
 
   test:race:
     desc: Race detector. Needs cgo, so it is guarded -- see cmd/devtool.
@@ -112,22 +120,6 @@ tasks:
     cmds:
       - go build -o "bin/" ./cmd/...
 
-  migrate:up:
-    desc: Apply database migrations (never runs on service boot)
-    cmds:
-      - go run ./cmd/migrate up
 
-  compose:up:
-    desc: Start postgres, redis, nats and the telemetry stack
-    cmds:
-      - docker compose -f "deploy/compose/docker-compose.yml" up -d
 
-  compose:down:
-    desc: Stop the local stack and delete its volumes
-    cmds:
-      - docker compose -f "deploy/compose/docker-compose.yml" down -v
 
-  k8s:render:
-    desc: Render the dev overlay (kubectl embeds kustomize -- no extra tool needed)
-    cmds:
-      - kubectl kustomize "deploy/k8s/overlays/dev"
