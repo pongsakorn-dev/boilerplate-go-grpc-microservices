@@ -13,7 +13,7 @@ managed:
     # (google.golang.org/genproto/..., buf.build/gen/go/...). If managed mode rewrote
     # their go_package under our prefix, protoc-gen-go would emit a SECOND copy of the
     # same descriptors and the protobuf runtime would panic at init with
-    # "file already registered". internal/protoschema/descriptor_test.go guards this.
+    # "file already registered". A follow-up will guard this with a descriptor test.
     - file_option: go_package_prefix
       path: google/api
     - file_option: go_package_prefix

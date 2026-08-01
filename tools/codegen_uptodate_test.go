@@ -25,8 +25,7 @@ const bufPin = "github.com/bufbuild/buf/cmd/buf@v1.72.0"
 
 // generatedSuffixes are the files buf owns. Anything else under gen/ is not compared,
 // because a hand-written file living there would make byte-equality impossible by
-// construction -- which is exactly why internal/protoschema/descriptor_test.go lives
-// outside gen/ rather than inside it.
+// construction. Any descriptor test therefore lives outside gen/, never inside it.
 var generatedSuffixes = []string{".pb.go", "_grpc.pb.go", ".pb.gw.go"}
 
 // TestGeneratedCodeIsUpToDate is the gate that makes committing generated code safe.

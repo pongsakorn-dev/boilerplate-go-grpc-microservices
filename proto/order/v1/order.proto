@@ -62,8 +62,13 @@ message OrderItem {
 message Order {
   string order_id = 1;
 
-  // Set from the verified token, never from the request body. An inbound tenant_id is
-  // rejected by the auth interceptor -- see auth/tenant_isolation_test.go.
+  // Populated by the server from the caller identity. This is an OUTPUT field.
+  //
+  // No request message carries a tenant_id, so there is nothing for a client to override.
+  // The isolation comes from the field being absent on the request side, not from a
+  // rejection rule. Cross-tenant invisibility is asserted by
+  // internal/order/ordertest/contract.go, in "an order in another tenant is
+  // indistinguishable from missing".
   string tenant_id = 2;
 
   string customer_id = 3;

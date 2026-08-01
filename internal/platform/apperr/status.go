@@ -4,6 +4,7 @@ import (
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/protoadapt"
 )
 
 // ToStatus converts any error into a gRPC status carrying machine-readable details.
@@ -30,15 +31,22 @@ func ToStatus(err error, domain string) *status.Status {
 
 	st := status.New(ae.Kind.GRPCCode(), ae.ClientMessage())
 
-	info := &errdetails.ErrorInfo{
-		Reason:   ae.Reason,
-		Domain:   domain,
-		Metadata: ae.Metadata,
+	details := []protoadapt.MessageV1{
+		protoadapt.MessageV1Of(&errdetails.ErrorInfo{
+			Reason:   ae.Reason,
+			Domain:   domain,
+			Metadata: ae.Metadata,
+		}),
 	}
-	withDetails, detailErr := st.WithDetails(info)
+	for _, d := range ae.Details {
+		details = append(details, protoadapt.MessageV1Of(d))
+	}
+
+	withDetails, detailErr := st.WithDetails(details...)
 	if detailErr != nil {
-		// Attaching details can only fail if the detail message cannot be marshalled.
-		// A degraded status beats dropping the error entirely.
+		// Attaching details can only fail if a detail message cannot be marshalled. A
+		// status without its details still tells the caller the code and the reason, which
+		// beats dropping the error entirely.
 		return st
 	}
 	return withDetails

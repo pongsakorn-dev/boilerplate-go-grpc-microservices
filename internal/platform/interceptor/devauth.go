@@ -17,8 +17,9 @@ import (
 // It is guarded in three places, because an accidental production deploy with dev auth is
 // a total authentication bypass:
 //
-//   - config.Validate refuses AUTH_MODE=dev when APP_ENV=production, before any listener
-//     opens (config_test.go::TestValidate_RejectsDevAuthOutsideDev).
+//   - config.Validate refuses AUTH_MODE=dev when APP_ENV=production, and refuses
+//     AUTH_MODE=oidc outright until M5, before any listener opens
+//     (config_test.go::TestValidateRejectsDevAuthInProduction).
 //   - app.New logs a WARN on every single startup, not once.
 //   - the deploy overlay sets AUTH_MODE=oidc explicitly rather than relying on a default.
 var DevPrincipal = auth.Principal{
@@ -40,23 +41,13 @@ func DevAuth() grpc.UnaryServerInterceptor {
 
 // DevAuthStream is the streaming equivalent.
 //
-// It has to wrap the ServerStream to override Context(), because grpc.ServerStream
-// returns the stream's own context and there is no setter. Without the wrapper the
-// principal is invisible inside a streaming handler -- a bug no unary test can catch,
-// which is why stream_test.go asserts it directly.
+// It must wrap the ServerStream to override Context(), because grpc.ServerStream returns
+// the stream's own context and offers no setter. Without the wrapper the principal is
+// invisible inside a streaming handler -- a bug no unary test can catch, so it earns a
+// dedicated stream test in M4.
 func DevAuthStream() grpc.StreamServerInterceptor {
 	return func(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-		return handler(srv, &wrappedStream{
-			ServerStream: ss,
-			ctx:          auth.WithPrincipal(ss.Context(), DevPrincipal),
-		})
+		ctx := auth.WithPrincipal(ss.Context(), DevPrincipal)
+		return handler(srv, WrapServerStream(ss, ctx))
 	}
 }
-
-// wrappedStream overrides Context so interceptor-injected values reach stream handlers.
-type wrappedStream struct {
-	grpc.ServerStream
-	ctx context.Context
-}
-
-func (w *wrappedStream) Context() context.Context { return w.ctx }

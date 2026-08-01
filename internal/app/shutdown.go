@@ -26,7 +26,7 @@ type Step struct {
 // bubble either reports a deadlock or hangs. A hanging test in the default tier is
 // adoption-fatal, because a newcomer cannot tell whether they broke it. So the sequencing
 // logic is tested here in a bubble, and the actual drain behaviour is tested against a
-// real bufconn server in grpcapi/drain_test.go. Two tests, each testing what it can
+// real bufconn server, which M4 will add. Two tests, each testing what it can
 // actually observe.
 //
 // Reverse order matters: dependencies are opened outermost-first (config, then database,
