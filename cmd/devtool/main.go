@@ -6,7 +6,7 @@
 // and fails on a contributor's laptop with an error that names none of this.
 //
 // Everything filesystem- or text-shaped therefore lives here, in Go, where it is
-// genuinely portable. internal/devtools/taskfile_test.go enforces the rule.
+// genuinely portable. test/taskfile_test.go enforces the rule.
 package main
 
 import (

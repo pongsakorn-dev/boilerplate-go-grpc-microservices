@@ -1,4 +1,4 @@
-package devtools_test
+package test
 
 import (
 	"os"
@@ -140,7 +140,7 @@ func TestFilePathsAreQuoted(t *testing.T) {
 	}
 }
 
-// TestEveryTaskHasADescription keeps `go tool task --list-all` useful.
+// TestEveryTaskHasADescription keeps `task --list-all` useful.
 //
 // An undescribed task is invisible in the task list, so it may as well not exist -- and a
 // contributor reinvents whatever it did.
@@ -164,7 +164,7 @@ func TestEveryTaskHasADescription(t *testing.T) {
 }
 
 // taskRefRE matches a task invocation as written in the README.
-var taskRefRE = regexp.MustCompile(`go tool task ([a-z][a-z0-9:._-]*)`)
+var taskRefRE = regexp.MustCompile("`task ([a-z][a-z0-9:._-]*)`")
 
 // TestReadmeOnlyReferencesRealTasks stops the documentation from drifting.
 //
@@ -190,8 +190,7 @@ func TestReadmeOnlyReferencesRealTasks(t *testing.T) {
 		seen[name] = true
 
 		if _, ok := tf.Tasks[name]; !ok {
-			t.Errorf("README.md references `go tool task %s`, which is not defined in Taskfile.yml",
-				name)
+			t.Errorf("README.md references `task %s`, which is not defined in Taskfile.yml", name)
 		}
 	}
 	if len(seen) == 0 {
