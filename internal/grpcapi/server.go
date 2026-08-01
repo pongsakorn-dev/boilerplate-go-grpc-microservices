@@ -28,10 +28,13 @@ func NewOrderServer(svc *order.Service) *OrderServer {
 
 // tenantOf takes the tenant from the authenticated principal.
 //
-// It deliberately ignores any tenant_id present in the request message. A caller that
-// could name its own tenant would be able to read and write every other tenant's data
-// with a valid token of its own -- the single worst bug a multi-tenant service can have.
-// auth/tenant_isolation_test.go asserts a body-supplied tenant is ignored.
+// A caller able to name its own tenant could read and write every other tenant's data with
+// a valid token of its own -- the worst bug a multi-tenant service can have. The defence is
+// structural rather than a rejection rule: no request message declares a tenant_id, so
+// there is nothing to ignore.
+//
+// Cross-tenant invisibility is asserted by internal/order/ordertest/contract.go. M5 will
+// add the token-side assertion.
 func tenantOf(ctx context.Context) (string, error) {
 	tenant, ok := auth.TenantFrom(ctx)
 	if !ok {
@@ -149,6 +152,13 @@ func (s *OrderServer) WatchOrders(req *orderv1.WatchOrdersRequest, stream orderv
 	return ctx.Err()
 }
 
-// Compile-time proof the adapter implements the generated interface. Without this, adding
-// an RPC to the proto only fails wherever the server happens to be registered.
+// This assertion documents intent but is NOT the safety net it looks like: OrderServer
+// embeds UnimplementedOrderServiceServer, which satisfies the interface unconditionally.
+// Adding an RPC to the proto therefore still compiles, and calls to it return Unimplemented
+// at runtime rather than failing the build.
+//
+// Embedding is required by grpc-go for forward compatibility, so this cannot be fixed by
+// removing it. The real guard is M5's policy-coverage test, which walks the protobuf
+// registry and fails when an RPC has no explicit authorization decision -- that catches a
+// new RPC at build time, from the registry rather than from the interface.
 var _ orderv1.OrderServiceServer = (*OrderServer)(nil)

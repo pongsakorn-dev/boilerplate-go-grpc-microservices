@@ -75,8 +75,22 @@ type Config struct {
 	Redis RedisConfig
 	NATS  NATSConfig
 
-	Server   ServerConfig
-	Shutdown ShutdownConfig
+	Telemetry TelemetryConfig
+	Server    ServerConfig
+	Shutdown  ShutdownConfig
+}
+
+type TelemetryConfig struct {
+	// OTLPEndpoint is the collector address, e.g. "localhost:4317". Empty means tracing is
+	// instrumented everywhere but exports nowhere -- which is what lets a fresh clone run
+	// with no collector at all.
+	OTLPEndpoint string
+
+	// TraceSampleRatio is the head-sampling ratio for traces with no sampled parent.
+	//
+	// 1.0 in development so you see everything. In production this is the main cost lever:
+	// at high request rates, tracing every request costs more than running the service.
+	TraceSampleRatio float64
 }
 
 type PostgresConfig struct {
@@ -150,8 +164,8 @@ type ShutdownConfig struct {
 	// DrainDelay is the gap between flipping health to NOT_SERVING and actually refusing
 	// work. Kubernetes removes a pod from Service endpoints asynchronously, so a pod that
 	// stops instantly on SIGTERM still receives requests for a short window. This is that
-	// window. deploy/k8s/kustomize_test.go asserts terminationGracePeriodSeconds exceeds
-	// DrainDelay + GracePeriod.
+	// window. M10 will assert terminationGracePeriodSeconds exceeds DrainDelay +
+	// GracePeriod, once the kustomize overlays exist.
 	DrainDelay time.Duration
 
 	// GracePeriod bounds GracefulStop before connections are cut.
@@ -216,6 +230,11 @@ func Parse(env map[string]string) (Config, error) {
 			Durable:    p.str("NATS_DURABLE", "orders-worker"),
 		},
 
+		Telemetry: TelemetryConfig{
+			OTLPEndpoint:     p.str("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+			TraceSampleRatio: p.float("OTEL_TRACE_SAMPLE_RATIO", 1.0),
+		},
+
 		Server: ServerConfig{
 			MaxConcurrentStreams:  uint32(p.intVal("GRPC_MAX_CONCURRENT_STREAMS", 250)),
 			MaxRecvMsgBytes:       p.intVal("GRPC_MAX_RECV_MSG_BYTES", 4<<20),
@@ -275,13 +294,26 @@ func (c Config) Validate() error {
 	if c.StoreDriver == StorePostgres && c.Postgres.DSN.Reveal() == "" {
 		errs = append(errs, errors.New("POSTGRES_DSN is required when STORE_DRIVER=postgres"))
 	}
+
+	// AUTH_MODE=oidc is REFUSED until the verifier exists.
+	//
+	// This is the most important line in this file right now, and it is here because of a
+	// real bug rather than a hypothetical one. The server installed the dev interceptor
+	// unconditionally and never read AuthMode, so APP_ENV=production AUTH_MODE=oidc
+	// validated, booted with no warning, and served every request as a full-scope
+	// dev-tenant principal.
+	//
+	// That is worse than shipping no auth at all: `oidc` is precisely the value a reader
+	// sets BECAUSE they read the warning about dev mode. A trap that springs only for the
+	// person who believed your documentation is the worst kind.
+	//
+	// Failing closed means the only bootable value is the one that is honest about what it
+	// does. Delete this block in M5, when NewVerifier can actually return an OIDC verifier.
 	if c.AuthMode == AuthOIDC {
-		if c.OIDC.IssuerURL == "" {
-			errs = append(errs, errors.New("OIDC_ISSUER_URL is required when AUTH_MODE=oidc"))
-		}
-		if c.OIDC.Audience == "" {
-			errs = append(errs, errors.New("OIDC_AUDIENCE is required when AUTH_MODE=oidc"))
-		}
+		errs = append(errs, errors.New(
+			"AUTH_MODE=oidc is refused: OIDC verification is not implemented yet (milestone M5). "+
+				"Until then the only supported value is AUTH_MODE=dev, which authenticates NOBODY "+
+				"and must not be exposed to an untrusted network"))
 	}
 
 	if c.Postgres.MaxOpenConns <= 0 {
@@ -290,6 +322,10 @@ func (c Config) Validate() error {
 	if c.Server.MaxTimeout < c.Server.DefaultTimeout {
 		errs = append(errs, fmt.Errorf("MAX_TIMEOUT (%s) must be >= DEFAULT_TIMEOUT (%s)",
 			c.Server.MaxTimeout, c.Server.DefaultTimeout))
+	}
+	if c.Telemetry.TraceSampleRatio < 0 || c.Telemetry.TraceSampleRatio > 1 {
+		errs = append(errs, fmt.Errorf("OTEL_TRACE_SAMPLE_RATIO %v must be between 0 and 1",
+			c.Telemetry.TraceSampleRatio))
 	}
 	if !oneOf(c.LogFormat, "json", "text") {
 		errs = append(errs, fmt.Errorf("LOG_FORMAT %q must be json or text", c.LogFormat))
@@ -327,6 +363,19 @@ func (p *parser) intVal(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+func (p *parser) float(key string, def float64) float64 {
+	raw, ok := p.env[key]
+	if !ok || raw == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		p.errs = append(p.errs, fmt.Errorf("%s: %q is not a number", key, raw))
+		return def
+	}
+	return f
 }
 
 func (p *parser) dur(key string, def time.Duration) time.Duration {

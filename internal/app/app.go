@@ -19,6 +19,7 @@ import (
 	"os"
 	"time"
 
+	"buf.build/go/protovalidate"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
@@ -38,6 +39,7 @@ type App struct {
 	grpcServer *grpc.Server
 	health     *health.Server
 	adminSrv   *http.Server
+	metrics    *observability.Metrics
 
 	// steps are torn down in reverse order by Shutdown.
 	steps []Step
@@ -45,9 +47,9 @@ type App struct {
 
 // New builds every dependency.
 //
-// It returns an error rather than panicking, which makes app_test.go's single assertion
-// -- that New succeeds -- a genuine wiring test: if a constructor is missing an argument
-// or a driver name is unhandled, this returns an error and the test fails with the reason.
+// It returns an error rather than panicking, so a wiring test can assert simply that New
+// succeeds: a missing constructor argument or an unhandled driver name comes back as an
+// error naming the reason. M4 will add that test.
 //
 // On a partial failure, everything already opened is closed before returning. Leaking a
 // database pool because startup failed halfway is how a crash-looping pod exhausts a
@@ -67,6 +69,33 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 			"Never run this outside local development.")
 	}
 
+	// Tracing first: it must be installed before anything that creates spans, and the
+	// propagator must be set even when no exporter is configured, or this service silently
+	// breaks trace continuity for every service downstream of it.
+	_, flushTraces, err := observability.NewTracerProvider(ctx, cfg)
+	if err != nil {
+		_ = a.closeOpened(ctx)
+		return nil, fmt.Errorf("tracing: %w", err)
+	}
+	a.steps = append(a.steps, Step{
+		Name:    "flush-traces",
+		Timeout: 5 * time.Second,
+		Fn:      flushTraces,
+	})
+
+	a.metrics = observability.NewMetrics()
+
+	// The validator compiles every CEL rule in every registered proto ONCE, at startup.
+	//
+	// Building it per-request would recompile them on every call. Building it here also
+	// means a malformed rule fails startup with a clear error instead of turning into an
+	// Internal on whichever RPC happens to be hit first in production.
+	validator, err := protovalidate.New()
+	if err != nil {
+		_ = a.closeOpened(ctx)
+		return nil, fmt.Errorf("build protovalidate: %w", err)
+	}
+
 	store, atomic, err := a.buildStore(ctx)
 	if err != nil {
 		_ = a.closeOpened(ctx)
@@ -76,17 +105,26 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 	orderSvc := order.NewService(store, atomic)
 
 	a.health = health.NewServer()
-	a.grpcServer = grpcapi.NewServer(grpcapi.Deps{
+	a.grpcServer, err = grpcapi.NewServer(grpcapi.Deps{
 		Log:          log,
 		Cfg:          cfg,
 		OrderService: orderSvc,
 		Health:       a.health,
+		Metrics:      a.metrics,
+		Validator:    validator,
 	})
+	if err != nil {
+		_ = a.closeOpened(ctx)
+		return nil, err
+	}
 
 	a.adminSrv = a.buildAdminServer()
 
 	return a, nil
 }
+
+// Metrics exposes the registry so tests can scrape it without a listener.
+func (a *App) Metrics() *observability.Metrics { return a.metrics }
 
 // buildStore selects the persistence driver.
 func (a *App) buildStore(ctx context.Context) (order.Store, order.Atomic, error) {
@@ -123,21 +161,22 @@ func (a *App) buildStore(ctx context.Context) (order.Store, order.Atomic, error)
 // ingress. Using an explicit mux here, bound to a private address, closes that by
 // construction. admin_test.go asserts the public listeners do not serve /debug/pprof.
 func (a *App) buildAdminServer() *http.Server {
-	mux := http.NewServeMux()
+	// live reports process health only -- deliberately NOT dependency health.
+	//
+	// A liveness probe that fails when Postgres is down makes Kubernetes restart every
+	// replica at once during a database blip, turning a recoverable dependency outage into
+	// a self-inflicted total outage. Readiness (grpc.health.v1, on the RPC port) is what
+	// gates traffic.
+	live := func() bool { return true }
 
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
-
-	// M3 adds /metrics and /debug/pprof here.
-
-	return &http.Server{
-		Addr:              a.cfg.AdminAddr,
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
+	mux := observability.NewAdminMux(a.metrics.Registry, live)
+	return observability.NewAdminServer(a.cfg, mux)
 }
+
+// AdminHandler exposes the admin mux so tests can exercise /metrics and /debug/pprof
+// without binding a port -- and so admin_test.go can assert the PUBLIC surfaces do not
+// serve them.
+func (a *App) AdminHandler() http.Handler { return a.adminSrv.Handler }
 
 // GRPCServer exposes the wired server so tests can serve it over an in-memory listener.
 func (a *App) GRPCServer() *grpc.Server { return a.grpcServer }

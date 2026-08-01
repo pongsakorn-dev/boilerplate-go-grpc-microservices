@@ -19,6 +19,7 @@ import (
 	"net/http"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/protobuf/proto"
 )
 
 // Kind is the class of failure. It is deliberately small: a taxonomy nobody can hold in
@@ -138,7 +139,19 @@ type Error struct {
 	// Metadata becomes ErrorInfo.metadata. Keep it small and never put PII in it.
 	Metadata map[string]string
 
+	// Details are extra google.rpc detail messages attached to the status, e.g. a
+	// BadRequest listing field violations or a RetryInfo telling the caller when to come
+	// back. They are the machine-readable half of the error: the message is for humans,
+	// these are for code.
+	Details []proto.Message
+
 	wrapped error
+}
+
+// WithDetails attaches google.rpc detail messages.
+func (e *Error) WithDetails(details ...proto.Message) *Error {
+	e.Details = append(e.Details, details...)
+	return e
 }
 
 // New builds an Error.

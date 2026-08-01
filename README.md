@@ -8,8 +8,9 @@ Clone it, run one command, and you have a working service. No `make`, no `protoc
 `buf`, no Docker, no C compiler.
 
 ```bash
-git clone <this-repo> && cd boilerplate-go-grpc-microservices
-go tool task verify   # green in ~3s on a cold test cache
+git clone git@github.com:pongsakorn-dev/boilerplate-go-grpc-microservices.git
+cd boilerplate-go-grpc-microservices
+go tool task verify   # the whole default test tier, no Docker needed
 go run ./cmd/orderd   # gRPC on :50051, admin on :9090
 ```
 
@@ -29,9 +30,11 @@ time than one that ships less.
 | In-memory store (`STORE_DRIVER=memory`) | ✅ Done | Same contract the Postgres adapter will satisfy |
 | Error model (`apperr`) | ✅ Done | One `Kind → gRPC code → HTTP status` table |
 | bufconn test harness | ✅ Done | Tests drive the **production** server |
+| LICENSE, SECURITY.md, third-party attribution | ✅ Done | Apache-2.0; `proto/third_party/` carries its own LICENSE + provenance |
 | Repo/import/toolchain guard tests | ✅ Done | CRLF, import boundaries, build-tag tiers, tool pins, Taskfile portability |
 | CI (Linux + Windows), golangci-lint | ✅ Done | Lint is at 0 issues; `-race` runs on Linux |
-| Full interceptor chain + observability | ⬜ M3 | Metrics, tracing, logging, admission, validation |
+| Full interceptor chain | ✅ Done | recovery, metrics, logging, errmap, admission, auth, deadline, validation |
+| Observability: slog + Prometheus + OTel traces | ✅ Done | Trace-correlated logs, `/metrics`, private pprof, OTLP export |
 | Postgres via GORM + goose migrations | ⬜ M4 | `STORE_DRIVER=postgres` currently returns an explicit error |
 | Real auth (OIDC/JWKS) + default-deny policy | ⬜ M5 | **See the security note below** |
 | REST/JSON edge (grpc-gateway) | ⬜ M6 | `.pb.gw.go` is generated but not yet served |
@@ -43,10 +46,15 @@ time than one that ships less.
 
 > [!WARNING]
 > **There is no real authentication yet.** `internal/platform/interceptor/devauth.go`
-> injects a fixed principal without verifying anything. It is guarded three ways
-> (`config.Validate` refuses `AUTH_MODE=dev` when `APP_ENV=production`, a WARN is logged on
-> every startup, and the deploy overlay will set `AUTH_MODE=oidc` explicitly) — but until
-> M5 lands, do not expose this to a network you do not control.
+> injects a fixed principal without verifying anything — every request is `dev-tenant` with
+> full scopes. Until M5 lands, do not expose a build from this branch to a network you do
+> not control. See [SECURITY.md](SECURITY.md).
+>
+> An earlier version of this warning said `AUTH_MODE=oidc` was one of the mitigations. It
+> was the opposite: the server never read `AUTH_MODE` at all, so setting it to `oidc`
+> validated, booted with no warning, and served every request unauthenticated. It now fails
+> closed — `AUTH_MODE=oidc` is refused until the verifier exists, and an unknown mode errors
+> rather than defaulting to something permissive.
 
 ---
 
@@ -71,7 +79,7 @@ instead of an empty page.
 | Listener | Address | Purpose |
 |---|---|---|
 | gRPC | `:50051` | The API. Reflection and `grpc.health.v1` are registered |
-| Admin | `127.0.0.1:9090` | `/healthz` now; `/metrics` and `/debug/pprof` in M3. **Bound privately on purpose** |
+| Admin | `127.0.0.1:9090` | `/healthz`, `/metrics`, `/debug/pprof`. **Bound privately on purpose** |
 | Gateway | `:8080` | REST/JSON — arrives in M6 |
 
 Poke it (install [grpcurl](https://github.com/fullstorydev/grpcurl) first — reflection means
@@ -143,8 +151,8 @@ internal/
     config/                   the ONLY package that reads the environment
     apperr/                   Kind enum + the one Kind->code->HTTP table
     auth/                     Principal and its context plumbing
-    interceptor/              recovery, errmap, dev auth
-    observability/            logging (metrics + tracing in M3)
+    interceptor/              recovery, logging, errmap, admission, auth, deadline, validate
+    observability/            slog+TraceHandler, Prometheus, OTel traces, admin mux
   testutil/                 bufconn harness that boots the real server
 
 test/                       cross-cutting guards only, never business tests
@@ -204,13 +212,28 @@ business test silently becomes a Docker test.
 ### Request path
 
 ```
-client → recovery → auth → errmap → OrderServer → order.Service → Store
+client
+  -> recovery      panic containment
+  -> metrics       counts shed load too, so it sits outside admission
+  -> logging       observes the FINAL code, because errmap is below it
+  -> errmap        domain error -> gRPC status + google.rpc details
+  -> admission     concurrency limit, BEFORE auth
+  -> auth          establishes the principal
+  -> deadline      bounds the handler and everything downstream
+  -> validate      protovalidate, from rules declared in the .proto
+  -> OrderServer -> order.Service -> Store
 ```
 
-`errmap` is **innermost** on purpose. It runs last on the way in and first on the way out,
-so every interceptor outside it — logging, metrics, tracing in M3 — observes the *final*
-status code. Put it anywhere else and your dashboards fill with `codes.Unknown` for errors
-you carefully classified.
+**`errmap` is not innermost, and that placement is the subtle one.** "Innermost" is the
+intuitive choice and it is wrong: an interceptor only maps errors from what it *wraps*.
+Placed last it wraps the handler alone, so rejections from admission, auth and validation
+sail past it unmapped and reach the client as `codes.Unknown` — and those are the errors
+clients hit most often.
+
+The real requirement is two-sided: below logging and metrics (so they record the mapped
+code), and above every interceptor that produces an error (so those get mapped at all).
+`internal/grpcapi/chain_test.go` caught this by asserting outcomes rather than reading the
+list.
 
 ---
 
@@ -222,12 +245,10 @@ compile-time guarantee. That is the only way `go test ./...` is safe with Docker
 
 | Tier | Command | Infra | Measured on this machine |
 |---|---|---|---|
-| Default | `go tool task verify` | none | **10.5s** cold cache, **0.9s** cached |
+| Default | `go tool task verify` | none | **13.3s** cold cache, **1.0s** cached |
 | Codegen | `go tool task verify:codegen` | network | **17.6s** — regenerates and byte-compares |
 | Integration *(M4)* | `go tool task verify:int` | Docker | — |
 | End-to-end *(M10)* | `go tool task verify:e2e` | Docker + compose | — |
-
-Current: **42 test functions across 13 files**, many table-driven with a dozen or more cases.
 
 ### Guard tests
 
@@ -250,6 +271,17 @@ merely to pass today:
 | `TestSynctestIsNotUsedWithRealNetworking` | A synctest bubble that would hang forever |
 | `TestGeneratedCodeIsUpToDate` | Committed `gen/` drifting from the `.proto` |
 | `TestAllProtoFieldsAreAcknowledged` | A new proto field silently never mapped |
+| `TestEveryKindIsMapped` | A new error Kind with no gRPC/HTTP row |
+| `TestInternalErrorsNeverLeakAndNeverLose` | Driver text reaching a client, or vanishing from the log |
+| `TestSecretIsRedactedThroughEveryEscapeRoute` | A password escaping via fmt, JSON **or** slog |
+| `TestValidateRejectsDevAuthInProduction` | `AUTH_MODE=dev` reaching production |
+| `TestTraceHandlerPassesTheStdlibConformanceSuite` | A wrapping slog handler breaking `WithGroup` |
+| `TestTraceHandlerSurvivesWith` | Derived loggers silently losing trace correlation |
+| `TestPprofIsOnDefaultServeMuxButWeNeverServeIt` | Profiling endpoints on a public listener |
+| `TestAdmissionReleasesSlotOnPanic` | A panicking handler permanently consuming a slot |
+| `TestCommentsDoNotCiteMissingTests` | A comment claiming a proof that does not exist |
+| `TestVendoredProtosKeepTheirLicenseHeaders` | Apache-2.0 attribution being stripped from vendored protos |
+| `TestErrorsAreMappedBeforeLoggingObservesThem` | Interceptor order regressing to `codes.Unknown` |
 
 ### The pattern worth stealing: one contract, two implementations
 
@@ -308,7 +340,7 @@ misconfigured deploy into five rollout attempts.
 | `GRPC_MAX_CONNECTION_AGE` | `30m` | Forces periodic GOAWAY so rolling deploys actually rebalance |
 | `SHUTDOWN_DRAIN_DELAY` | `5s` | Health flips to NOT_SERVING, then waits. Kubernetes deregisters asynchronously, so a pod that stops instantly still gets traffic |
 
-Secrets use a [`Secret` type](internal/platform/config/config.go) that redacts through
+Licensed under [Apache-2.0](LICENSE). Secrets use a [`Secret` type](internal/platform/config/config.go) that redacts through
 `String`, `MarshalJSON`, **and** `LogValue` — the three routes by which a password normally
 escapes. Covering only one is the usual mistake.
 

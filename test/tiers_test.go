@@ -1,8 +1,11 @@
 package test
 
 import (
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -78,23 +81,38 @@ func TestTaggedTestsHaveAValidConstraint(t *testing.T) {
 		if err != nil {
 			continue
 		}
-		src := strings.ReplaceAll(string(b), "\r\n", "\n")
 
-		idx := strings.Index(src, "//go:build")
-		if idx < 0 {
+		// Scan LINE BY LINE, and only above the package clause.
+		//
+		// A whole-file substring search is wrong here in a way that bites immediately:
+		// this very file contains "//go:build" inside an error message, and a naive
+		// search finds that literal and reports the file as broken. A build directive is
+		// only meaningful before `package`, so that is the only region worth looking at.
+		lines := strings.Split(strings.ReplaceAll(string(b), "\r\n", "\n"), "\n")
+
+		pkgLine := -1
+		for i, line := range lines {
+			if strings.HasPrefix(line, "package ") {
+				pkgLine = i
+				break
+			}
+		}
+		if pkgLine < 0 {
 			continue
 		}
 
-		// Everything from the constraint to the package clause must contain a blank line.
-		pkgIdx := strings.Index(src, "\npackage ")
-		if pkgIdx < 0 || pkgIdx < idx {
-			t.Errorf("%s: //go:build appears after the package clause, so it is ignored", rel)
-			continue
-		}
-		between := src[idx:pkgIdx]
-		if !strings.Contains(between, "\n\n") {
-			t.Errorf("%s: //go:build is not separated from `package` by a blank line, "+
-				"so Go treats it as a plain comment and the file joins the DEFAULT build", rel)
+		for i := 0; i < pkgLine; i++ {
+			if !strings.HasPrefix(strings.TrimSpace(lines[i]), "//go:build") {
+				continue
+			}
+			// The line immediately after the directive must be blank. Without the blank
+			// line Go treats the directive as an ordinary comment: the constraint is
+			// silently ignored, the file joins the default build, and an integration test
+			// starts running on machines with no Docker. The compiler never warns.
+			if i+1 >= pkgLine || strings.TrimSpace(lines[i+1]) != "" {
+				t.Errorf("%s:%d: //go:build is not followed by a blank line, so Go treats "+
+					"it as a plain comment and the file joins the DEFAULT build", rel, i+1)
+			}
 		}
 	}
 }
@@ -110,39 +128,59 @@ func TestTaggedTestsHaveAValidConstraint(t *testing.T) {
 // never return and has no way to tell whether they broke it.
 //
 // The rule: synctest for pure sequencing logic (internal/app/shutdown.go), real servers for
-// real network behaviour (internal/grpcapi/drain_test.go).
+// real network behaviour.
 func TestSynctestIsNotUsedWithRealNetworking(t *testing.T) {
 	t.Parallel()
 
 	root := testutil.RepoRoot(t)
-	networkImports := []string{
-		`"net"`,
-		`"net/http"`,
-		`"google.golang.org/grpc"`,
-		`grpc/test/bufconn`,
+
+	// Matched against the file's real IMPORT LIST, from the parsed AST -- not against its
+	// raw text. Substring-scanning the source finds these paths inside string literals
+	// (this file quotes every one of them in its own rules) and reports files that import
+	// nothing of the sort.
+	networkPackages := map[string]bool{
+		"net":                                 true,
+		"net/http":                            true,
+		"google.golang.org/grpc":              true,
+		"google.golang.org/grpc/test/bufconn": true,
 	}
+
+	fset := token.NewFileSet()
 
 	for _, rel := range testutil.TrackedFiles(t) {
 		if !strings.HasSuffix(rel, "_test.go") {
 			continue
 		}
-		b, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
-		if err != nil {
-			continue
-		}
-		src := string(b)
 
-		if !strings.Contains(src, "synctest.") {
+		file, err := parser.ParseFile(fset, filepath.Join(root, filepath.FromSlash(rel)), nil, 0)
+		if err != nil {
+			continue // a file that does not parse is a different test's problem
+		}
+
+		usesSynctest := false
+		for _, imp := range file.Imports {
+			if path, err := strconv.Unquote(imp.Path.Value); err == nil && path == "testing/synctest" {
+				usesSynctest = true
+				break
+			}
+		}
+		if !usesSynctest {
 			continue
 		}
-		for _, imp := range networkImports {
-			if strings.Contains(src, imp) {
-				t.Errorf("%s uses testing/synctest AND imports %s.\n\n"+
-					"A synctest bubble containing a real listener deadlocks or hangs, because\n"+
-					"grpc-go's transport goroutines are not durably blocking. Test the pure\n"+
-					"sequencing logic in a bubble and the network behaviour against a real\n"+
-					"bufconn server, in two separate tests.", rel, imp)
+
+		for _, imp := range file.Imports {
+			path, err := strconv.Unquote(imp.Path.Value)
+			if err != nil || !networkPackages[path] {
+				continue
 			}
+			t.Errorf("%s imports testing/synctest AND %s.\n\n"+
+				"A synctest bubble containing a real listener deadlocks or hangs, because\n"+
+				"grpc-go's transport goroutines are not durably blocking -- and a hanging\n"+
+				"test in the default tier is worse than a failing one, because a newcomer\n"+
+				"cannot tell whether they broke it.\n\n"+
+				"Split it: test the pure sequencing logic in a bubble (see\n"+
+				"internal/app/shutdown_test.go) and the real network behaviour against a\n"+
+				"bufconn server in its own test.", rel, path)
 		}
 	}
 }

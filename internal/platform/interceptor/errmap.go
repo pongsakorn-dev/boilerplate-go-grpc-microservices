@@ -11,14 +11,15 @@ import (
 
 // ErrorMap converts handler errors into gRPC statuses with machine-readable details.
 //
-// It is the INNERMOST interceptor, which means it runs last on the way in and first on
-// the way out. That placement is load-bearing: every interceptor outside it -- logging,
-// metrics, tracing -- then observes the FINAL status code. Put it anywhere else and your
-// dashboards fill with codes.Unknown for errors you carefully classified, because
-// logging saw the raw error before it was mapped.
+// Its POSITION in the chain is load-bearing and non-obvious. internal/grpcapi/chain.go is
+// the single canonical explanation; it is deliberately not repeated here.
 //
-// chain_test.go asserts this behaviourally: a domain not-found must appear as NotFound in
-// both the log record and the grpc_server_handled_total metric, not as Unknown.
+// (It used to be. This paragraph said "It is the INNERMOST interceptor" while chain.go said
+// in capitals that innermost is wrong -- the one argument written at four sites is the one
+// that drifted into a flat contradiction, at six months old with a single author. That is
+// the empirical case for one canonical home per argument.)
+//
+// Short version: below logging and metrics, above everything that produces an error.
 func ErrorMap(domain string) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		resp, err := handler(ctx, req)
