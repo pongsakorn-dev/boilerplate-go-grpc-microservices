@@ -1,0 +1,42 @@
+# buf workspace.
+#
+# NOTE: there is deliberately no `deps:` block and no buf.lock. BSR dependencies
+# resolve into %LOCALAPPDATA%\buf\cache, which `go mod download` never warms — so
+# declaring them would make "clone and generate offline" false on a cold machine.
+# Everything third-party is vendored under proto/third_party/ instead.
+#
+# Two modules: third_party is on the include path but is never linted, never
+# breaking-checked, and never generated (see buf.gen.yaml `inputs`).
+version: v2
+
+modules:
+  - path: proto
+    excludes:
+      - proto/third_party
+    lint:
+      use:
+        - STANDARD
+    breaking:
+      use:
+        - WIRE_JSON
+
+  - path: proto/third_party
+    lint:
+      use:
+        - MINIMAL
+      ignore:
+        - proto/third_party
+    breaking:
+      ignore:
+        - proto/third_party
+
+lint:
+  use:
+    - STANDARD
+
+# WIRE_JSON, not the looser default: this template ships a JSON/REST edge, so a change
+# that is wire-compatible but renames a JSON field is still a breaking change for callers.
+# Stating it explicitly makes the strictness a decision rather than an inherited default.
+breaking:
+  use:
+    - WIRE_JSON
