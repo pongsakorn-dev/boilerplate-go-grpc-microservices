@@ -1,0 +1,44 @@
+version: v2
+
+# Managed mode owns go_package, so no .proto file hand-writes one. That means
+# `cmd/rename` only has to rewrite the prefix HERE, not in every proto file.
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/example/gomicro/gen/go
+
+  disable:
+    # Third-party protos already have canonical Go packages published as modules
+    # (google.golang.org/genproto/..., buf.build/gen/go/...). If managed mode rewrote
+    # their go_package under our prefix, protoc-gen-go would emit a SECOND copy of the
+    # same descriptors and the protobuf runtime would panic at init with
+    # "file already registered". internal/protoschema/descriptor_test.go guards this.
+    - file_option: go_package_prefix
+      path: google/api
+    - file_option: go_package_prefix
+      path: buf/validate
+
+plugins:
+  # `local:` takes an argv list, so plugins resolve through the go.mod `tool` directive.
+  # That puts protoc-gen-go in the SAME module graph as the google.golang.org/protobuf
+  # runtime, which makes generator/runtime version skew structurally impossible.
+  # (buf itself is deliberately NOT a tool dependency — see Taskfile.yml.)
+  - local: [go, tool, protoc-gen-go]
+    out: gen/go
+    opt: paths=source_relative
+
+  - local: [go, tool, protoc-gen-go-grpc]
+    out: gen/go
+    opt: paths=source_relative
+
+  - local: [go, tool, protoc-gen-grpc-gateway]
+    out: gen/go
+    opt: paths=source_relative
+
+# Only our own protos are generated. third_party is on the include path for imports
+# and nothing more.
+inputs:
+  - directory: proto
+    paths:
+      - proto/order

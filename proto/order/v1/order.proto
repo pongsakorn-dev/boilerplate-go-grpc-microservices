@@ -1,0 +1,187 @@
+syntax = "proto3";
+
+package order.v1;
+
+import "buf/validate/validate.proto";
+import "google/api/annotations.proto";
+import "google/protobuf/timestamp.proto";
+
+// NOTE: no `option go_package` here on purpose. buf.gen.yaml managed mode owns it,
+// so forking this template means changing ONE line in buf.gen.yaml rather than one
+// line in every .proto file. `cmd/rename` does exactly that.
+
+// Money mirrors google.type.Money field-for-field (currency_code / units / nanos).
+//
+// It is declared here rather than importing google/type/money.proto so the proto tree
+// stays self-contained and codegen needs one fewer vendored file. The wire format is
+// identical to google.type.Money, so swapping to the canonical type later is not a
+// breaking change.
+//
+// Money is NEVER a double. internal/order/money_test.go has an AST test asserting
+// float64 appears nowhere in the money path -- floating point silently corrupts
+// financial data in a way no integration test will catch.
+message Money {
+  // ISO-4217 three-letter currency code, e.g. "USD".
+  string currency_code = 1 [(buf.validate.field).string.pattern = "^[A-Z]{3}$"];
+
+  // Whole units. For "USD", 1 unit is 1 dollar.
+  int64 units = 2;
+
+  // Fractional part in nanos (10^-9). Must carry the same sign as units.
+  int32 nanos = 3 [(buf.validate.field).int32 = {
+    gte: -999999999
+    lte: 999999999
+  }];
+
+  option (buf.validate.message).cel = {
+    id: "money.sign_consistency"
+    message: "units and nanos must have the same sign"
+    expression: "(this.units >= 0 && this.nanos >= 0) || (this.units <= 0 && this.nanos <= 0)"
+  };
+}
+
+enum OrderStatus {
+  ORDER_STATUS_UNSPECIFIED = 0;
+  ORDER_STATUS_PENDING = 1;
+  ORDER_STATUS_CONFIRMED = 2;
+  ORDER_STATUS_SHIPPED = 3;
+  ORDER_STATUS_CANCELLED = 4;
+}
+
+message OrderItem {
+  string sku = 1 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 64
+  }];
+
+  int32 quantity = 2 [(buf.validate.field).int32.gt = 0];
+
+  Money unit_price = 3 [(buf.validate.field).required = true];
+}
+
+message Order {
+  string order_id = 1;
+
+  // Set from the verified token, never from the request body. An inbound tenant_id is
+  // rejected by the auth interceptor -- see auth/tenant_isolation_test.go.
+  string tenant_id = 2;
+
+  string customer_id = 3;
+  OrderStatus status = 4;
+  repeated OrderItem items = 5;
+  Money total = 6;
+
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+}
+
+message CreateOrderRequest {
+  string customer_id = 1 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 64
+  }];
+
+  repeated OrderItem items = 2 [(buf.validate.field).repeated = {
+    min_items: 1
+    max_items: 100
+  }];
+
+  // Optional. When present, the RPC is replayable: sending the same key twice yields
+  // one order and two byte-identical responses. The client retry policy in
+  // internal/platform/client/servicecfg.json only retries CreateOrder when this is set,
+  // because retrying a non-idempotent mutation is how a template ships duplicate orders.
+  string idempotency_key = 3 [
+    (buf.validate.field).string.uuid = true,
+    (buf.validate.field).ignore = IGNORE_IF_ZERO_VALUE
+  ];
+}
+
+message CreateOrderResponse {
+  Order order = 1;
+}
+
+message GetOrderRequest {
+  string order_id = 1 [(buf.validate.field).string.uuid = true];
+}
+
+message GetOrderResponse {
+  Order order = 1;
+}
+
+message ListOrdersRequest {
+  // Server clamps this to a documented maximum and echoes the size actually used.
+  int32 page_size = 1 [(buf.validate.field).int32 = {
+    gte: 0
+    lte: 1000
+  }];
+
+  // Opaque. Callers must treat it as a blob -- it encodes the keyset cursor, and its
+  // internal shape is not part of the API contract.
+  string page_token = 2;
+
+  // Typed filter fields only, deliberately not an AIP-160 expression language: a CEL-ish
+  // filter parser is a large surface with no static query guarantees behind it.
+  OrderStatus status = 3;
+  string customer_id = 4;
+}
+
+message ListOrdersResponse {
+  repeated Order orders = 1;
+
+  // Empty when there are no further pages.
+  string next_page_token = 2;
+}
+
+message CancelOrderRequest {
+  string order_id = 1 [(buf.validate.field).string.uuid = true];
+
+  string reason = 2 [(buf.validate.field).string.max_len = 512];
+
+  string idempotency_key = 3 [
+    (buf.validate.field).string.uuid = true,
+    (buf.validate.field).ignore = IGNORE_IF_ZERO_VALUE
+  ];
+}
+
+message CancelOrderResponse {
+  Order order = 1;
+}
+
+message WatchOrdersRequest {
+  OrderStatus status = 1;
+}
+
+message WatchOrdersResponse {
+  Order order = 1;
+}
+
+service OrderService {
+  rpc CreateOrder(CreateOrderRequest) returns (CreateOrderResponse) {
+    option (google.api.http) = {
+      post: "/v1/orders"
+      body: "*"
+    };
+  }
+
+  rpc GetOrder(GetOrderRequest) returns (GetOrderResponse) {
+    option (google.api.http) = {get: "/v1/orders/{order_id}"};
+  }
+
+  rpc ListOrders(ListOrdersRequest) returns (ListOrdersResponse) {
+    option (google.api.http) = {get: "/v1/orders"};
+  }
+
+  rpc CancelOrder(CancelOrderRequest) returns (CancelOrderResponse) {
+    option (google.api.http) = {
+      post: "/v1/orders/{order_id}:cancel"
+      body: "*"
+    };
+  }
+
+  // Server-streaming exists in the template on purpose: a stream is the only way to
+  // exercise the grpc.ServerStream context wrapper, mid-stream client cancellation, and
+  // the graceful-drain path. All three are invisible to unary tests.
+  rpc WatchOrders(WatchOrdersRequest) returns (stream WatchOrdersResponse) {
+    option (google.api.http) = {get: "/v1/orders:watch"};
+  }
+}

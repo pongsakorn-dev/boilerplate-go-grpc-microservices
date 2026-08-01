@@ -1,0 +1,133 @@
+version: '3'
+
+# Rules enforced by internal/devtools/taskfile_test.go:
+#
+#   1. Every cmds: line's first token must be one of {go, docker, kubectl, git}.
+#      Task's embedded shell (mvdan.cc/sh) has NO rm/cp/mv/sed/awk/jq builtins on
+#      Windows. Anything filesystem- or text-shaped lives in cmd/devtool instead, in Go.
+#   2. Every path interpolation is double-quoted. GOROOT on a stock Windows install is
+#      "C:\Program Files\Go" -- an unquoted path with a space silently splits into two args.
+
+vars:
+  # buf is deliberately NOT in the go.mod `tool` directive.
+  #
+  # Buf's own docs say not to install it via tools.go or `go tool`, because that resolves
+  # buf's dependencies against yours. Both buf and this service depend on
+  # google.golang.org/protobuf and golang.org/x/net, so MVS would silently upgrade the
+  # protobuf RUNTIME of every service built from this template in order to satisfy a
+  # build tool. The symptom (a protobuf runtime panic) would never be traced back here.
+  #
+  # The @version suffix makes `go run` ignore this module's go.mod entirely.
+  #
+  # Pinned in three places: here, .github/workflows/ci.yml, and
+  # tools/codegen_uptodate_test.go. test/toolpins_test.go asserts all three are identical.
+  BUF: github.com/bufbuild/buf/cmd/buf@v1.72.0
+
+  # Same mechanism, same reasoning. `go run pkg@version` resolves golangci-lint's deps
+  # against its own go.mod, so it needs neither the tool directive nor Docker.
+  GOLANGCI: github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+
+tasks:
+  default:
+    desc: Show available tasks
+    cmds:
+      - go tool task --list-all
+    silent: true
+
+  setup:
+    desc: Download modules and warm the build cache
+    cmds:
+      - go mod download
+      - go build ./...
+
+  gen:
+    desc: Regenerate protobuf code (no protoc, no network, no Docker)
+    cmds:
+      - go run {{.BUF}} generate
+
+  proto:lint:
+    desc: Lint .proto files
+    cmds:
+      - go run {{.BUF}} lint
+
+  proto:breaking:
+    desc: Fail if the wire or JSON contract broke against main
+    cmds:
+      - go run {{.BUF}} breaking --against ".git#branch=main"
+
+  verify:
+    desc: Default tier -- no Docker, no network, no cgo. This is the one that must always pass.
+    cmds:
+      - go build ./...
+      - go vet ./...
+      - go test ./...
+
+  verify:int:
+    desc: Integration tier -- requires a running Docker daemon
+    cmds:
+      - go test -tags=integration ./...
+
+  verify:e2e:
+    desc: End-to-end tier -- builds the real image and runs the compose stack
+    cmds:
+      - go test -tags=e2e ./test/e2e/...
+
+  verify:codegen:
+    desc: Assert the committed generated code still matches the protos
+    cmds:
+      - go test -tags=codegen ./tools/...
+
+  test:race:
+    desc: Race detector. Needs cgo, so it is guarded -- see cmd/devtool.
+    cmds:
+      - go run ./cmd/devtool race
+
+  lint:
+    desc: golangci-lint
+    cmds:
+      - go run {{.GOLANGCI}} run
+
+  fmt:
+    desc: Format all Go code
+    cmds:
+      - go fmt ./...
+
+  dev:
+    desc: Run the order service locally (in-memory store, dev auth)
+    cmds:
+      - go run ./cmd/orderd
+
+  doctor:
+    desc: Report what this machine can and cannot run, and why
+    cmds:
+      - go run ./cmd/devtool doctor
+
+  clean:
+    desc: Remove build and test artifacts
+    cmds:
+      - go run ./cmd/devtool clean
+
+  build:
+    desc: Build all binaries into bin/
+    cmds:
+      - go build -o "bin/" ./cmd/...
+
+  migrate:up:
+    desc: Apply database migrations (never runs on service boot)
+    cmds:
+      - go run ./cmd/migrate up
+
+  compose:up:
+    desc: Start postgres, redis, nats and the telemetry stack
+    cmds:
+      - docker compose -f "deploy/compose/docker-compose.yml" up -d
+
+  compose:down:
+    desc: Stop the local stack and delete its volumes
+    cmds:
+      - docker compose -f "deploy/compose/docker-compose.yml" down -v
+
+  k8s:render:
+    desc: Render the dev overlay (kubectl embeds kustomize -- no extra tool needed)
+    cmds:
+      - kubectl kustomize "deploy/k8s/overlays/dev"
