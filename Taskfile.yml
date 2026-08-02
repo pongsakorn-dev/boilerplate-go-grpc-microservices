@@ -89,17 +89,28 @@ tasks:
     cmds:
       - go run ./cmd/migrate status
 
+  db:prune:dry-run:
+    desc: Count what retention WOULD delete from outbox and processed_events, changing nothing
+    cmds:
+      - go run ./cmd/prune -dry-run
+
+  db:prune:
+    desc: Delete aged rows from outbox and processed_events. Run db:prune:dry-run first.
+    cmds:
+      - go run ./cmd/prune
+
   verify:deploy:
     desc: Build the kustomize overlays. Needs kubectl (which embeds kustomize v5).
     cmds:
       - kubectl kustomize deploy/k8s/overlays/dev
 
   docker:build:
-    desc: Build all three images from the multi-target Dockerfile
+    desc: Build all four images from the multi-target Dockerfile
     cmds:
       - docker build -f deploy/docker/Dockerfile --target orderd -t gomicro/orderd:dev .
       - docker build -f deploy/docker/Dockerfile --target migrate -t gomicro/migrate:dev .
       - docker build -f deploy/docker/Dockerfile --target worker -t gomicro/worker:dev .
+      - docker build -f deploy/docker/Dockerfile --target prune -t gomicro/prune:dev .
 
   up:
     desc: Start postgres, redis and nats. Add --profile auth for Keycloak, obs for Grafana.

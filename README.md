@@ -157,6 +157,7 @@ cmd/
   orderd/                   the service. ~15 lines; everything lives in internal/app
   migrate/                  goose runner. The ONLY thing that changes the schema
   worker/                   drains the outbox. A separate process on purpose
+  prune/                    retention. A CronJob, separate from the relay on purpose
   devtool/                  cross-platform task helpers (Taskfile can't do filesystem work)
   rename/                   one-shot fork tool. Regenerates protos, then deletes itself
 
@@ -406,11 +407,11 @@ implementation plan; the short version:
 
 ```bash
 task up              # postgres + redis. Add --profile auth for Keycloak, obs for Grafana
-task docker:build    # all three images from one Dockerfile
+task docker:build    # all four images from one Dockerfile
 task verify:deploy   # build the kustomize overlays (needs kubectl)
 ```
 
-### One Dockerfile, three targets
+### One Dockerfile, four targets
 
 `orderd`, `migrate` and `worker` share a build stage, so the Go version can't drift between
 them. Measured:
@@ -716,6 +717,46 @@ order_counts      still 2
 ```
 
 That is the interlock the whole design rests on, observed rather than described.
+
+### Retention
+
+`outbox` and `processed_events` are append-only. The relay must not delete what it publishes
+and the consumer must not delete its own dedup rows, so without something outside both of them
+these become the largest tables in the database, without bound.
+
+[`cmd/prune`](cmd/prune/main.go) is that something — a separate binary on a schedule, not a
+goroutine in the worker. Draining the outbox and pruning it have opposite urgency: a drain that
+stops means events are not being delivered and someone should be woken, while a prune that
+stops means a table is bigger than it should be and someone should look next week. Running the
+`DELETE` inside the relay's loop couples those, so lock pressure from housekeeping becomes a
+delivery outage.
+
+**`RETENTION_PROCESSED_EVENTS` must exceed `NATS_STREAM_MAX_AGE`, and startup refuses a
+configuration where it does not.** That is a correctness boundary rather than a preference. A
+dedup row is safe to delete only once the broker can no longer deliver its message — which is
+when the stream's own retention has dropped it. Delete it an hour early and a redelivery lands
+on a consumer with no memory of having seen it: the projection applies the event twice, and
+nothing reports it. No error, no metric, and the events that caused it are gone from the stream
+by the time anyone reconciles the numbers. The shipped defaults leave a day of margin.
+
+**Quarantined rows are never pruned, at any age.** A row with `failed_at` set was never
+published and stays until an operator clears it — which makes it, by construction, the oldest
+row in the table and the first thing an age-based sweep would reach. What prevents that is
+ageing on `published_at` rather than `occurred_at`: an unpublished row has no `published_at`,
+and `NULL < timestamp` is `NULL`, which `WHERE` treats as false. Pending and quarantined rows
+are ineligible automatically.
+
+Run the dry run before the first real one — it is the only run that deletes months at once:
+
+```bash
+go run ./cmd/prune -dry-run
+```
+
+The exit code carries one signal worth alerting on. A prune stopped by SIGTERM exits **0** —
+the cluster is taking the pod away and the committed batches are kept. A prune that hits its
+`-timeout` exits **non-zero**, and that means retention is falling behind the write rate: the
+schedule is too infrequent, or `RETENTION_BATCH_SIZE` too small. It is self-worsening, because
+every run that does not finish leaves more for the next one.
 
 ---
 
@@ -1286,6 +1327,9 @@ misconfigured deploy into five rollout attempts.
 | `NATS_CONSUMER` | `order-projection` | Durable name, and the key `processed_events` is namespaced by |
 | `NATS_MAX_DELIVER` | `5` | Attempts before the message is dead-lettered |
 | `NATS_ACK_WAIT` | `30s` | Must exceed the handler's worst case, or slow work looks like a duplicate |
+| `RETENTION_OUTBOX` | `168h` | How long a **published** outbox row is kept. Quarantined rows are never pruned at any age |
+| `RETENTION_PROCESSED_EVENTS` | `192h` | **Startup fails unless this exceeds `NATS_STREAM_MAX_AGE`** — see [Retention](#retention) |
+| `RETENTION_BATCH_SIZE` | `1000` | Rows per `DELETE`. An unbounded one holds a lock for its whole duration |
 | `UPSTREAM_DEFAULT_TIMEOUT` | `10s` | Bounds an outbound call whose context carries no deadline |
 | `UPSTREAM_RESERVE_FRACTION` | `0.1` | Share of the remaining deadline kept back, so an upstream call fails **inside** your handler |
 | `UPSTREAM_MIN_BUDGET` | `50ms` | Below this a call is refused without dialling. There is no upstream **address** setting — see [Calling another service](#calling-another-service) |
@@ -1471,15 +1515,16 @@ half-build. They are ordered by dependency:
 
 | | What is left | Depends on |
 |---|---|---|
-| 1 | Retention for `outbox` and `processed_events` — both grow forever | — |
-| 2 | A metric for quarantined rows and for the oldest unpublished one | — |
-| 3 | Keycloak in the e2e tier, so OIDC is not hand-verified | — |
-| 4 | `grpc_client_*` metrics | 2 — same registry, and `MustRegister` panics on a duplicate |
-| 5 | Trace context carried through the outbox into the consumer | — (largest blast radius: a migration plus the event shape) |
-| 6 | An executable `DELETING.md` — the `profile` tier the plan named | 1, 2, 4, 5 — each changes the subsystem inventory it encodes |
+| 1 | A metric for quarantined rows and for the oldest unpublished one | — |
+| 2 | Keycloak in the e2e tier, so OIDC is not hand-verified | — |
+| 3 | `grpc_client_*` metrics | 1 — same registry, and `MustRegister` panics on a duplicate |
+| 4 | Trace context carried through the outbox into the consumer | — (largest blast radius: a migration plus the event shape) |
+| 5 | An executable `DELETING.md` — the `profile` tier the plan named | 1, 3, 4 — each changes the subsystem inventory it encodes |
 
-Items 1, 2, 3 and 5 are described in full under *Known gaps*, including the exact predicates
-and the reasoning about what is safe.
+Items 1, 2 and 4 are described in full under *Known gaps*, including the exact predicates and
+the reasoning about what is safe.
+
+Retention shipped as [`cmd/prune`](cmd/prune/main.go) and is no longer on this list.
 
 Every "reduced", "split" and "cut" above came out of a review that asked what this template
 over-engineers. [ADR 0002](docs/adr/0002-what-was-cut.md) records what was removed and the two
@@ -1499,11 +1544,10 @@ rather than maintained.
   `task verify:e2e`, because the shipped compose file does not configure `orderd` for OIDC —
   wiring that would mean a second compose profile whose only consumer is a test. Everything
   else in the deployment story is now automated.
-- **Nothing prunes `outbox` or `processed_events`.** Both grow forever. `processed_events`
-  only needs to outlive `NATS_STREAM_MAX_AGE` — a message the broker has dropped can never be
-  redelivered — so a periodic `DELETE ... WHERE processed_at < now() - interval '8 days'` is
-  safe for the shipped 7-day default. The outbox needs the same treatment for published rows.
-  Neither job is shipped, because the right schedule depends on volume nobody here knows.
+- **The prune schedule is a guess.** `cmd/prune` ships and the CronJob runs nightly at 03:17,
+  but the right *frequency* depends on volume nobody here knows. A service writing a thousand
+  events a second wants it hourly; one writing a thousand a day could run it monthly. The
+  schedule is the one number in `prune-cronjob.yaml` you should expect to change.
 - **Quarantined outbox rows need an alert.** A row with `failed_at` set is skipped forever
   until a human clears it, and nothing in the system will mention it again. The query is
   `SELECT count(*) FROM outbox WHERE failed_at IS NOT NULL` — the alert is yours to wire.

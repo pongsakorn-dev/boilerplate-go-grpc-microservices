@@ -1,0 +1,121 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: prune
+  labels:
+    app.kubernetes.io/name: prune
+spec:
+  # 03:17, not 03:00.
+  #
+  # Every cron example ever written uses the top of the hour, so a cluster's nightly jobs all
+  # fire at the same instant and contend for the same database. An odd minute costs nothing and
+  # takes this job out of that pile.
+  schedule: "17 3 * * *"
+
+  # FORBID, not Allow.
+  #
+  # Two pruners deleting from the same table at once is not a correctness problem -- the
+  # DELETEs are idempotent and ctid batches are disjoint under row locks -- but it doubles the
+  # lock pressure on a table that is also being written to continuously. If one run overruns
+  # into the next window, the right answer is to let it finish, not to start a second.
+  concurrencyPolicy: Forbid
+
+  # A run that has not started within an hour of its schedule is skipped rather than queued.
+  # Retention is not time-critical: missing one night is invisible, while a thundering herd of
+  # deferred runs after a cluster outage is not.
+  startingDeadlineSeconds: 3600
+
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+
+  jobTemplate:
+    spec:
+      # Two attempts, then stop and stay visible.
+      #
+      # A prune that fails repeatedly is usually failing for a reason retries cannot fix -- a
+      # statement timeout, a lock, a full disk. Retrying forever would bury that in a crash
+      # loop; failing the Job leaves it in the history where failedJobsHistoryLimit keeps it.
+      backoffLimit: 2
+
+      # Bound the whole Job. The binary's own -timeout defaults to 30m; this is the outer
+      # guard for the case where it is stuck somewhere the deadline does not reach.
+      activeDeadlineSeconds: 2400
+
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: prune
+        spec:
+          restartPolicy: Never
+
+          # The pruner checks for cancellation at every batch boundary and exits keeping the
+          # batches it completed, so a stop mid-run loses no progress and needs no rollback.
+          terminationGracePeriodSeconds: 30
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+
+          containers:
+            - name: prune
+              image: gomicro/prune
+              imagePullPolicy: IfNotPresent
+
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                runAsNonRoot: true
+                capabilities:
+                  drop: ["ALL"]
+
+              # No probes: this is a Job. It runs to completion and its exit code is the
+              # verdict, which is what a probe would otherwise be approximating.
+
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  # Memory only, no CPU limit. Same reasoning as orderd and worker: CFS
+                  # throttling on a batch job turns a long job into a much longer one.
+                  memory: 256Mi
+
+              env:
+                - name: APP_ENV
+                  value: production
+                - name: SERVICE_NAME
+                  value: prune
+
+                # RETENTION_PROCESSED_EVENTS MUST EXCEED NATS_STREAM_MAX_AGE, and the binary
+                # refuses to start otherwise. Both are set here rather than left to defaults so
+                # the relationship is visible in one place: raising the stream's retention
+                # without raising this one is the mistake the check exists to catch.
+                #
+                # 8 days against the shipped 7-day stream leaves a day of margin for clock skew
+                # and for a night when this job does not run.
+                - name: NATS_STREAM_MAX_AGE
+                  value: "168h"
+                - name: RETENTION_PROCESSED_EVENTS
+                  value: "192h"
+                - name: RETENTION_OUTBOX
+                  value: "168h"
+                - name: RETENTION_BATCH_SIZE
+                  value: "1000"
+
+              envFrom:
+                # Carries POSTGRES_DSN. NATS_URL is unused here -- the pruner never talks to
+                # the broker -- but the secret is shared with orderd and worker.
+                - secretRef:
+                    name: orderd-secrets
+
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+
+          volumes:
+            - name: tmp
+              emptyDir: {}
