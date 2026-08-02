@@ -109,6 +109,9 @@ type Config struct {
 	Outbox OutboxConfig
 	NATS   NATSConfig
 
+	// Upstream configures OUTBOUND calls to other services. See internal/platform/client.
+	Upstream UpstreamConfig
+
 	Telemetry TelemetryConfig
 	Server    ServerConfig
 	Shutdown  ShutdownConfig
@@ -285,6 +288,39 @@ type NATSConfig struct {
 	AckWait time.Duration
 }
 
+// UpstreamConfig configures calls this service makes TO other services.
+//
+// There is deliberately no address here. A platform package cannot know your upstreams, and a
+// single UPSTREAM_ADDR would be wrong the moment there are two of them -- so the target is
+// passed by whoever builds the connection, and only the cross-cutting behaviour lives here.
+type UpstreamConfig struct {
+	// DefaultTimeout bounds an outbound call whose context carries no deadline.
+	//
+	// Separate from the server's DEFAULT_TIMEOUT on purpose: that one decides how long this
+	// service is willing to WORK, and this one how long it is willing to WAIT. They are
+	// tuned by different evidence and there is no reason for them to move together.
+	DefaultTimeout time.Duration
+
+	// ReserveFraction is the share of the remaining deadline kept back for this service.
+	//
+	// It is what makes an upstream timeout land INSIDE your handler instead of alongside it.
+	// Spend the caller's whole budget on the upstream call and, when the upstream is slow,
+	// your handler is cancelled at the same instant -- no log line naming the culprit, no
+	// metric, and a caller who learns only that something somewhere was slow.
+	//
+	// 0.1 leaves a tenth. Too small and there is no room to record anything; too large and
+	// you fail calls that would have succeeded.
+	ReserveFraction float64
+
+	// MinBudget is the least remaining time worth making a call with.
+	//
+	// Below it the client fails immediately without dialling. Making the call anyway spends
+	// a connection, a goroutine and a full upstream handler on an answer that is already
+	// certain to arrive too late -- and the upstream has no way to know that, so it does the
+	// entire job before discovering nobody is listening.
+	MinBudget time.Duration
+}
+
 type ServerConfig struct {
 	// MaxConcurrentStreams must be set: grpc-go's default is effectively unbounded, so
 	// one client can open enough streams to exhaust memory.
@@ -398,6 +434,12 @@ func ParseFor(env map[string]string, role Role) (Config, error) {
 			Consumer:         p.str("NATS_CONSUMER", "order-projection"),
 			MaxDeliver:       p.intVal("NATS_MAX_DELIVER", 5),
 			AckWait:          p.dur("NATS_ACK_WAIT", 30*time.Second),
+		},
+
+		Upstream: UpstreamConfig{
+			DefaultTimeout:  p.dur("UPSTREAM_DEFAULT_TIMEOUT", 10*time.Second),
+			ReserveFraction: p.float("UPSTREAM_RESERVE_FRACTION", 0.1),
+			MinBudget:       p.dur("UPSTREAM_MIN_BUDGET", 50*time.Millisecond),
 		},
 
 		Telemetry: TelemetryConfig{
@@ -535,6 +577,32 @@ func (c Config) Validate() error {
 	// uses outbox.LogPublisher, and a clone with no broker should not have to supply coherent
 	// stream settings for a stream it never creates.
 	errs = append(errs, c.validateNATS()...)
+
+	// A reserve outside (0,1) is not a tuning choice, it is a broken one: at 0 the upstream
+	// gets the entire deadline and the headroom this exists for is gone, and at 1 or above
+	// every call is refused before it is made.
+	if c.Upstream.ReserveFraction <= 0 || c.Upstream.ReserveFraction >= 1 {
+		errs = append(errs, fmt.Errorf(
+			"UPSTREAM_RESERVE_FRACTION %v must be between 0 and 1 exclusive: at 0 an upstream "+
+				"call consumes the caller's whole deadline and your handler is cancelled with it",
+			c.Upstream.ReserveFraction))
+	}
+	if c.Upstream.DefaultTimeout <= 0 {
+		errs = append(errs, fmt.Errorf("UPSTREAM_DEFAULT_TIMEOUT must be positive, got %s",
+			c.Upstream.DefaultTimeout))
+	}
+	if c.Upstream.MinBudget <= 0 {
+		errs = append(errs, fmt.Errorf("UPSTREAM_MIN_BUDGET must be positive, got %s",
+			c.Upstream.MinBudget))
+	}
+	if c.Upstream.MinBudget >= c.Upstream.DefaultTimeout {
+		// Nothing would ever be callable: a call with no deadline gets DefaultTimeout, which
+		// would immediately be judged too small to bother making.
+		errs = append(errs, fmt.Errorf(
+			"UPSTREAM_MIN_BUDGET (%s) must be less than UPSTREAM_DEFAULT_TIMEOUT (%s), or every "+
+				"call with no deadline is refused before it is made",
+			c.Upstream.MinBudget, c.Upstream.DefaultTimeout))
+	}
 
 	if c.Postgres.MaxOpenConns <= 0 {
 		errs = append(errs, errors.New("POSTGRES_MAX_OPEN_CONNS must be positive and explicit"))

@@ -42,7 +42,7 @@ time than one that ships less.
 | Outbox + relay | ✅ Done | Written in the business transaction; drained by `cmd/worker`. **At-least-once** |
 | NATS JetStream publisher + consumer | ✅ Done | Synchronous acks, `Nats-Msg-Id` dedup, dead-letter subject, outbox quarantine |
 | Read-model projection + consumer dedup | ✅ Done | `processed_events` written in the **same transaction** as the effect |
-| Typed client + deadline budget | ⬜ M9 | Scope **reduced**: the second service was cut |
+| Outbound client + deadline budget | ✅ Done | Budget, opt-in retries, no token forwarding, upstream errors. **No production call site** — see below |
 | Dockerfile, compose, kustomize | ✅ Done | 11.7 MB distroless, no shell. Manifests asserted in the default tier |
 | Keycloak realm example | ✅ Done | Imported by a real Keycloak; a real token accepted end to end — see [`deploy/keycloak/`](deploy/keycloak/) |
 | `cmd/rename`, ADRs, `DELETING.md` | ⬜ M11 | Scope **reduced**: `cmd/scaffold` was cut |
@@ -175,6 +175,7 @@ internal/
     interceptor/              recovery, logging, errmap, admission, auth, deadline, validate
     gormx/                    tenant guard, pool config, slog adapter, query counter
     migrations/               goose .sql via embed.FS
+    client/                   OUTBOUND calls: deadline budget, opt-in retries, upstream errors
     outbox/                   the relay: FOR UPDATE SKIP LOCKED, batched, at-least-once
     events/                   JetStream publisher + consumer, dead-letter, subject rules
       eventstest/               embedded nats-server. No Docker, so it runs in the default tier
@@ -706,6 +707,140 @@ That is the interlock the whole design rests on, observed rather than described.
 
 ---
 
+## Calling another service
+
+`internal/platform/client` is the outbound half of the platform: it hands back a configured
+`*grpc.ClientConn` and knows nothing about any particular service's protobuf, so it is reused
+rather than forked when a second service appears.
+
+> [!NOTE]
+> **Nothing in this repository calls it.** The second service was cut from the plan, so this
+> package is built, tested against the real server over bufconn, and unused. The client is the
+> reusable half of an inter-service story; a second copy of the order domain would have proved
+> less and cost more. You are looking at a library, not a live path.
+
+### The deadline budget
+
+The one thing a service mesh cannot do for you. A mesh enforces a timeout on the call; it
+cannot arrange for **your handler to still be running when that timeout fires**.
+
+Spend the caller's whole remaining deadline on the upstream and, when the upstream is slow,
+both deadlines expire together: your handler is cancelled mid-flight, you log nothing worth
+having, you record no metric, and your caller learns only that something somewhere was slow.
+Reserving a slice means the upstream call fails *first*, inside your handler, where you can
+name the dependency.
+
+| Remaining deadline | What the upstream gets |
+|---|---|
+| none | `UPSTREAM_DEFAULT_TIMEOUT` — an outbound RPC with no deadline holds a goroutine and a connection until the upstream feels like answering |
+| enough | remaining minus `UPSTREAM_RESERVE_FRACTION` |
+| below `UPSTREAM_MIN_BUDGET` | **nothing.** The call is refused without dialling |
+
+That last row is not a detail. Dialling anyway spends a connection, a goroutine and a complete
+upstream handler — including its database work — on an answer already certain to arrive too
+late, and the upstream has no way to know that. Under the load that produces tight deadlines,
+that is the difference between a slow dependency and a collapsed one.
+`TestACallIsRefusedWhenTooLittleTimeRemains` asserts the upstream is never reached at all.
+
+> Writing the reserve test badly is instructive: the first version asserted only "the upstream
+> got less than the whole budget", which **passed with the reserve deleted entirely**, because
+> transit alone costs a fraction of a millisecond. Sabotage caught it; the assertion is now a
+> ceiling of 95%.
+
+### The caller's token is never forwarded
+
+Taking the inbound `Authorization` header and putting it on the outbound call is the obvious
+implementation, works immediately, and is wrong in two ways that are expensive to reverse.
+
+**Audience.** A token names the service it may be spent at, and the verifier refuses one that
+names someone else — which is exactly why a token stolen from service A is useless against
+service B. Forwarding only works if every service shares an audience, at which point that check
+distinguishes nothing, anywhere.
+
+**Confused deputy.** A forwarded bearer token lets whoever holds it act as that user for as long
+as it lives. A compromised downstream can spend it against a third service, and nothing in the
+request says the user did not ask.
+
+The model that works is a service credential plus a separate, verifiable assertion about the end
+user. That assertion needs an issuer this template does not ship, so what *is* shipped is the
+seam: a `Credentials` interface for the service's own identity, and `x-gomicro-tenant-id` /
+`x-gomicro-subject` as context that **nothing trusts** — the server builds its `Principal` from a
+verified token and from nothing else. Scopes are deliberately not propagated at all: an
+authorisation input arriving as an unverified header is a privilege escalation waiting for the
+first service that reads it.
+
+The header arrives on the outgoing context *by inheritance*, so not forwarding it takes
+deliberate code. `TestTheCallersTokenIsNeverForwarded` is what stops that code being deleted as
+redundant — with the strip removed, the end user's token reaches the upstream on the next run.
+
+### Retries are opt-in, per method
+
+Default-deny, the same shape as the authorisation policy and for the same reason: only the
+person who wrote the method knows whether replaying it is safe.
+
+gRPC cannot distinguish a request the server never received from one it received, acted on, and
+then failed to acknowledge. For a read that is free. For `CreateOrder` it is a second order,
+charged to a real customer, with no error anywhere. This repository ships no idempotency-key
+mechanism, so nothing would make a mutation safe to replay — mutations simply have no policy,
+and `TestAMethodWithNoPolicyIsNotRetried` proves the absence means what it should.
+
+`UNAVAILABLE` is the only retryable code. `RESOURCE_EXHAUSTED` is excluded deliberately: this
+service's own server returns it for three different things, one of which (a deadline that had
+already expired on arrival) can never succeed on a retry — and service config cannot express
+"retry unless the reason is `DEADLINE_ALREADY_EXPIRED`". Retry throttling is on whenever any
+policy exists, so a struggling upstream does not receive a traffic multiplier at its worst
+moment.
+
+**The quietest failure in the package**, measured against grpc-go v1.83.0 by breaking each key
+in turn:
+
+| Mistake | What happens |
+|---|---|
+| `retrypolicy` for `retryPolicy` | **Works.** Key matching is case-insensitive |
+| `maxAttempt` for `maxAttempts` | **Loud.** The field is required, so `Dial` fails with "the provided default service config is invalid" |
+| `retry_policy` for `retryPolicy` | **Silent.** Unknown key discarded, config valid, `Dial` succeeds, connection has *no retries at all* |
+
+Nothing in a test suite notices the third — a retry test that only asserts "the call eventually
+succeeded" passes, because the call succeeds on its first attempt whenever nothing is failing.
+`TestARetryPolicyActuallyReachesTheConnection` asks the connection what it actually ended up
+with, which is the only check that cannot be fooled.
+
+### An upstream's error is not yours
+
+Returning the callee's error unchanged is tempting and produces a bug that is unfalsifiable from
+the outside. This service's `ErrorMap` interceptor sees a valid `*status.Error` that is not an
+`*apperr.Error` and forwards it **verbatim** — so your caller receives the upstream's code, the
+upstream's message, and an `ErrorInfo` naming the upstream's service.
+
+Concretely: inventory answers `NotFound` because SKU-9 does not exist, you pass it through, and
+your caller concludes *their order* does not exist. They retry with a different order id and get
+the same answer forever.
+
+So an upstream failure arrives as a `*client.Error`, which is **not** a `*status.Error` and
+cannot be returned by accident. The default translation says what is true about *your* service:
+
+| Upstream said | Your caller sees | Why |
+|---|---|---|
+| `Unavailable`, `DeadlineExceeded`, `Canceled`, `ResourceExhausted` | `KindUnavailable` | Retryable, and a caller can act on it |
+| anything else | `KindInternal` | They did not send that argument — you did. That is your bug |
+
+`Unauthenticated` deserves its own line: forwarding it tells your caller to re-authenticate, so
+they discard a perfectly good session, log in again, and get the same answer — while the real
+fault is *this service's* misconfigured credential, which nobody is looking at.
+
+When a callee's answer genuinely does mean something in your domain, `AppError` translates it
+deliberately and keeps the upstream error as the cause, so it stays in the logs while your caller
+sees only what you chose.
+
+### Transport security
+
+`Insecure()` exists for bufconn and a local stack, and `Dial` **refuses it under
+`APP_ENV=production`** — an unencrypted service-to-service call carries the service credential in
+clear text. It cannot be reached by omission either: leaving `TransportCredentials` unset means
+TLS with the system roots.
+
+---
+
 ## Rate limiting
 
 `REDIS_ADDR` enables a per-tenant quota shared by every replica. Empty disables it, and the
@@ -1069,6 +1204,9 @@ misconfigured deploy into five rollout attempts.
 | `NATS_CONSUMER` | `order-projection` | Durable name, and the key `processed_events` is namespaced by |
 | `NATS_MAX_DELIVER` | `5` | Attempts before the message is dead-lettered |
 | `NATS_ACK_WAIT` | `30s` | Must exceed the handler's worst case, or slow work looks like a duplicate |
+| `UPSTREAM_DEFAULT_TIMEOUT` | `10s` | Bounds an outbound call whose context carries no deadline |
+| `UPSTREAM_RESERVE_FRACTION` | `0.1` | Share of the remaining deadline kept back, so an upstream call fails **inside** your handler |
+| `UPSTREAM_MIN_BUDGET` | `50ms` | Below this a call is refused without dialling. There is no upstream **address** setting — see [Calling another service](#calling-another-service) |
 | `STORE_DRIVER` | `memory` | `memory` \| `postgres`. Postgres needs `POSTGRES_DSN` and a `migrate up` first |
 
 Settings for subsystems that do not exist yet are deliberately
@@ -1157,14 +1295,13 @@ is built.)
 
 **Done:** M0–M1 foundation · M2 toolchain guards · M3 interceptors + observability ·
 M5 auth · M4 Postgres · M6 REST edge · M7 rate limiting · M8a outbox relay ·
-M10 deploy · M8b JetStream + worker · plus an evidence-backed cuts pass.
+M10 deploy · M8b JetStream + worker · M9 outbound client · plus an evidence-backed cuts pass.
 
 **Remaining, in order:**
 
 | | Milestone | What it delivers | Scope change |
 |---|---|---|---|
-| **next** | **M9** Client | `internal/platform/client`: service config, deadline budget, trace/principal propagation | **reduced** — second service cut |
-| | **M11** Forkability | `cmd/rename`, ADRs, `DELETING.md` | **reduced** — `cmd/scaffold` cut |
+| **next** | **M11** Forkability | `cmd/rename`, ADRs, `DELETING.md` | **reduced** — `cmd/scaffold` cut |
 
 Every "reduced" and "split" above came out of a review that asked what this template
 over-engineers. The reasoning is recorded in the commit history rather than restated here —
@@ -1197,6 +1334,15 @@ rather than maintained.
   server is alive, which is not the question. What actually detects a wedged worker is the age
   of the oldest unpublished outbox row. `deploy/k8s/base/worker.yaml` says so at the point
   where the probes would go.
+- **The outbound client has no metrics.** `observability.Metrics` has a `Server` field and no
+  `Client` one, so there are no `grpc_client_*` series. Adding them is a few lines, but the
+  registry uses `MustRegister`, which **panics** on a duplicate — so a fork wiring client
+  metrics must add exactly one `ClientMetrics` to the shared registry, give it the same
+  histogram buckets as the server (otherwise client and server latency are not comparable in
+  PromQL), and note that grpcprom labels carry no target, so two upstreams collapse into one
+  series. Left out rather than half-built, since nothing here calls an upstream yet.
+- **The client is unary-first.** Stream interceptors are wired and the budget bounds how long
+  ESTABLISHING a stream may take, but nothing asserts client-stream behaviour end to end.
 - **The trace does not survive the broker.** The relay reads rows from the database, long
   after the request that produced them finished, so events carry no `traceparent`. Propagating
   it means storing the trace context in the outbox row at write time — a real change to the
