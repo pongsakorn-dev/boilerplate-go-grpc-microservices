@@ -33,8 +33,10 @@ func NewOrderServer(svc *order.Service) *OrderServer {
 // structural rather than a rejection rule: no request message declares a tenant_id, so
 // there is nothing to ignore.
 //
-// Cross-tenant invisibility is asserted by internal/order/ordertest/contract.go. M5 will
-// add the token-side assertion.
+// Cross-tenant invisibility is asserted from both sides: the store's half by
+// internal/order/ordertest/contract.go, and the token's half by
+// auth_test.go::TestTenantIsolationIsDrivenByTheToken, which gives one tenant a fully
+// scoped credential and confirms another tenant's order is indistinguishable from missing.
 func tenantOf(ctx context.Context) (string, error) {
 	tenant, ok := auth.TenantFrom(ctx)
 	if !ok {
@@ -158,7 +160,9 @@ func (s *OrderServer) WatchOrders(req *orderv1.WatchOrdersRequest, stream orderv
 // at runtime rather than failing the build.
 //
 // Embedding is required by grpc-go for forward compatibility, so this cannot be fixed by
-// removing it. The real guard is M5's policy-coverage test, which walks the protobuf
-// registry and fails when an RPC has no explicit authorization decision -- that catches a
-// new RPC at build time, from the registry rather than from the interface.
+// removing it. The real guard is policy_coverage_test.go, which walks the protobuf registry
+// and fails when an RPC has no explicit authorisation decision -- catching a new RPC from
+// the registry rather than from the interface. Stronger still, NewServer calls
+// Policy.ValidateCoverage after registration, so an uncovered method stops the server
+// booting rather than waiting for someone to run the tests.
 var _ orderv1.OrderServiceServer = (*OrderServer)(nil)

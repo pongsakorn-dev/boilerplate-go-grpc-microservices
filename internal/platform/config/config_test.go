@@ -38,34 +38,101 @@ func TestParseDefaults(t *testing.T) {
 	}
 }
 
-// TestValidateRefusesOIDCUntilTheVerifierExists guards the bug that made this whole file
-// worth re-reading.
+// TestValidateRefusesHalfConfiguredOIDC is the successor to a test that refused
+// AUTH_MODE=oidc outright, and it guards the same bug in its surviving form.
 //
-// The server used to install the dev interceptor unconditionally and never read AuthMode at
-// all. So APP_ENV=production AUTH_MODE=oidc validated, booted with no warning, and served
-// every request as a full-scope dev-tenant principal -- and `oidc` is precisely the value a
-// reader sets BECAUSE they read the warning about dev mode.
+// The original bug: the server installed the dev interceptor unconditionally and never read
+// AuthMode, so APP_ENV=production AUTH_MODE=oidc validated, booted with no warning, and
+// served every request as a full-scope dev-tenant principal -- and `oidc` is precisely the
+// value a reader sets BECAUSE they read the warning about dev mode.
 //
-// Until the verifier exists, the only honest behaviour is to refuse. Delete this test in M5,
-// and replace it with one asserting a real token is required.
-func TestValidateRefusesOIDCUntilTheVerifierExists(t *testing.T) {
+// The verifier now exists, so refusing `oidc` outright would be wrong. What must not come
+// back is the shape: a configuration that LOOKS authenticated and verifies nothing. Each
+// case below is one of those.
+func TestValidateRefusesHalfConfiguredOIDC(t *testing.T) {
 	t.Parallel()
 
-	for _, env := range []string{config.EnvDevelopment, config.EnvStaging, config.EnvProduction} {
-		_, err := config.Parse(map[string]string{
-			"APP_ENV":         env,
-			"AUTH_MODE":       config.AuthOIDC,
-			"OIDC_ISSUER_URL": "https://issuer.example.com",
-			"OIDC_AUDIENCE":   "orders",
+	base := map[string]string{
+		"APP_ENV":         config.EnvProduction,
+		"AUTH_MODE":       config.AuthOIDC,
+		"OIDC_ISSUER_URL": "https://issuer.example.com",
+		"OIDC_AUDIENCE":   "orders",
+	}
+
+	cases := []struct {
+		name    string
+		mutate  func(map[string]string)
+		wantHas string
+	}{
+		{
+			// The one that actually bites. A verifier with no expected audience accepts
+			// every token the issuer ever signed -- including tokens minted for a
+			// completely different application that happens to share the IdP. It is a
+			// breach, and it produces no error anywhere until someone notices the wrong
+			// service's users have accounts.
+			name:    "no audience accepts tokens meant for other applications",
+			mutate:  func(m map[string]string) { delete(m, "OIDC_AUDIENCE") },
+			wantHas: "OIDC_AUDIENCE",
+		},
+		{
+			name:    "no issuer means nothing to discover keys from",
+			mutate:  func(m map[string]string) { delete(m, "OIDC_ISSUER_URL") },
+			wantHas: "OIDC_ISSUER_URL",
+		},
+		{
+			// An empty tenant claim would authenticate callers into no tenant at all,
+			// which the store layer must then interpret -- and "no tenant" is one bad
+			// branch away from "every tenant".
+			name:    "empty tenant claim breaks the tenant-comes-from-the-token rule",
+			mutate:  func(m map[string]string) { m["OIDC_TENANT_CLAIM"] = " " },
+			wantHas: "OIDC_TENANT_CLAIM",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			env := make(map[string]string, len(base))
+			for k, v := range base {
+				env[k] = v
+			}
+			tc.mutate(env)
+
+			_, err := config.Parse(env)
+			if err == nil {
+				t.Fatalf("this configuration was accepted, but it verifies nothing meaningful: %v", env)
+			}
+			if !strings.Contains(err.Error(), tc.wantHas) {
+				t.Errorf("error does not name %s: %v", tc.wantHas, err)
+			}
 		})
-		if err == nil {
-			t.Errorf("APP_ENV=%s AUTH_MODE=oidc was accepted, but no OIDC verifier exists -- "+
-				"the service would run with NO authentication while appearing configured", env)
-			continue
-		}
-		if !strings.Contains(err.Error(), "not implemented") {
-			t.Errorf("APP_ENV=%s: error does not explain why oidc is refused: %v", env, err)
-		}
+	}
+}
+
+// TestValidateAcceptsFullyConfiguredOIDC is the other half, and the one that would have
+// caught a refusal left in place after the verifier landed.
+func TestValidateAcceptsFullyConfiguredOIDC(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.Parse(map[string]string{
+		"APP_ENV":         config.EnvProduction,
+		"AUTH_MODE":       config.AuthOIDC,
+		"OIDC_ISSUER_URL": "https://issuer.example.com/realms/gomicro",
+		"OIDC_AUDIENCE":   "orderd",
+	})
+	if err != nil {
+		t.Fatalf("a fully configured OIDC deployment was refused: %v", err)
+	}
+
+	// The claim defaults are what let a Keycloak deployment set two variables instead of
+	// four. If they ever become empty, NewOIDCVerifier refuses to build -- so assert them
+	// here, where the failure names the cause.
+	if cfg.OIDC.TenantClaim != "tenant_id" {
+		t.Errorf("OIDC_TENANT_CLAIM default = %q, want tenant_id", cfg.OIDC.TenantClaim)
+	}
+	if cfg.OIDC.ScopeClaim != "scope" {
+		t.Errorf("OIDC_SCOPE_CLAIM default = %q, want scope", cfg.OIDC.ScopeClaim)
 	}
 }
 

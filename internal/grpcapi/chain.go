@@ -1,7 +1,7 @@
 package grpcapi
 
 import (
-	"fmt"
+	"errors"
 	"log/slog"
 
 	"buf.build/go/protovalidate"
@@ -15,6 +15,7 @@ import (
 
 	orderv1 "github.com/example/gomicro/gen/go/order/v1"
 	"github.com/example/gomicro/internal/order"
+	"github.com/example/gomicro/internal/platform/auth"
 	"github.com/example/gomicro/internal/platform/config"
 	"github.com/example/gomicro/internal/platform/interceptor"
 	"github.com/example/gomicro/internal/platform/observability"
@@ -29,6 +30,20 @@ type Deps struct {
 	Health       *health.Server
 	Metrics      *observability.Metrics
 	Validator    protovalidate.Validator
+
+	// Verifier authenticates callers. REQUIRED -- NewServer refuses a nil one rather than
+	// substituting a default.
+	//
+	// There is no "if nil, build one from Cfg" convenience here, and that omission is the
+	// point. A nil-means-default in an authentication path is how a test helper, a partial
+	// refactor, or a new call site ends up silently running with whatever the default
+	// happens to be. Callers construct it with auth.NewVerifier, whose unknown-mode arm
+	// returns an error.
+	Verifier auth.Verifier
+
+	// Policy is the authorisation map. REQUIRED, and checked for completeness against the
+	// server's registered methods before NewServer returns.
+	Policy auth.Policy
 }
 
 // NewServer builds the production gRPC server: the real interceptor chain, the real
@@ -38,18 +53,21 @@ type Deps struct {
 // their own server. That is what stops the test harness drifting into a parallel wiring
 // that passes while production fails.
 func NewServer(d Deps) (*grpc.Server, error) {
-	// Auth is SELECTED from configuration, never hard-wired.
+	// Auth arrives fully built, and both halves are refused when absent.
 	//
-	// This function used to install DevAuth unconditionally and never read Cfg.AuthMode at
-	// all, which meant AUTH_MODE=oidc was silently ignored and the service ran with no
-	// authentication while appearing configured. config.Validate now refuses that value,
-	// but the durable fix is structural: the switch exists BEFORE the second verifier does,
-	// with a default arm that returns an error rather than falling through to a permissive
-	// one. A factory that cannot express "I do not know this mode" is how fail-open
-	// happens.
-	authUnary, authStream, err := authInterceptors(d.Cfg)
-	if err != nil {
-		return nil, err
+	// This function used to install a dev interceptor unconditionally and never read
+	// Cfg.AuthMode at all, so AUTH_MODE=oidc was silently ignored and the service ran with
+	// no authentication while appearing configured. The bypass was confirmed by writing a
+	// test that called an RPC with no credentials and got three orders back.
+	//
+	// The durable fix is structural rather than a corrected line: selection lives in
+	// auth.NewVerifier, whose unknown-mode arm errors, and this constructor cannot proceed
+	// without the result. Neither function has a permissive path to fall into.
+	if d.Verifier == nil {
+		return nil, errors.New("grpcapi.NewServer: Deps.Verifier is nil; build one with auth.NewVerifier")
+	}
+	if len(d.Policy) == 0 {
+		return nil, errors.New("grpcapi.NewServer: Deps.Policy is empty; every RPC would be denied")
 	}
 
 	// THE CHAIN. grpc-go applies these outermost-first, so the LAST entry is closest to
@@ -62,7 +80,7 @@ func NewServer(d Deps) (*grpc.Server, error) {
 	//  logging    observes the FINAL code, because errmap sits below it
 	//  errmap     see the note below -- its position is the subtle one
 	//  admission  BEFORE auth: shed a flood before paying for signature verification
-	//  auth       establishes the principal (M5 swaps in real verification)
+	//  auth       verifies the credential AND enforces the policy, as one step
 	//  deadline   bounds the handler and everything it calls downstream
 	//  validate   after auth, so an anonymous caller cannot probe the schema
 	//
@@ -77,12 +95,12 @@ func NewServer(d Deps) (*grpc.Server, error) {
 	// record the mapped code rather than Unknown) and ABOVE every interceptor that produces
 	// an error (so those errors get mapped at all). This position satisfies both.
 	unary := []grpc.UnaryServerInterceptor{
-		interceptor.Recovery(d.Log),
+		interceptor.Recovery(d.Log, d.Cfg.ServiceName),
 		d.Metrics.Server.UnaryServerInterceptor(),
 		interceptor.Logging(d.Log),
 		interceptor.ErrorMap(d.Cfg.ServiceName),
 		interceptor.Admission(d.Cfg.Server.AdmissionLimit),
-		authUnary,
+		interceptor.Auth(d.Verifier, d.Policy, d.Log),
 		interceptor.Deadline(d.Cfg.Server.DefaultTimeout, d.Cfg.Server.MaxTimeout),
 		interceptor.Validate(d.Validator),
 	}
@@ -100,11 +118,11 @@ func NewServer(d Deps) (*grpc.Server, error) {
 	// by grpc.MaxConcurrentStreams (250). A fork that adds streaming work touching the
 	// database MUST revisit this -- see docs/adr/ when it lands.
 	stream := []grpc.StreamServerInterceptor{
-		interceptor.RecoveryStream(d.Log),
+		interceptor.RecoveryStream(d.Log, d.Cfg.ServiceName),
 		d.Metrics.Server.StreamServerInterceptor(),
 		interceptor.LoggingStream(d.Log),
 		interceptor.ErrorMapStream(d.Cfg.ServiceName),
-		authStream,
+		interceptor.AuthStream(d.Verifier, d.Policy, d.Log),
 		interceptor.DeadlineStream(d.Cfg.Server.MaxTimeout),
 	}
 
@@ -180,28 +198,19 @@ func NewServer(d Deps) (*grpc.Server, error) {
 	// the alert never fires because the thing it watches does not exist yet.
 	d.Metrics.Server.InitializeMetrics(srv)
 
-	return srv, nil
-}
-
-// authInterceptors picks the verifier for the configured AUTH_MODE.
-//
-// The default arm returns an error and never a permissive fallback. That is the whole
-// point: an unrecognised mode must stop the process, because the alternative -- quietly
-// using dev auth -- is a service that looks configured and authenticates nobody.
-func authInterceptors(cfg config.Config) (grpc.UnaryServerInterceptor, grpc.StreamServerInterceptor, error) {
-	switch cfg.AuthMode {
-	case config.AuthDev:
-		return interceptor.DevAuth(), interceptor.DevAuthStream(), nil
-
-	case config.AuthOIDC:
-		// Unreachable today: config.Validate refuses this value before New is ever called.
-		// The arm exists so that M5 is a change to THIS switch rather than a change to the
-		// shape of the function -- and so that removing the Validate guard without
-		// implementing the verifier fails loudly instead of falling back to dev.
-		return nil, nil, fmt.Errorf(
-			"AUTH_MODE=%s: the OIDC verifier is not implemented yet (milestone M5)", cfg.AuthMode)
-
-	default:
-		return nil, nil, fmt.Errorf("unknown AUTH_MODE %q", cfg.AuthMode)
+	// THE POLICY MUST COVER EVERY REGISTERED METHOD, or this server does not start.
+	//
+	// Deliberately here, after every RegisterXServer call, rather than only in a test. A
+	// test proves the policy was complete the last time someone ran it; this makes an
+	// incomplete policy unable to boot, on every machine, including the one running an
+	// unreviewed branch at 2am.
+	//
+	// It also covers the services grpc-go registers on our behalf -- health and reflection
+	// -- which no .proto in this repo mentions and which a policy written from the .proto
+	// alone would therefore miss.
+	if err := d.Policy.ValidateCoverage(servedMethods(srv), auth.MethodsInPackages(ownedProtoPackages...)); err != nil {
+		return nil, err
 	}
+
+	return srv, nil
 }

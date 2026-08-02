@@ -107,9 +107,31 @@ type PostgresConfig struct {
 type OIDCConfig struct {
 	IssuerURL string
 	Audience  string
-	JWKSURL   string
+
+	// JWKSURL overrides discovery. Empty is the normal case: the verifier reads
+	// jwks_uri from the issuer's /.well-known/openid-configuration.
+	JWKSURL string
+
 	// Leeway tolerates clock skew between this service and the identity provider.
 	Leeway time.Duration
+
+	// TenantClaim and ScopeClaim are where this provider puts the tenant and the granted
+	// scopes. Configurable because no two providers agree, and hardcoding one vendor's
+	// shape is what makes a "generic" template single-vendor in practice.
+	//
+	// Both accept dotted paths for nested claims ("realm_access.roles"). The defaults suit
+	// the Keycloak realm in deploy/keycloak/; auth/claims.go carries the mapping table for
+	// Auth0, Cognito and Entra ID.
+	TenantClaim string
+	ScopeClaim  string
+
+	// MaxKeyAge bounds how long a cached JWKS is served before revalidation.
+	//
+	// This is what makes key REVOCATION take effect. Refetching only when a key id is
+	// unknown never revalidates in the common case, because an issuer that revokes one key
+	// keeps signing with its others -- so every token names a key already cached, and the
+	// revoked one stays trusted until the process restarts.
+	MaxKeyAge time.Duration
 }
 
 type ServerConfig struct {
@@ -180,10 +202,13 @@ func Parse(env map[string]string) (Config, error) {
 		},
 
 		OIDC: OIDCConfig{
-			IssuerURL: p.str("OIDC_ISSUER_URL", ""),
-			Audience:  p.str("OIDC_AUDIENCE", ""),
-			JWKSURL:   p.str("OIDC_JWKS_URL", ""),
-			Leeway:    p.dur("OIDC_LEEWAY", 30*time.Second),
+			IssuerURL:   p.str("OIDC_ISSUER_URL", ""),
+			Audience:    p.str("OIDC_AUDIENCE", ""),
+			JWKSURL:     p.str("OIDC_JWKS_URL", ""),
+			Leeway:      p.dur("OIDC_LEEWAY", 30*time.Second),
+			TenantClaim: p.str("OIDC_TENANT_CLAIM", "tenant_id"),
+			ScopeClaim:  p.str("OIDC_SCOPE_CLAIM", "scope"),
+			MaxKeyAge:   p.dur("OIDC_MAX_KEY_AGE", 15*time.Minute),
 		},
 
 		Telemetry: TelemetryConfig{
@@ -251,25 +276,37 @@ func (c Config) Validate() error {
 		errs = append(errs, errors.New("POSTGRES_DSN is required when STORE_DRIVER=postgres"))
 	}
 
-	// AUTH_MODE=oidc is REFUSED until the verifier exists.
+	// AUTH_MODE=oidc requires enough configuration to actually verify something.
 	//
-	// This is the most important line in this file right now, and it is here because of a
-	// real bug rather than a hypothetical one. The server installed the dev interceptor
-	// unconditionally and never read AuthMode, so APP_ENV=production AUTH_MODE=oidc
-	// validated, booted with no warning, and served every request as a full-scope
-	// dev-tenant principal.
+	// This block replaces a blanket refusal of AUTH_MODE=oidc that stood until the verifier
+	// existed, and the history is worth keeping because it explains the shape. The server
+	// once installed the dev interceptor unconditionally and never read AuthMode, so
+	// APP_ENV=production AUTH_MODE=oidc validated, booted with no warning, and served every
+	// request as a full-scope dev-tenant principal -- a total bypass that sprang only for
+	// the reader who believed the documentation and set the safe-looking value.
 	//
-	// That is worse than shipping no auth at all: `oidc` is precisely the value a reader
-	// sets BECAUSE they read the warning about dev mode. A trap that springs only for the
-	// person who believed your documentation is the worst kind.
-	//
-	// Failing closed means the only bootable value is the one that is honest about what it
-	// does. Delete this block in M5, when NewVerifier can actually return an OIDC verifier.
+	// The lesson carried forward: `oidc` must never be a value that LOOKS configured while
+	// verifying nothing. Half-configured is the modern version of that failure -- an issuer
+	// with no audience accepts every token the IdP ever minted, including tokens for other
+	// applications entirely -- so it is refused here, before any listener opens, as well as
+	// in NewOIDCVerifier.
 	if c.AuthMode == AuthOIDC {
-		errs = append(errs, errors.New(
-			"AUTH_MODE=oidc is refused: OIDC verification is not implemented yet (milestone M5). "+
-				"Until then the only supported value is AUTH_MODE=dev, which authenticates NOBODY "+
-				"and must not be exposed to an untrusted network"))
+		if c.OIDC.IssuerURL == "" {
+			errs = append(errs, errors.New("OIDC_ISSUER_URL is required when AUTH_MODE=oidc"))
+		}
+		if c.OIDC.Audience == "" {
+			errs = append(errs, errors.New(
+				"OIDC_AUDIENCE is required when AUTH_MODE=oidc: without it this service accepts "+
+					"any token the issuer signed, including tokens issued to other applications"))
+		}
+		// TrimSpace, not != "": OIDC_TENANT_CLAIM=" " survives the parser's empty-means-
+		// default rule and would otherwise reach the verifier as a claim path made of one
+		// space, which matches nothing and denies everyone for a reason nobody can see.
+		if strings.TrimSpace(c.OIDC.TenantClaim) == "" {
+			errs = append(errs, errors.New(
+				"OIDC_TENANT_CLAIM must not be empty: the tenant comes from the verified token, "+
+					"never from the request body"))
+		}
 	}
 
 	if c.Postgres.MaxOpenConns <= 0 {
