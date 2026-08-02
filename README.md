@@ -718,6 +718,34 @@ order_counts      still 2
 
 That is the interlock the whole design rests on, observed rather than described.
 
+### Watching the outbox
+
+Two failures here are completely silent from outside the process. A **quarantined** row — one
+the relay gave up on — is skipped by every future drain, and nothing mentions it again, so an
+event sits undelivered until somebody happens to look. And a relay **wedged** on a broker that
+accepts connections but never acks keeps running, logging nothing, with a healthy process and a
+backlog growing without bound.
+
+The worker exports both on a private admin listener (`ADMIN_ADDR`, `:9090` in the pod):
+
+| Series | What a rise means |
+|---|---|
+| `gomicro_outbox_quarantined_rows` | Undelivered events that no drain will retry. Above zero, somebody has to clear `failed_at` |
+| `gomicro_outbox_oldest_pending_age_seconds` | Nothing is draining. **This is the one to page on** |
+| `gomicro_outbox_pending_rows` | Publishing is slower than writing |
+| `gomicro_outbox_last_observation_timestamp_seconds` | Alert on **staleness**: if the observer dies, every gauge above freezes at a healthy-looking value |
+
+`gomicro_outbox_oldest_pending_age_seconds` is the one that matters, because it is the only
+one a merely-running process cannot satisfy — which is exactly what a liveness probe cannot
+give you, and why the worker has a listener but still no probes.
+
+**The observer runs on its own clock, not the relay's**, and that is the whole design. The
+gauge exists to detect a relay that has stopped making progress; if the relay refreshed it, the
+same wedge would stop it updating and freeze it at its last value. A frozen gauge reads as a
+stable, healthy system on a dashboard — the metric would go quiet at exactly the moment it had
+something to say. `OUTBOX_OBSERVE_INTERVAL` is deliberately separate from `OUTBOX_POLL_INTERVAL`
+for that reason, and an integration test asserts the age keeps climbing while nothing drains.
+
 ### Retention
 
 `outbox` and `processed_events` are append-only. The relay must not delete what it publishes
@@ -1318,6 +1346,7 @@ misconfigured deploy into five rollout attempts.
 | `OUTBOX_BATCH_SIZE` | `100` | Bounds one claim — and therefore how long a transaction is held across broker I/O |
 | `OUTBOX_POLL_INTERVAL` | `1s` | Idle latency only. A full batch is followed immediately |
 | `OUTBOX_MAX_CONNS` | `2` | The relay's pool. Small so background work doesn't eat the connection budget |
+| `OUTBOX_OBSERVE_INTERVAL` | `15s` | How often the outbox gauges refresh. **Deliberately not** `OUTBOX_POLL_INTERVAL` — see [Watching the outbox](#watching-the-outbox) |
 | `NATS_URL` | | The broker. **Empty keeps `outbox.LogPublisher`**, which prints what would be sent |
 | `NATS_STREAM` | `EVENTS` | Created or updated at startup, idempotently |
 | `NATS_SUBJECT_PREFIX` | `events` | Prepended to the event type. The tenant is **not** in the subject — see [The broker](#the-broker-nats-jetstream) |
@@ -1515,16 +1544,16 @@ half-build. They are ordered by dependency:
 
 | | What is left | Depends on |
 |---|---|---|
-| 1 | A metric for quarantined rows and for the oldest unpublished one | — |
-| 2 | Keycloak in the e2e tier, so OIDC is not hand-verified | — |
-| 3 | `grpc_client_*` metrics | 1 — same registry, and `MustRegister` panics on a duplicate |
-| 4 | Trace context carried through the outbox into the consumer | — (largest blast radius: a migration plus the event shape) |
-| 5 | An executable `DELETING.md` — the `profile` tier the plan named | 1, 3, 4 — each changes the subsystem inventory it encodes |
+| 1 | Keycloak in the e2e tier, so OIDC is not hand-verified | — |
+| 2 | `grpc_client_*` metrics | — |
+| 3 | Trace context carried through the outbox into the consumer | — (largest blast radius: a migration plus the event shape) |
+| 4 | An executable `DELETING.md` — the `profile` tier the plan named | 2, 3 — each changes the subsystem inventory it encodes |
 
-Items 1, 2 and 4 are described in full under *Known gaps*, including the exact predicates and
-the reasoning about what is safe.
+Items 1 and 3 are described in full under *Known gaps*, including the reasoning about what is
+safe.
 
-Retention shipped as [`cmd/prune`](cmd/prune/main.go) and is no longer on this list.
+Retention shipped as [`cmd/prune`](cmd/prune/main.go), and outbox health as
+[`outbox.Observer`](internal/platform/outbox/observer.go); neither is on this list any more.
 
 Every "reduced", "split" and "cut" above came out of a review that asked what this template
 over-engineers. [ADR 0002](docs/adr/0002-what-was-cut.md) records what was removed and the two
@@ -1548,14 +1577,16 @@ rather than maintained.
   but the right *frequency* depends on volume nobody here knows. A service writing a thousand
   events a second wants it hourly; one writing a thousand a day could run it monthly. The
   schedule is the one number in `prune-cronjob.yaml` you should expect to change.
-- **Quarantined outbox rows need an alert.** A row with `failed_at` set is skipped forever
-  until a human clears it, and nothing in the system will mention it again. The query is
-  `SELECT count(*) FROM outbox WHERE failed_at IS NOT NULL` — the alert is yours to wire.
-- **The worker has no probes.** It opens no listener, so there is nothing to probe without
-  adding one, and an HTTP server added purely to answer a liveness check reports that the HTTP
-  server is alive, which is not the question. What actually detects a wedged worker is the age
-  of the oldest unpublished outbox row. `deploy/k8s/base/worker.yaml` says so at the point
-  where the probes would go.
+- **The alert thresholds are yours to choose.** The worker exports the outbox's health (see
+  [Watching the outbox](#watching-the-outbox)), but this repo defines no rules — what counts as
+  "too old" depends on how fast your events need to land, which nobody here knows. The series
+  and the meaning of each are documented; the numbers are not.
+- **The worker still has no probes.** It has a listener now, carrying `/metrics`, and that is
+  unchanged rather than unfinished: a `/healthz` there would report the HTTP server is alive,
+  which is not the question, since a relay wedged on a broker that accepts connections and
+  never acks would pass it forever. The signal that *cannot* be satisfied by a merely-running
+  process is the age of the oldest unpublished row. `deploy/k8s/base/worker.yaml` says so at
+  the point where the probes would go.
 - **The outbound client has no metrics.** `observability.Metrics` has a `Server` field and no
   `Client` one, so there are no `grpc_client_*` series. Adding them is a few lines, but the
   registry uses `MustRegister`, which **panics** on a duplicate — so a fork wiring client

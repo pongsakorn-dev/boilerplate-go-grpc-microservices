@@ -179,6 +179,14 @@ worth naming: delete `cmd/prune/`, `internal/platform/outbox/prune.go`, the Cron
 that both tables grow without bound — which is fine for a service that publishes a few thousand
 events a day and is not fine for one that publishes a few thousand a second.
 
+**Keeping the outbox but not its metrics** is the other one. Delete
+`internal/platform/outbox/observer.go`, `00004_outbox_observability.sql`, the
+`OUTBOX_OBSERVE_INTERVAL` field, and the observer goroutine, admin listener and registry in
+`cmd/worker/main.go` — which returns that binary to opening no listener at all, so also drop
+the `admin` port and `ADMIN_ADDR` from `worker.yaml` and compose. Understand what you are
+giving up first: a quarantined row and a wedged relay both become invisible again, and the
+worker has no probes precisely because those metrics were the alternative.
+
 ---
 
 ## 7. Postgres and GORM

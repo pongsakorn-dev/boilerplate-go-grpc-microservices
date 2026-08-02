@@ -234,6 +234,17 @@ type OutboxConfig struct {
 	// MaxConns bounds the relay's database pool. Small on purpose -- background work should
 	// not compete with request-serving replicas for the database's connection budget.
 	MaxConns int
+
+	// ObserveInterval is how often outbox.Observer refreshes its gauges.
+	//
+	// DELIBERATELY NOT PollInterval, even though both are timers in the same process. The
+	// observer runs on its own clock precisely so that a relay wedged on an unresponsive
+	// broker cannot stop the metrics that would report it: sharing the relay's tick would
+	// freeze the oldest-pending-age gauge at the moment it started mattering.
+	//
+	// Default 15s, matching a conventional Prometheus scrape interval -- refreshing faster
+	// than the scrape only costs database round trips nobody reads.
+	ObserveInterval time.Duration
 }
 
 // RetentionConfig bounds the two tables that otherwise grow forever.
@@ -460,9 +471,10 @@ func ParseFor(env map[string]string, role Role) (Config, error) {
 		},
 
 		Outbox: OutboxConfig{
-			BatchSize:    p.intVal("OUTBOX_BATCH_SIZE", 100),
-			PollInterval: p.dur("OUTBOX_POLL_INTERVAL", time.Second),
-			MaxConns:     p.intVal("OUTBOX_MAX_CONNS", 2),
+			BatchSize:       p.intVal("OUTBOX_BATCH_SIZE", 100),
+			PollInterval:    p.dur("OUTBOX_POLL_INTERVAL", time.Second),
+			MaxConns:        p.intVal("OUTBOX_MAX_CONNS", 2),
+			ObserveInterval: p.dur("OUTBOX_OBSERVE_INTERVAL", 15*time.Second),
 		},
 
 		// The default ProcessedEvents (8 days) deliberately exceeds the default StreamMaxAge

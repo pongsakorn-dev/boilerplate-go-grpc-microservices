@@ -153,10 +153,14 @@ func requireDocker() error {
 // cannot prevent.
 //
 // Published host ports are global. A developer running `task up` in this same checkout has
-// 50051 and 8080 bound, and without this check the failure arrives as a compose error about
-// port allocation buried in build output, several minutes in.
+// these bound, and without this check the failure arrives as a compose error about port
+// allocation buried in build output, several minutes in.
+//
+// THIS LIST HAS TO TRACK THE COMPOSE FILE. 9091 was added when the worker gained an admin
+// listener; forgetting it would have reintroduced exactly the buried failure this exists to
+// prevent, for the one service whose port is newest and least expected.
 func requireFreePorts() error {
-	for _, port := range []string{"50051", "8080"} {
+	for _, port := range []string{"50051", "8080", "9091"} {
 		if inUse(port) {
 			return fmt.Errorf("host port %s is already bound.\n\n"+
 				"The e2e stack publishes the same ports the compose file does, so a dev stack "+

@@ -190,6 +190,20 @@ services:
       # Without NATS_URL the worker uses outbox.LogPublisher and prints what it would send.
       # That is a supported configuration -- but the compose stack has a broker, so use it.
       NATS_URL: "nats://nats:4222"
+      # Faster than the 15s default so the outbox gauges are useful while poking at a local
+      # stack. ADMIN_ADDR binds all interfaces because the default is loopback INSIDE the
+      # container, which nothing on the host or on the compose network could ever reach.
+      OUTBOX_OBSERVE_INTERVAL: "2s"
+      ADMIN_ADDR: "0.0.0.0:9090"
+    ports:
+      # The worker's admin surface: /metrics carrying the outbox gauges, and pprof.
+      #
+      # 9091 on the host, leaving 9090 free for orderd's own admin listener -- which this file
+      # deliberately does not publish, because pprof on a host port is a profile dump and a
+      # free CPU-pinning DoS for anything that can reach it. The worker's is published only
+      # because the outbox gauges are the point of this milestone and looking at them from the
+      # host is how you check the stack. Delete this mapping for anything but local work.
+      - "9091:9090"
 
 volumes:
   postgres-data:

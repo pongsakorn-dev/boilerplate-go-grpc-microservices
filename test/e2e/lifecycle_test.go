@@ -6,9 +6,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/http"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +20,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	orderv1 "github.com/example/gomicro/gen/go/order/v1"
+	"github.com/example/gomicro/internal/platform/migrations"
 )
 
 const (
@@ -168,9 +172,54 @@ func TestMigrationsRanBeforeTheServerAccepted(t *testing.T) {
 	}
 
 	// And the schema is actually current, rather than merely having been attempted.
-	if got := strings.TrimSpace(psql(t, "SELECT max(version_id) FROM goose_db_version")); got != "2" {
-		t.Errorf("goose reports schema version %q, want 2", got)
+	//
+	// THE EXPECTED VERSION IS DERIVED, not written down. It used to be the literal "2", which
+	// meant every migration added to the repo broke this test for a reason that had nothing to
+	// do with what it asserts -- and broke it only in the slowest tier, so it was found long
+	// after the change that caused it. (It was: 00003 and 00004 both landed before anyone ran
+	// this.) A guard that fails on unrelated work is a guard people learn to edit past.
+	//
+	// Reading the highest embedded migration keeps the real assertion -- the container ran
+	// them ALL, not just some -- while making an added migration a non-event here.
+	want := highestMigrationVersion(t)
+	if got := strings.TrimSpace(psql(t, "SELECT max(version_id) FROM goose_db_version")); got != want {
+		t.Errorf("goose reports schema version %q, want %q.\n\n"+
+			"The migrate container exited zero without applying every migration, so the "+
+			"service is running against a schema older than the code expects.", got, want)
 	}
+}
+
+// highestMigrationVersion reads the newest version out of the embedded migration set.
+//
+// The filenames are goose's own contract -- NNNNN_name.sql -- so the leading number is the
+// version. Parsed rather than counted: a repo that ever skips or renumbers a file would make a
+// count wrong while leaving the maximum right.
+func highestMigrationVersion(t *testing.T) string {
+	t.Helper()
+
+	entries, err := fs.Glob(migrations.FS, "*.sql")
+	if err != nil {
+		t.Fatalf("glob the embedded migrations: %v", err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("no embedded migrations found; this assertion would be meaningless")
+	}
+
+	var highest int64
+	for _, name := range entries {
+		digits, _, ok := strings.Cut(filepath.Base(name), "_")
+		if !ok {
+			t.Fatalf("migration %q is not named NNNNN_name.sql", name)
+		}
+		v, err := strconv.ParseInt(digits, 10, 64)
+		if err != nil {
+			t.Fatalf("migration %q has a non-numeric version prefix: %v", name, err)
+		}
+		if v > highest {
+			highest = v
+		}
+	}
+	return strconv.FormatInt(highest, 10)
 }
 
 // TestTheImageHasNoShell keeps the attack surface where the Dockerfile claims it is.
