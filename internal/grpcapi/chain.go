@@ -19,6 +19,7 @@ import (
 	"github.com/example/gomicro/internal/platform/config"
 	"github.com/example/gomicro/internal/platform/interceptor"
 	"github.com/example/gomicro/internal/platform/observability"
+	"github.com/example/gomicro/internal/platform/ratelimit"
 )
 
 // Deps is everything NewServer needs. A struct rather than a long parameter list so adding
@@ -44,6 +45,12 @@ type Deps struct {
 	// Policy is the authorisation map. REQUIRED, and checked for completeness against the
 	// server's registered methods before NewServer returns.
 	Policy auth.Policy
+
+	// Limiter is the distributed per-tenant quota. REQUIRED, for the same reason Verifier
+	// is: a nil-means-unlimited default is one forgotten wiring step away from a service
+	// with no quotas at all, and nothing would report it. Callers with no Redis pass
+	// ratelimit.AllowAll{}, which says so out loud.
+	Limiter ratelimit.Limiter
 }
 
 // NewServer builds the production gRPC server: the real interceptor chain, the real
@@ -69,6 +76,10 @@ func NewServer(d Deps) (*grpc.Server, error) {
 	if len(d.Policy) == 0 {
 		return nil, errors.New("grpcapi.NewServer: Deps.Policy is empty; every RPC would be denied")
 	}
+	if d.Limiter == nil {
+		return nil, errors.New("grpcapi.NewServer: Deps.Limiter is nil; pass ratelimit.AllowAll{} " +
+			"to run without quotas, so that choice is visible at the call site")
+	}
 
 	// THE CHAIN. grpc-go applies these outermost-first, so the LAST entry is closest to
 	// the handler. chain_test.go proves the ordering behaviourally -- with no test hooks
@@ -81,6 +92,7 @@ func NewServer(d Deps) (*grpc.Server, error) {
 	//  errmap     see the note below -- its position is the subtle one
 	//  admission  BEFORE auth: shed a flood before paying for signature verification
 	//  auth       verifies the credential AND enforces the policy, as one step
+	//  ratelimit  AFTER auth: the quota is keyed by the tenant in the verified token
 	//  deadline   bounds the handler and everything it calls downstream
 	//  validate   after auth, so an anonymous caller cannot probe the schema
 	//
@@ -101,6 +113,7 @@ func NewServer(d Deps) (*grpc.Server, error) {
 		interceptor.ErrorMap(d.Cfg.ServiceName),
 		interceptor.Admission(d.Cfg.Server.AdmissionLimit),
 		interceptor.Auth(d.Verifier, d.Policy, d.Log),
+		interceptor.RateLimit(d.Limiter, d.Log),
 		interceptor.Deadline(d.Cfg.Server.DefaultTimeout, d.Cfg.Server.MaxTimeout),
 		interceptor.Validate(d.Validator),
 	}
