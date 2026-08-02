@@ -140,10 +140,15 @@ services:
       - "50051:50051"
       - "8080:8080"
     healthcheck:
-      # The image has no shell and no grpc_health_probe binary, so the container-level check
-      # uses the REST edge. Kubernetes uses a native grpc: probe instead -- see
-      # deploy/k8s/base/deployment.yaml -- which needs neither.
-      test: ["CMD", "/orderd", "--help"]
+      # THE BINARY PROBES ITSELF. The image has no shell, no curl and deliberately no
+      # grpc_health_probe, and Compose has no equivalent of Kubernetes' native grpc: probe --
+      # so `orderd -health` dials its own gRPC health endpoint and exits 0 only if SERVING.
+      #
+      # This line used to read `/orderd --help`, a flag the binary never parsed: instead of
+      # printing usage it started a SECOND server inside the container and raced the first for
+      # the port, so the healthcheck could never pass. The e2e tier found it by running the
+      # stack, which is the only thing that would have.
+      test: ["CMD", "/orderd", "-health"]
       interval: 10s
       timeout: 3s
       retries: 3

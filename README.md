@@ -44,6 +44,7 @@ time than one that ships less.
 | Read-model projection + consumer dedup | ✅ Done | `processed_events` written in the **same transaction** as the effect |
 | Outbound client + deadline budget | ✅ Done | Budget, opt-in retries, no token forwarding, upstream errors. **No production call site** — see below |
 | Dockerfile, compose, kustomize | ✅ Done | 11.7 MB distroless, no shell. Manifests asserted in the default tier |
+| Automated end-to-end tier | ✅ Done | Runs the **shipped** images and compose file. Found two real defects on its first run |
 | Keycloak realm example | ✅ Done | Imported by a real Keycloak; a real token accepted end to end — see [`deploy/keycloak/`](deploy/keycloak/) |
 | `cmd/rename`, decision index, `DELETING.md` | ✅ Done | Rename proven by renaming this repo and testing the result. `cmd/scaffold` **cut** |
 
@@ -197,6 +198,7 @@ docs/
   adr/                      the decision index -- reasoning lives next to the code it decided
 
 test/                       ALL cross-cutting guards, incl. proto toolchain and Taskfile
+  e2e/                      the SHIPPED artifacts: real images, real compose, real signals
 ```
 
 ---
@@ -289,7 +291,10 @@ compile-time guarantee. That is the only way `go test ./...` is safe with Docker
 | Default | `go test ./...` | none | **9s** cold cache, **1s** cached |
 | Codegen | `task verify:codegen` | network | **17.6s** — regenerates and byte-compares |
 | Integration | `task verify:int` | Docker | **20s** with the image cached. **Skips**, never fails, without Docker |
-| End-to-end *(M10)* | not yet — arrives with the compose stack | Docker + compose | — |
+| End-to-end | `task verify:e2e` | Docker + compose | **92s** — the shipped images, the shipped compose file, real SIGTERM |
+<!-- fork-tool:begin -->
+| Rename | `task verify:rename` | none | **26s** — renames a copy of this repo, then builds and tests it |
+<!-- fork-tool:end -->
 
 ### Guard tests
 
@@ -709,6 +714,76 @@ order_counts      still 2
 ```
 
 That is the interlock the whole design rests on, observed rather than described.
+
+---
+
+## The end-to-end tier
+
+```bash
+task verify:e2e
+```
+
+Everything else here tests the code. This tests **what is deployed**: the real Dockerfile, the
+real compose file, the real images, real SIGTERM. 92 seconds, behind `//go:build e2e` because
+it needs a Docker daemon.
+
+The distinction is not academic. On its first run it found two defects that had shipped, both
+living in files no Go test reads:
+
+**The compose healthcheck could never pass.** It ran `/orderd --help`, a flag the binary did not
+parse — so instead of printing usage it started a *second* server inside the container and raced
+the first for the port. `compose up --wait` would hang and then fail.
+
+**Fixing that made it worse before it made it better.** Adding flag parsing to support a real
+`-health` command meant `--help` began printing usage and exiting **zero** — turning a
+healthcheck that could never pass into one that could never fail. Those are opposite failures
+and only one is loud:
+
+| | |
+|---|---|
+| never passes | **loud.** `up --wait` errors and everyone notices |
+| always passes | **silent.** The orchestrator believes a dead service is healthy, keeps routing to it, and never restarts it |
+
+Every other test in this tier would still pass with an always-green healthcheck, because they all
+talk to the service directly. The test that catches it reads the healthcheck **out of the running
+container** and runs it against nothing, requiring it to fail. Hardcoding the command instead —
+which is what the first version did — proves only that `-health` works, and says nothing about
+whether compose uses it.
+
+The image has no shell, no curl and no `grpc_health_probe`, so `orderd -health` dials its own
+gRPC health endpoint. Kubernetes needs none of this: it has had native `grpc:` probes since 1.27.
+
+### Shutdown is measured, in both directions
+
+`docker stop` returns in **5.7s** against a 30s timeout — the number M10 measured by hand, now
+asserted on every run. The assertion is two-sided, and the lower bound was learned from a
+sabotage rather than reasoned:
+
+| Stop takes | What it means |
+|---|---|
+| **near 30s** | SIGTERM never reached the process. That is a shell-form `ENTRYPOINT`: PID 1 is `/bin/sh`, which forwards nothing, so every deploy SIGKILLs mid-request |
+| **under 5s** | The signal arrived and nothing handled it. Go's runtime kills the process on an unhandled SIGTERM, so this is **faster** than a healthy drain |
+| ~5.7s | Health flipped, `SHUTDOWN_DRAIN_DELAY` elapsed, connections drained |
+
+Removing `syscall.SIGTERM` from the signal set stops the container in **706ms** — comfortably
+inside an upper bound alone. The first version of that test passed under exactly that sabotage.
+
+### What else it asserts
+
+- The stack serves the same order over **both** REST and gRPC — the transcoder really is in
+  front of the same service.
+- The data is really in Postgres, not the in-memory store. Drop `STORE_DRIVER` and every other
+  test still passes; only this one notices that everything vanishes on restart.
+- `migrate` ran to completion **before** `orderd` accepted traffic, and the schema is current.
+- The full async path in containers: order → outbox → relay → JetStream → consumer →
+  `order_counts`, with nothing unpublished and nothing quarantined.
+- The image contains no shell — `/bin/sh`, `/bin/bash` and `/busybox/sh` all fail to execute.
+
+> [!NOTE]
+> `task verify:e2e` passes `-count=1`, and that is required rather than tidy. Go's test cache
+> keys on Go files; it knows nothing about the Dockerfile or the compose file, so editing either
+> and re-running reports a **cached pass** from the previous build. A deliberately broken
+> healthcheck came back green in 0.0s while this tier was being written.
 
 ---
 
@@ -1280,6 +1355,7 @@ It refuses to run on a dirty working tree. It rewrites most of the repository an
 itself, so the only practical undo is `git checkout .` — which would take your uncommitted work
 with it.
 
+<!-- fork-tool:begin -->
 ### The part that makes it a tool and not a `sed` command
 
 Replacing the module path in every tracked file produces a repository that **compiles, passes
@@ -1322,6 +1398,8 @@ above builds perfectly.
 
 Because managed mode owns `go_package`, **no `.proto` file hard-codes an import path** — the
 prefix lives in one line of [`buf.gen.yaml`](buf.gen.yaml), not one line per proto.
+
+<!-- fork-tool:end -->
 
 ### What it deliberately leaves
 
@@ -1380,12 +1458,11 @@ M5 auth · M4 Postgres · M6 REST edge · M7 rate limiting · M8a outbox relay �
 M10 deploy · M8b JetStream + worker · M9 outbound client · M11 forkability ·
 plus an evidence-backed cuts pass.
 
-**Every planned milestone has shipped.** What remains is test coverage rather than features,
-and both items are listed in *Known gaps* below rather than as milestones:
+**Every planned milestone has shipped**, and so has the end-to-end tier that was the last gap.
+What remains is one piece of test backfill, listed in *Known gaps* rather than as a milestone:
 
 | | What is left | Why it is not a milestone |
 |---|---|---|
-| | An automated end-to-end tier (`//go:build e2e`) | The paths are verified by hand today; nothing replays them in CI |
 | | Backfill of a few M1–M3 tests | Absorbed piecemeal as later milestones touched the same code |
 
 Every "reduced", "split" and "cut" above came out of a review that asked what this template
@@ -1401,10 +1478,11 @@ rather than maintained.
 
 ### Known gaps
 
-- **No automated end-to-end tier yet.** The image, the compose stack, the Keycloak realm,
-  graceful shutdown and the full outbox → JetStream → projection path were each verified by
-  hand (see *Deployment* and *The broker*), but nothing replays those sequences in CI. It is
-  the last piece of M10 and is listed here rather than quietly dropped.
+- **The e2e tier does not cover Keycloak.** The realm import and a real token being accepted
+  end to end were verified by hand (see *Authentication*) and are not replayed by
+  `task verify:e2e`, because the shipped compose file does not configure `orderd` for OIDC —
+  wiring that would mean a second compose profile whose only consumer is a test. Everything
+  else in the deployment story is now automated.
 - **Nothing prunes `outbox` or `processed_events`.** Both grow forever. `processed_events`
   only needs to outlive `NATS_STREAM_MAX_AGE` — a message the broker has dropped can never be
   redelivered — so a periodic `DELETE ... WHERE processed_at < now() - interval '8 days'` is
