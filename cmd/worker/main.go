@@ -18,11 +18,14 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/example/gomicro/internal/order/orderproj"
 	"github.com/example/gomicro/internal/platform/config"
+	"github.com/example/gomicro/internal/platform/events"
 	"github.com/example/gomicro/internal/platform/observability"
 	"github.com/example/gomicro/internal/platform/outbox"
 )
@@ -35,12 +38,13 @@ func main() {
 }
 
 func run() error {
-	cfg, err := config.Load()
+	// LoadWorker, not Load. The worker opens no listener, so the server's auth rules do not
+	// apply to it -- and applying them stopped it booting with APP_ENV=production at all. The
+	// role is declared by this binary rather than by an environment variable, so a manifest
+	// cannot forget it. See config.Role.
+	cfg, err := config.LoadWorker()
 	if err != nil {
 		return fmt.Errorf("configuration: %w", err)
-	}
-	if cfg.Postgres.DSN.Reveal() == "" {
-		return fmt.Errorf("POSTGRES_DSN is required: the outbox lives in the database")
 	}
 
 	log := observability.NewLogger(cfg, os.Stdout)
@@ -68,27 +72,80 @@ func run() error {
 		return fmt.Errorf("connect to database: %w", err)
 	}
 
-	// LogPublisher is a PLACEHOLDER, and it says so on every event it handles.
+	// NATS_URL EMPTY IS A SUPPORTED CONFIGURATION, not a degraded one.
 	//
-	// M8b replaces this one line with the JetStream publisher. Everything else -- claiming,
-	// batching, the marking transaction, at-least-once semantics -- is already the real
-	// thing, and none of it changes when the broker arrives.
-	publisher := outbox.LogPublisher{Log: log}
+	// LogPublisher prints exactly what would be published, so a fresh clone exercises the
+	// entire outbox path -- claiming, batching, the marking transaction, at-least-once
+	// semantics -- with no broker installed anywhere. Everything below this line is identical
+	// either way; only the Publisher differs.
+	var (
+		publisher outbox.Publisher = outbox.LogPublisher{Log: log}
+		consumer  *events.Consumer
+		publishTo = "log (NATS_URL is empty; no broker)"
+	)
+
+	if cfg.NATS.URL != "" {
+		p, closeNATS, err := events.Connect(ctx, cfg, log)
+		if err != nil {
+			return fmt.Errorf("nats: %w", err)
+		}
+		defer closeNATS()
+
+		publisher = p
+		publishTo = cfg.NATS.URL + " stream=" + cfg.NATS.Stream
+
+		// The projection is the consumer's whole job. It applies each event and its
+		// deduplication row in ONE transaction -- see internal/order/orderproj.
+		consumer = events.NewConsumer(p.JetStream(), cfg.NATS,
+			orderproj.New(db, cfg.NATS.Consumer, log), log)
+	}
 
 	relay := outbox.NewRelay(db, publisher, log, outbox.WithBatchSize(cfg.Outbox.BatchSize))
 
-	log.Info("outbox relay starting",
+	log.Info("worker starting",
 		"batch_size", cfg.Outbox.BatchSize,
 		"poll_interval", cfg.Outbox.PollInterval.String(),
-		"publisher", "log (placeholder until M8b wires JetStream)")
+		"publisher", publishTo,
+		"consumer", consumer != nil)
 
-	if err := relay.Run(ctx, cfg.Outbox.PollInterval); err != nil {
-		return fmt.Errorf("relay: %w", err)
+	// The relay and the consumer are INDEPENDENT, and run concurrently.
+	//
+	// They are only in the same process because both are background work with the same
+	// scaling story. Neither waits on the other: a consumer stuck on a slow projection must
+	// not stop the relay from draining the outbox, or a downstream problem becomes an
+	// upstream one.
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := relay.Run(ctx, cfg.Outbox.PollInterval); err != nil {
+			errs <- fmt.Errorf("relay: %w", err)
+		}
+	}()
+
+	if consumer != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := consumer.Run(ctx); err != nil {
+				errs <- fmt.Errorf("consumer: %w", err)
+			}
+		}()
 	}
 
-	// Run returns nil only on cancellation, so reaching here means SIGTERM. Anything the
-	// relay had claimed rolled back with its transaction and stays unpublished for whichever
-	// process picks it up next -- which is why a relay needs no drain period of its own.
-	log.Info("outbox relay stopped")
+	wg.Wait()
+	close(errs)
+
+	// Both return nil only on cancellation, so reaching here normally means SIGTERM. Anything
+	// the relay had claimed rolled back with its transaction and stays unpublished for
+	// whichever process picks it up next, which is why a relay needs no drain period of its
+	// own; the consumer drains its in-flight messages inside Run.
+	if err := <-errs; err != nil {
+		return err
+	}
+
+	log.Info("worker stopped")
 	return nil
 }

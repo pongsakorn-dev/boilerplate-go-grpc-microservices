@@ -1,6 +1,6 @@
 # The local development stack.
 #
-#   docker compose up -d                     postgres + redis. That is all most work needs.
+#   docker compose up -d                     postgres + redis + nats. That is all most work needs.
 #   docker compose --profile auth up -d      adds Keycloak, for the OIDC path
 #   docker compose --profile obs  up -d      adds Grafana/Tempo/Prometheus in one container
 #   docker compose --profile app  up -d      adds orderd and the worker, built from source
@@ -48,6 +48,28 @@ services:
       - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  nats:
+    image: nats:2-alpine
+    # -js enables JetStream, which is what makes streams, consumers and Nats-Msg-Id
+    # deduplication exist at all. Plain NATS core is fire-and-forget: a publish with no
+    # subscriber is silently discarded, which is precisely the delivery guarantee an outbox
+    # exists to avoid.
+    #
+    # -sd is the store directory. It is a named volume rather than a bind mount so the stream
+    # survives `docker compose restart` but not `down -v`, matching how postgres-data behaves.
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "4222:4222"   # clients -- the value for NATS_URL
+      - "8222:8222"   # monitoring: http://localhost:8222/jsz?streams=1
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      # /healthz on the monitoring port. The image has no curl, but it does have wget.
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
       interval: 2s
       timeout: 3s
       retries: 15
@@ -155,9 +177,15 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      nats:
+        condition: service_healthy
     environment:
       POSTGRES_DSN: "postgres://gomicro:gomicro@postgres:5432/gomicro?sslmode=disable"
       OUTBOX_POLL_INTERVAL: "2s"
+      # Without NATS_URL the worker uses outbox.LogPublisher and prints what it would send.
+      # That is a supported configuration -- but the compose stack has a broker, so use it.
+      NATS_URL: "nats://nats:4222"
 
 volumes:
   postgres-data:
+  nats-data:

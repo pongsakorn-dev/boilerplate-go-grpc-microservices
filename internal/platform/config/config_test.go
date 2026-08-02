@@ -346,3 +346,176 @@ func TestTimeoutOrderingIsValidated(t *testing.T) {
 		t.Fatal("MAX_TIMEOUT below DEFAULT_TIMEOUT was accepted")
 	}
 }
+
+// TestNATSSettingsAreOnlyValidatedWhenABrokerIsConfigured keeps the no-broker path free.
+//
+// NATS_URL empty means cmd/worker uses outbox.LogPublisher, and a clone with no broker must
+// not have to supply coherent stream settings for a stream it never creates.
+func TestNATSSettingsAreOnlyValidatedWhenABrokerIsConfigured(t *testing.T) {
+	t.Parallel()
+
+	// Thoroughly broken NATS settings, with no NATS_URL.
+	cfg, err := config.Parse(map[string]string{
+		"NATS_STREAM":             "",
+		"NATS_SUBJECT_PREFIX":     "*",
+		"NATS_MAX_DELIVER":        "-3",
+		"NATS_DUPLICATE_WINDOW":   "1ns",
+		"NATS_DLQ_SUBJECT_PREFIX": "events",
+	})
+	if err != nil {
+		t.Fatalf("broker settings were validated even though NATS_URL is empty: %v", err)
+	}
+	if cfg.NATS.URL != "" {
+		t.Errorf("NATS_URL = %q, want empty", cfg.NATS.URL)
+	}
+}
+
+// TestTheDeadLetterPrefixMayNotSitInsideTheConsumerFilter catches a configuration that looks
+// fine on both lines and destroys the stream.
+//
+// The consumer filters {NATS_SUBJECT_PREFIX}.> and dead-letters to
+// {NATS_DLQ_SUBJECT_PREFIX}.{subject}. Nest the second inside the first and every dead letter
+// is redelivered to the consumer that just gave up on it, dead-lettered again, and so on --
+// consumer_test.go measures 1005 handler runs for one message in two seconds.
+func TestTheDeadLetterPrefixMayNotSitInsideTheConsumerFilter(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name, prefix, dlq string
+		wantErr           bool
+	}{
+		{name: "the shipped defaults", prefix: "events", dlq: "dlq"},
+		{name: "unrelated subtrees", prefix: "gomicro.events", dlq: "gomicro.dead"},
+
+		// The token-aware check earns its keep here: a plain string prefix test would
+		// reject this pair, which is perfectly safe.
+		{name: "shared word, different token", prefix: "events", dlq: "eventsdlq"},
+
+		{name: "nested", prefix: "events", dlq: "events.dlq", wantErr: true},
+		{name: "identical", prefix: "events", dlq: "events", wantErr: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := config.Parse(map[string]string{
+				"NATS_URL":                "nats://localhost:4222",
+				"NATS_SUBJECT_PREFIX":     tc.prefix,
+				"NATS_DLQ_SUBJECT_PREFIX": tc.dlq,
+			})
+
+			switch {
+			case tc.wantErr && err == nil:
+				t.Errorf("prefix %q with dead-letter prefix %q was accepted; the consumer "+
+					"would be fed its own dead letters forever", tc.prefix, tc.dlq)
+			case tc.wantErr && !strings.Contains(err.Error(), "dead letters"):
+				t.Errorf("the error does not explain the loop: %v", err)
+			case !tc.wantErr && err != nil:
+				t.Errorf("prefix %q with dead-letter prefix %q was rejected: %v", tc.prefix, tc.dlq, err)
+			}
+		})
+	}
+}
+
+// TestTheDuplicateWindowMustOutliveTheRelayRetry is the other cross-field constraint.
+//
+// A batch whose marking transaction fails is republished one poll interval later. If
+// JetStream has forgotten the message id by then, the republish is stored as a second message
+// and every consumer sees the event twice. Neither value looks wrong on its own line.
+func TestTheDuplicateWindowMustOutliveTheRelayRetry(t *testing.T) {
+	t.Parallel()
+
+	_, err := config.Parse(map[string]string{
+		"NATS_URL":              "nats://localhost:4222",
+		"NATS_DUPLICATE_WINDOW": "5s",
+		"OUTBOX_POLL_INTERVAL":  "30s",
+	})
+	if err == nil {
+		t.Fatal("a deduplication window shorter than the relay's retry gap was accepted.\n\n" +
+			"Every republished batch would be stored twice, and the duplicate would reach " +
+			"every consumer.")
+	}
+	if !strings.Contains(err.Error(), "NATS_DUPLICATE_WINDOW") {
+		t.Errorf("the error does not name the setting to change: %v", err)
+	}
+
+	// The shipped defaults are nowhere near the line.
+	if _, err := config.Parse(map[string]string{"NATS_URL": "nats://localhost:4222"}); err != nil {
+		t.Errorf("the default window and poll interval do not validate together: %v", err)
+	}
+}
+
+// TestWildcardsAreRefusedInBrokerNames stops a subject prefix that matches everything.
+func TestWildcardsAreRefusedInBrokerNames(t *testing.T) {
+	t.Parallel()
+
+	for _, key := range []string{"NATS_STREAM", "NATS_SUBJECT_PREFIX", "NATS_CONSUMER"} {
+		t.Run(key, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := config.Parse(map[string]string{
+				"NATS_URL": "nats://localhost:4222",
+				key:        "ev>nts",
+			})
+			if err == nil {
+				t.Errorf("%s accepted a wildcard character", key)
+			}
+		})
+	}
+}
+
+// TestTheWorkerIsNotBoundByTheServersAuthRules is a bug found by writing a manifest.
+//
+// AUTH_MODE defaults to dev, and dev is refused when APP_ENV=production -- correctly, for a
+// process that would otherwise serve every request as a full-scope principal. cmd/worker
+// opens no listener and verifies no tokens, so the rule protects nothing there and stopped it
+// booting in production entirely.
+//
+// Both halves are asserted, because the fix is only right if the SERVER still refuses.
+func TestTheWorkerIsNotBoundByTheServersAuthRules(t *testing.T) {
+	t.Parallel()
+
+	env := map[string]string{
+		"APP_ENV":      config.EnvProduction,
+		"POSTGRES_DSN": "postgres://user:pass@db:5432/gomicro",
+	}
+
+	if _, err := config.Parse(env); err == nil {
+		t.Error("a traffic-serving process was allowed to start with AUTH_MODE=dev in " +
+			"production; that is a total authentication bypass and must stay refused")
+	}
+
+	cfg, err := config.ParseFor(env, config.RoleWorker)
+	if err != nil {
+		t.Fatalf("the worker cannot start in production: %v\n\n"+
+			"It has no listener and verifies no tokens, so the auth rule protects nothing "+
+			"here -- it just makes the worker undeployable.", err)
+	}
+	if cfg.Role != config.RoleWorker {
+		t.Errorf("Role = %v, want RoleWorker", cfg.Role)
+	}
+}
+
+// TestTheWorkerRequiresADatabase is the requirement that IS its own.
+//
+// The outbox lives in Postgres, so a worker without a DSN has nothing to do. Validating it
+// here rather than in main means it arrives alongside every other misconfiguration instead of
+// as a separate failure after the first one is fixed.
+func TestTheWorkerRequiresADatabase(t *testing.T) {
+	t.Parallel()
+
+	_, err := config.ParseFor(map[string]string{}, config.RoleWorker)
+	if err == nil {
+		t.Fatal("the worker validated with no POSTGRES_DSN")
+	}
+	if !strings.Contains(err.Error(), "POSTGRES_DSN") {
+		t.Errorf("the error does not name the missing setting: %v", err)
+	}
+
+	// The SERVER has no such requirement: STORE_DRIVER=memory is the default and is what
+	// makes `git clone && go run ./cmd/orderd` work with nothing installed.
+	if _, err := config.Parse(map[string]string{}); err != nil {
+		t.Errorf("the default server config now requires a database: %v", err)
+	}
+}

@@ -26,6 +26,7 @@ package outbox
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"time"
 )
@@ -51,10 +52,45 @@ type Message struct {
 
 // Publisher sends a message onward.
 //
-// The one seam between this milestone and the broker. M8b implements it over NATS JetStream;
-// nothing in the relay changes when it does.
+// The one seam between the relay and the broker. internal/platform/events implements it over
+// NATS JetStream, and nothing in the relay changed when it did.
 type Publisher interface {
+	// Publish delivers m, or returns an error.
+	//
+	// An error marked with Permanent means retrying is pointless and the row is quarantined.
+	// Any other error leaves the row unpublished for the next drain.
 	Publish(ctx context.Context, m Message) error
+}
+
+// permanent marks an error that retrying cannot fix.
+//
+// It lives here, next to Publisher, because it is part of that interface's contract rather
+// than a detail of any one implementation: the relay has to decide between "try again in a
+// second" and "set this row aside", and only the publisher knows which is which.
+//
+// A wrapper rather than a sentinel, so the underlying error survives errors.Is and errors.As.
+type permanent struct{ err error }
+
+func (p permanent) Error() string { return p.err.Error() }
+func (p permanent) Unwrap() error { return p.err }
+
+// Permanent marks err as unretryable. It returns nil for a nil error.
+func Permanent(err error) error {
+	if err == nil {
+		return nil
+	}
+	return permanent{err: err}
+}
+
+// IsPermanent reports whether retrying err is pointless.
+//
+// Everything unmarked is treated as transient. That default is deliberate and the asymmetry
+// is the point: calling a transient failure permanent quarantines an event that would have
+// gone through, while calling a permanent failure transient only wastes retries until someone
+// looks. The second mistake is visible and reversible; the first is neither.
+func IsPermanent(err error) bool {
+	var p permanent
+	return errors.As(err, &p)
 }
 
 // LogPublisher writes events to the log instead of a broker.

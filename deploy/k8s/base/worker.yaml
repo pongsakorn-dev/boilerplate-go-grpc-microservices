@@ -1,0 +1,115 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  labels:
+    app.kubernetes.io/name: worker
+spec:
+  # ONE REPLICA BY DEFAULT, and that is a considered number rather than a placeholder.
+  #
+  # The relay is safe to run many times over -- FOR UPDATE SKIP LOCKED is exactly what makes
+  # concurrent claims disjoint -- so this is not a correctness limit. It is an ordering one:
+  # with two relays, two events for the same order can be split across batches and reach the
+  # broker out of order. See the guarantees at the top of internal/platform/outbox.
+  #
+  # Scale it up when throughput matters more than per-aggregate order, which for most services
+  # is immediately. The consumer side scales independently and safely either way, because
+  # processed_events makes duplicate delivery a no-op.
+  replicas: 1
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: worker
+
+  strategy:
+    # RECREATE, not RollingUpdate.
+    #
+    # A rolling update would briefly run the old and new worker together, which is harmless
+    # for correctness and pointless here: there is no traffic to keep serving, so the only
+    # thing overlap buys is a second relay competing for the same rows during every deploy.
+    type: Recreate
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: worker
+    spec:
+      # Shorter than orderd's 40s, because the worker has nothing to drain.
+      #
+      # It serves no traffic, so there is no endpoint-removal delay to wait out. On SIGTERM
+      # the relay's in-flight transaction rolls back and its rows stay unpublished for the
+      # next process; the consumer drains its buffered messages within AckWait, and anything
+      # it does not finish is redelivered. Both are designed to be interrupted.
+      terminationGracePeriodSeconds: 40
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: worker
+          image: gomicro/worker
+          imagePullPolicy: IfNotPresent
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+
+          # NO PROBES, deliberately, and this is the interesting part of the file.
+          #
+          # The worker opens no listener, so there is nothing to probe without adding one --
+          # and adding an HTTP server purely to answer a liveness check means the check
+          # reports that the HTTP server is alive, which is not the question. A relay wedged
+          # on a broker that accepts connections and never acks would pass such a probe
+          # forever.
+          #
+          # What actually detects a stuck worker is the outbox itself: the age of the oldest
+          # unpublished row, and the count of rows with failed_at set. Both are already in the
+          # database, both are alertable with one query, and neither can be fooled by a
+          # process that is technically running.
+          #
+          # A fork that wants Kubernetes to restart a wedged worker should add an admin
+          # listener whose /healthz reflects DRAIN PROGRESS -- not process liveness.
+
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              # Memory only. A CPU limit causes CFS throttling, which on a batch worker turns
+              # a backlog into a much longer backlog for no benefit. Same reasoning as orderd.
+              memory: 256Mi
+
+          env:
+            - name: APP_ENV
+              value: production
+            - name: SERVICE_NAME
+              value: worker
+            # The relay's pool is small on purpose: background work must not compete with
+            # request-serving replicas for the database's connection budget.
+            - name: OUTBOX_MAX_CONNS
+              value: "2"
+            - name: OUTBOX_POLL_INTERVAL
+              value: "1s"
+
+          envFrom:
+            # Carries POSTGRES_DSN and NATS_URL. With NATS_URL absent the worker still runs
+            # and logs what it would publish -- see outbox.LogPublisher -- so a missing secret
+            # degrades to visible no-op rather than a crash loop.
+            - secretRef:
+                name: orderd-secrets
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir: {}

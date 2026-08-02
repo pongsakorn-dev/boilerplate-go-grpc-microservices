@@ -31,10 +31,14 @@ import (
 // ORDER BY id with the partial index on (id) WHERE published_at IS NULL means the claim is an
 // index scan over exactly the unpublished rows, so it stays cheap as the table grows -- and
 // an outbox table grows forever until something prunes it.
+//
+// AND failed_at IS NULL skips QUARANTINED rows -- see quarantine below. Without it, a row
+// that can never be published is reclaimed on every drain and blocks everything behind it.
 const claimSQL = `
 SELECT id, tenant_id, aggregate_id, event_type, payload, occurred_at
 FROM outbox
 WHERE published_at IS NULL
+  AND failed_at IS NULL
 ORDER BY id
 LIMIT $1
 FOR UPDATE SKIP LOCKED`
@@ -130,16 +134,38 @@ func (r *Relay) DrainOnce(ctx context.Context) (int, error) {
 	}
 
 	for _, m := range batch {
-		if err := r.publisher.Publish(ctx, m); err != nil {
-			// Abandon the WHOLE batch, deliberately.
-			//
-			// Marking the ones that succeeded would need a second transaction and would
-			// leave the batch half-committed if that failed too. Rolling back republishes a
-			// few messages the broker already accepted, which is exactly the duplicate the
-			// at-least-once contract already requires consumers to handle. Trading a
-			// duplicate for a lost event is always the right way round.
+		err := r.publisher.Publish(ctx, m)
+		if err == nil {
+			continue
+		}
+
+		// Abandon the WHOLE batch, deliberately.
+		//
+		// Marking the ones that succeeded would need a second transaction and would leave
+		// the batch half-committed if that failed too. Rolling back republishes a few
+		// messages the broker already accepted, which is exactly the duplicate the
+		// at-least-once contract already requires consumers to handle. Trading a duplicate
+		// for a lost event is always the right way round.
+		//
+		// Cheap in practice, too: those republished messages carry the same Nats-Msg-Id, so
+		// the broker's deduplication window collapses them back into one stored message. The
+		// simplicity of this rollback is bought by that window existing.
+		if !IsPermanent(err) {
 			return 0, fmt.Errorf("publish outbox row %d: %w", m.ID, err)
 		}
+
+		// A PERMANENT failure gets the row out of the way.
+		//
+		// Without this the relay reclaims the same unpublishable row on every drain and
+		// never reaches anything behind it -- one oversized payload silently stopping every
+		// event in the service. The rollback happens first (deferred above) so the quarantine
+		// runs in its own transaction against rows nobody holds a lock on.
+		_ = tx.Rollback()
+		if qErr := r.quarantine(ctx, m, err); qErr != nil {
+			return 0, fmt.Errorf("publish outbox row %d failed permanently (%v) and it could "+
+				"not be quarantined: %w", m.ID, err, qErr)
+		}
+		return 0, fmt.Errorf("quarantined outbox row %d: %w", m.ID, err)
 	}
 
 	if err := r.markPublished(ctx, tx, batch); err != nil {
@@ -157,6 +183,42 @@ func (r *Relay) DrainOnce(ctx context.Context) (int, error) {
 	}
 
 	return len(batch), nil
+}
+
+// quarantine sets one row aside so the relay can move past it.
+//
+// The row is NOT deleted and NOT marked published: it stays in the table with the reason
+// attached, invisible to the claim query, and an operator who fixes the cause replays it with
+//
+//	UPDATE outbox SET failed_at = NULL, failure_reason = NULL WHERE id = ...;
+//
+// An event is never discarded, which is the guarantee the whole pattern exists to make. The
+// cost is that quarantined rows need watching -- a count of them is the alert worth having,
+// because nothing else in the system will mention them again.
+func (r *Relay) quarantine(ctx context.Context, m Message, cause error) error {
+	// context.WithoutCancel: quarantining is what happens on the way to giving up, and it
+	// must still run when the drain is being cancelled. Otherwise a relay shut down at the
+	// wrong moment restarts and hits the same poison row forever.
+	qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+
+	res, err := r.db.ExecContext(qctx,
+		`UPDATE outbox SET failed_at = now(), failure_reason = $2 WHERE id = $1 AND published_at IS NULL`,
+		m.ID, cause.Error())
+	if err != nil {
+		return fmt.Errorf("quarantine outbox row %d: %w", m.ID, err)
+	}
+	if affected, err := res.RowsAffected(); err == nil && affected == 0 {
+		// Nothing to do: another relay published it between the failure and this update.
+		return nil
+	}
+
+	r.log.ErrorContext(ctx, "outbox row quarantined; it will not be retried until an operator clears failed_at",
+		slog.Int64("outbox_id", m.ID),
+		slog.String("event_type", m.EventType),
+		slog.String("tenant_id", m.TenantID),
+		slog.String("error", cause.Error()))
+	return nil
 }
 
 // markPublished stamps the claimed rows.
