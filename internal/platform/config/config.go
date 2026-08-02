@@ -109,6 +109,9 @@ type Config struct {
 	Outbox OutboxConfig
 	NATS   NATSConfig
 
+	// Retention bounds how long the two append-only tables keep rows. See cmd/prune.
+	Retention RetentionConfig
+
 	// Upstream configures OUTBOUND calls to other services. See internal/platform/client.
 	Upstream UpstreamConfig
 
@@ -231,6 +234,44 @@ type OutboxConfig struct {
 	// MaxConns bounds the relay's database pool. Small on purpose -- background work should
 	// not compete with request-serving replicas for the database's connection budget.
 	MaxConns int
+}
+
+// RetentionConfig bounds the two tables that otherwise grow forever.
+//
+// Both are append-only by design: the outbox keeps every event it has ever published, and
+// processed_events keeps one row per message ever consumed. Neither is ever read again after
+// its purpose is served, and nothing in the system deletes them, so on a busy service they
+// become the largest tables in the database with no upper bound.
+type RetentionConfig struct {
+	// Outbox is how long a PUBLISHED row is kept before cmd/prune deletes it.
+	//
+	// Published rows are pure history: the relay will never look at them again, since its
+	// claim query filters on published_at IS NULL. They are kept at all only so an operator
+	// investigating an incident can see what was sent and when.
+	//
+	// QUARANTINED rows are NEVER deleted by retention, whatever this is set to. A row with
+	// failed_at set has not been published and never will be until a human clears it -- so
+	// ageing it out would silently discard the one event anybody actually needed to see.
+	Outbox time.Duration
+
+	// ProcessedEvents is how long a consumer deduplication row is kept.
+	//
+	// THIS VALUE IS A CORRECTNESS BOUNDARY, not a housekeeping preference, and Validate
+	// refuses a configuration where it does not exceed NATS_STREAM_MAX_AGE.
+	//
+	// The dedup row is what stops a redelivered message being applied twice. It is safe to
+	// delete only once the broker can no longer deliver that message at all -- which is
+	// exactly when the stream's own retention has dropped it. Delete it one hour early and a
+	// redelivery lands on a consumer with no memory of having seen it: the projection applies
+	// the event a second time, the count is wrong, and it stays wrong.
+	ProcessedEvents time.Duration
+
+	// BatchSize bounds one DELETE statement.
+	//
+	// A single unbounded DELETE over months of accumulated rows takes a lock for its whole
+	// duration and generates one enormous WAL record. Batching keeps each statement short
+	// enough that ordinary traffic is not blocked behind it.
+	BatchSize int
 }
 
 // NATSConfig configures the JetStream publisher and consumer.
@@ -424,6 +465,15 @@ func ParseFor(env map[string]string, role Role) (Config, error) {
 			MaxConns:     p.intVal("OUTBOX_MAX_CONNS", 2),
 		},
 
+		// The default ProcessedEvents (8 days) deliberately exceeds the default StreamMaxAge
+		// (7 days) by a full day rather than by an hour. The margin absorbs clock skew between
+		// the broker and the database, and a prune job that does not run on schedule.
+		Retention: RetentionConfig{
+			Outbox:          p.dur("RETENTION_OUTBOX", 168*time.Hour),
+			ProcessedEvents: p.dur("RETENTION_PROCESSED_EVENTS", 192*time.Hour),
+			BatchSize:       p.intVal("RETENTION_BATCH_SIZE", 1000),
+		},
+
 		NATS: NATSConfig{
 			URL:              p.str("NATS_URL", ""),
 			Stream:           p.str("NATS_STREAM", "EVENTS"),
@@ -515,6 +565,41 @@ func (c Config) Validate() error {
 
 	if c.StoreDriver == StorePostgres && c.Postgres.DSN.Reveal() == "" {
 		errs = append(errs, errors.New("POSTGRES_DSN is required when STORE_DRIVER=postgres"))
+	}
+
+	// THE RETENTION FLOOR, and the reason it is refused here rather than documented.
+	//
+	// processed_events is the consumer's memory of what it has already applied. A row may be
+	// deleted only once the broker can no longer deliver that message -- which is when the
+	// stream's own retention has dropped it. Set this below NATS_STREAM_MAX_AGE and there is a
+	// window in which a message still exists on the broker while the record of having handled
+	// it does not: a redelivery in that window is applied a second time.
+	//
+	// What makes it worth failing startup over is that nothing downstream would report it. The
+	// projection increments a counter twice, no error is logged, no metric moves, and the wrong
+	// number is still there tomorrow. It would be found, if ever, by someone reconciling
+	// figures weeks later -- at which point the events that caused it are long gone from the
+	// stream and the cause is unknowable.
+	//
+	// Unconditional rather than scoped to a role: this is a coherence check between two values,
+	// and both are read from the same environment whichever binary is starting.
+	if c.Retention.ProcessedEvents > 0 && c.Retention.ProcessedEvents <= c.NATS.StreamMaxAge {
+		errs = append(errs, fmt.Errorf(
+			"RETENTION_PROCESSED_EVENTS (%s) must be GREATER than NATS_STREAM_MAX_AGE (%s): "+
+				"a deduplication row deleted while the broker can still redeliver its message "+
+				"lets the consumer apply that event twice, silently and permanently",
+			c.Retention.ProcessedEvents, c.NATS.StreamMaxAge))
+	}
+	if c.Retention.Outbox <= 0 {
+		errs = append(errs, fmt.Errorf("RETENTION_OUTBOX (%s) must be positive", c.Retention.Outbox))
+	}
+	if c.Retention.ProcessedEvents <= 0 {
+		errs = append(errs, fmt.Errorf("RETENTION_PROCESSED_EVENTS (%s) must be positive",
+			c.Retention.ProcessedEvents))
+	}
+	if c.Retention.BatchSize <= 0 {
+		errs = append(errs, fmt.Errorf("RETENTION_BATCH_SIZE (%d) must be positive; an unbounded "+
+			"DELETE holds a lock for its whole duration", c.Retention.BatchSize))
 	}
 
 	// AUTH_MODE=oidc requires enough configuration to actually verify something.

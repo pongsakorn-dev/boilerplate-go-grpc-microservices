@@ -42,7 +42,8 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/orderd  ./cmd/orderd  && \
     go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/migrate ./cmd/migrate && \
-    go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/worker  ./cmd/worker
+    go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/worker  ./cmd/worker  && \
+    go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/prune   ./cmd/prune
 
 # ---------------------------------------------------------------------------------------
 # Runtime targets
@@ -79,3 +80,12 @@ FROM gcr.io/distroless/static:nonroot AS worker
 COPY --from=build /out/worker /worker
 USER nonroot:nonroot
 ENTRYPOINT ["/worker"]
+
+FROM gcr.io/distroless/static:nonroot AS prune
+COPY --from=build /out/prune /prune
+USER nonroot:nonroot
+# Deleting IS the default here, unlike migrate above, and the asymmetry is deliberate: this
+# runs from a CronJob whose whole purpose is the deletion, and requiring an argument would mean
+# the manifest carries the one word standing between the schedule and the data. Run it with
+# -dry-run first; see the package comment for why the first run is the one to look at.
+ENTRYPOINT ["/prune"]

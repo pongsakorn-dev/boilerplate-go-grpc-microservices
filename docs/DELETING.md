@@ -151,7 +151,7 @@ runs it.
 event vanished" impossible; a service that publishes from inside its handler does not have that
 property, whatever its README says.
 
-- **Delete:** `internal/platform/outbox/`, `cmd/worker/`
+- **Delete:** `internal/platform/outbox/`, `cmd/worker/`, `cmd/prune/`
 - **Domain:** this is the invasive one. `internal/order` declares `EventPublisher` and
   `Store.InTx` hands one to the callback, so removing the outbox means:
   - `internal/order/store.go`: remove the `EventPublisher` interface and change `Atomic.InTx` to
@@ -162,12 +162,22 @@ property, whatever its README says.
   - `internal/order/ordertest/contract.go`: remove the two transactional subtests — they exist to
     assert the outbox invariant and assert nothing without it.
 - **Schema:** drop the `outbox` table and its index from
-  `internal/platform/migrations/00001_orders.sql`, and delete `00002_events.sql` entirely if you
-  also did step 4.
-- **Config:** remove `OutboxConfig`, the `Outbox` field, and its `OUTBOX_*` entries.
-- **Deploy:** remove `deploy/k8s/base/worker.yaml` and its line in
-  `deploy/k8s/base/kustomization.yaml`, the `worker` service in compose, and the `worker` target
-  from `deploy/docker/Dockerfile` and `Taskfile.yml`'s `docker:build`.
+  `internal/platform/migrations/00001_orders.sql`, delete `00003_retention.sql`, and delete
+  `00002_events.sql` entirely if you also did step 4.
+- **Config:** remove `OutboxConfig`, the `Outbox` field, and its `OUTBOX_*` entries. Remove
+  `RetentionConfig`, the `Retention` field, the `RETENTION_*` entries, and the retention block
+  in `Validate` — including the check that `RETENTION_PROCESSED_EVENTS` exceeds
+  `NATS_STREAM_MAX_AGE`, which has nothing left to protect once neither table exists.
+- **Deploy:** remove `deploy/k8s/base/worker.yaml` and `prune-cronjob.yaml` and their lines in
+  `deploy/k8s/base/kustomization.yaml`, the `worker` service in compose, and the `worker` and
+  `prune` targets from `deploy/docker/Dockerfile` and `Taskfile.yml`'s `docker:build`. Also
+  remove the `db:prune` and `db:prune:dry-run` targets.
+
+**Keeping the outbox but not the pruning** is a supported halfway house, and it is the one
+worth naming: delete `cmd/prune/`, `internal/platform/outbox/prune.go`, the CronJob, the
+`RETENTION_*` config and the Dockerfile target, and keep everything else. You then own the fact
+that both tables grow without bound — which is fine for a service that publishes a few thousand
+events a day and is not fine for one that publishes a few thousand a second.
 
 ---
 

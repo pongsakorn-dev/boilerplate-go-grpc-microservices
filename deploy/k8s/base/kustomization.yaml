@@ -4,6 +4,7 @@ kind: Kustomization
 resources:
   - deployment.yaml
   - worker.yaml
+  - prune-cronjob.yaml
   - service.yaml
   - pdb.yaml
   - hpa.yaml

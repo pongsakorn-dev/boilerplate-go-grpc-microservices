@@ -519,3 +519,85 @@ func TestTheWorkerRequiresADatabase(t *testing.T) {
 		t.Errorf("the default server config now requires a database: %v", err)
 	}
 }
+
+// TestRetentionMustOutliveTheStream is the correctness boundary in RetentionConfig, enforced.
+//
+// processed_events is the consumer's memory of what it has already applied. Deleting a row
+// while the broker can still redeliver its message reopens the window that table exists to
+// close: the redelivery arrives at a consumer with no record of it, the projection applies the
+// event a second time, and the wrong number is permanent.
+//
+// Nothing downstream would report it. No error is logged, no metric moves, and the events that
+// caused it are gone from the stream by the time anyone reconciles the figures -- which is why
+// this is refused at startup rather than documented as a caution.
+func TestRetentionMustOutliveTheStream(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		retention string
+		maxAge    string
+		wantErr   bool
+	}{
+		// The shipped defaults, stated as a case so a future change to either has to
+		// come past this test.
+		{name: "defaults leave a day of margin", retention: "192h", maxAge: "168h"},
+
+		{name: "comfortably longer", retention: "720h", maxAge: "24h"},
+
+		// EQUAL IS REFUSED, not accepted. At exactly the stream's age the two are racing:
+		// whether the dedup row or the message disappears first depends on clock skew between
+		// the broker and the database, which is not something to leave to chance.
+		{name: "equal is not enough", retention: "168h", maxAge: "168h", wantErr: true},
+
+		{name: "shorter than the stream", retention: "24h", maxAge: "168h", wantErr: true},
+
+		// The realistic mistake: someone raises the broker's retention to keep more history
+		// and does not think about the table that has to outlive it.
+		{name: "stream retention raised past it", retention: "192h", maxAge: "336h", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := config.Parse(map[string]string{
+				"RETENTION_PROCESSED_EVENTS": tc.retention,
+				"NATS_STREAM_MAX_AGE":        tc.maxAge,
+			})
+
+			switch {
+			case tc.wantErr && err == nil:
+				t.Fatalf("RETENTION_PROCESSED_EVENTS=%s was accepted with "+
+					"NATS_STREAM_MAX_AGE=%s.\n\nA message the broker redelivers in that gap "+
+					"is applied twice, silently and permanently.", tc.retention, tc.maxAge)
+			case tc.wantErr && !strings.Contains(err.Error(), "RETENTION_PROCESSED_EVENTS"):
+				t.Errorf("the error does not name the setting: %v", err)
+			case !tc.wantErr && err != nil:
+				t.Fatalf("a valid retention was rejected: %v", err)
+			}
+		})
+	}
+}
+
+// TestRetentionRejectsNonsense covers the values that would make cmd/prune misbehave rather
+// than fail: a zero batch size is an unbounded DELETE, and a zero retention deletes everything.
+func TestRetentionRejectsNonsense(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct{ name, key, value, want string }{
+		{"zero batch size", "RETENTION_BATCH_SIZE", "0", "RETENTION_BATCH_SIZE"},
+		{"negative batch size", "RETENTION_BATCH_SIZE", "-1", "RETENTION_BATCH_SIZE"},
+		{"zero outbox retention", "RETENTION_OUTBOX", "0s", "RETENTION_OUTBOX"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := config.Parse(map[string]string{tc.key: tc.value})
+			if err == nil {
+				t.Fatalf("%s=%s was accepted", tc.key, tc.value)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("the error does not name %s: %v", tc.want, err)
+			}
+		})
+	}
+}
