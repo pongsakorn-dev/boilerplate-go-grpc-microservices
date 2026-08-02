@@ -40,7 +40,7 @@ time than one that ships less.
 | Postgres via GORM + goose migrations | ✅ Done | Same store contract as the in-memory driver, plus N+1, query-plan and rollback guards |
 | REST/JSON edge (grpc-gateway) | ✅ Done | Client mode over an in-process connection, so REST runs the **same** interceptors |
 | Distributed rate limiting (Redis) | ✅ Done | GCRA per tenant+method, **fails open**. Cache-aside deliberately cut |
-| Outbox + relay | ⬜ M8a | The `EventPublisher` port exists and is tested |
+| Outbox + relay | ✅ Done | Written in the business transaction; drained by `cmd/worker`. **At-least-once** |
 | NATS JetStream + worker | ⬜ M8b | Deliberately **after** M10, so the deploy story exists first |
 | Typed client + deadline budget | ⬜ M9 | Scope **reduced**: the second service was cut |
 | Dockerfile, compose, kustomize, e2e | ⬜ M10 | Also where the Keycloak realm finally gets booted |
@@ -154,6 +154,7 @@ gen/openapiv2/              OpenAPI v2 for the REST edge, generated from the sam
 cmd/
   orderd/                   the service. ~15 lines; everything lives in internal/app
   migrate/                  goose runner. The ONLY thing that changes the schema
+  worker/                   drains the outbox. A separate process on purpose
   devtool/                  cross-platform task helpers (Taskfile can't do filesystem work)
 
 internal/
@@ -172,6 +173,7 @@ internal/
     interceptor/              recovery, logging, errmap, admission, auth, deadline, validate
     gormx/                    tenant guard, pool config, slog adapter, query counter
     migrations/               goose .sql via embed.FS
+    outbox/                   the relay: FOR UPDATE SKIP LOCKED, batched, at-least-once
     ratelimit/                GCRA quota over Redis. Tested against miniredis, no Docker
     testdb/                   testcontainers harness (build tag `integration` only)
     observability/            slog+TraceHandler, Prometheus, OTel traces, admin mux
@@ -334,6 +336,8 @@ merely to pass today:
 | `TestLimiterFailsOPENWhenRedisIsDown` | A dead quota store taking the whole service down |
 | `TestRejectionDoesNotExtendThePenalty` | A retrying client extending its own lockout indefinitely |
 | `TestKeysAreIndependent` | One noisy tenant throttling everybody |
+| `TestConcurrentRelaysDoNotBlockOnEachOther` | A second relay that waits instead of helping |
+| `TestAFailedPublishAbandonsTheWholeBatch` | A half-marked batch losing events on broker failure |
 
 ### The pattern worth stealing: one contract, two implementations
 
@@ -370,6 +374,86 @@ implementation plan; the short version:
 | Time in tests | `testing/synctest` | No `Clock` interface — the stdlib made that abstraction unnecessary in Go 1.25 |
 | Assertions | stdlib + `go-cmp`/`protocmp` | One assertion idiom, not two. Adding testify later is purely additive |
 | Task runner | [Taskfile](Taskfile.yml) via `go tool` | No Makefile: Windows has no `make`. Task's shell has no `rm`/`sed`/`jq` either, so those live in `cmd/devtool` |
+
+---
+
+## The outbox
+
+The domain writes an event row **inside the same transaction** as the business change, so
+*"the order committed but the event vanished"* is not a state the database can hold. A
+separate process drains it:
+
+```bash
+go run ./cmd/worker
+```
+
+### What it guarantees, precisely
+
+| | |
+|---|---|
+| ✅ **No lost events** | The row and the business change commit together, or neither does |
+| ✅ **At-least-once** | Every event reaches the broker at least once |
+| ❌ **Not exactly-once** | If the broker accepts a publish and the marking transaction then fails, the event is republished. **Consumers must deduplicate** |
+| ❌ **Not globally ordered** | Two relays claim disjoint batches concurrently, so event 20 can arrive before 19 |
+| ⚠️ **Per-aggregate order** | Holds only with a **single** relay. Two can split one order's events and finish out of order |
+
+Anyone claiming exactly-once delivery has moved the deduplication somewhere you haven't
+looked yet. Those last two are the ones that bite, so they're written down rather than
+discovered.
+
+### `FOR UPDATE SKIP LOCKED` — measured, not assumed
+
+The claim query is what makes running more than one relay useful. Against Postgres 17, with
+one transaction holding rows 1–10 and a second issuing the identical claim under a 400ms
+`lock_timeout`:
+
+| | Second transaction |
+|---|---|
+| `FOR UPDATE` | **Blocks**, then dies: `canceling statement due to lock timeout (SQLSTATE 55P03)` at 403ms |
+| `FOR UPDATE SKIP LOCKED` | Returns rows 11–20 in **1ms** |
+
+The difference is invisible in the *results* — both eventually publish every row exactly
+once. Only the **blocking** distinguishes them, which is why
+`TestConcurrentRelaysDoNotBlockOnEachOther` asserts that both relays reach `Publish`
+concurrently rather than asserting on what they published.
+
+That test took two attempts. The first gave each relay a batch big enough for the whole table
+and checked no row shipped twice — it passed while proving nothing, because one relay claimed
+everything and the other claimed none, which is the identical outcome with or without
+`SKIP LOCKED`.
+
+### The transaction is held across the publish
+
+Deliberate, and a real trade-off. Holding it is what makes failure safe: if the broker rejects
+a message or the process dies mid-batch, the transaction rolls back, `published_at` stays
+`NULL`, and the next drain reclaims the rows. Nothing is lost and no reconciliation job is
+needed.
+
+The cost is a database transaction open for the duration of the batch's network I/O, which
+bloats vacuum and inflates replication lag if the batch is large or the broker slow. Hence
+`OUTBOX_BATCH_SIZE`. A fork under real load should switch to a **lease** — claim with a short
+`UPDATE` stamping `claimed_at`, commit, publish outside any transaction, then mark published —
+which needs lease expiry to recover from a crashed relay, exactly the complexity this version
+avoids while the volume doesn't demand it.
+
+A partial failure abandons the **whole** batch. Marking the successful ones would need a second
+transaction and leaves the batch half-committed if that fails too. Rolling back republishes a
+few messages the broker already took — a duplicate the at-least-once contract already requires
+consumers to handle. Trading a duplicate for a lost event is never the right way round.
+
+### Why a separate process
+
+Running the relay inside `orderd` ties publishing throughput to however many API replicas the
+HPA happens to have chosen: a traffic lull that scales the API down also slows event delivery,
+and scaling up for latency multiplies the relay's database load for nothing. Different
+bottlenecks, different replica counts — and a relay stuck on an unavailable broker shouldn't
+consume resources in the process serving customers.
+
+> [!NOTE]
+> The publisher is currently `outbox.LogPublisher`, a **placeholder** that logs instead of
+> sending. M8b replaces that one line with NATS JetStream. Everything else — claiming,
+> batching, the marking transaction, at-least-once semantics — is already the real thing and
+> none of it changes when the broker arrives.
 
 ---
 
@@ -724,6 +808,9 @@ misconfigured deploy into five rollout attempts.
 | `REDIS_ADDR` | | Rate limiting. **Empty disables it** and the service runs unthrottled |
 | `RATE_LIMIT_PER_MINUTE` | `600` | Sustained quota per tenant **per method** |
 | `RATE_LIMIT_BURST` | `100` | Instantaneous allowance. Without burst, two back-to-back requests are rejected at any sustained rate |
+| `OUTBOX_BATCH_SIZE` | `100` | Bounds one claim — and therefore how long a transaction is held across broker I/O |
+| `OUTBOX_POLL_INTERVAL` | `1s` | Idle latency only. A full batch is followed immediately |
+| `OUTBOX_MAX_CONNS` | `2` | The relay's pool. Small so background work doesn't eat the connection budget |
 | `STORE_DRIVER` | `memory` | `memory` \| `postgres`. Postgres needs `POSTGRES_DSN` and a `migrate up` first |
 
 Settings for subsystems that do not exist yet (Redis, NATS, the gateway) are deliberately
@@ -810,14 +897,14 @@ is built.)
 ## Roadmap
 
 **Done:** M0–M1 foundation · M2 toolchain guards · M3 interceptors + observability ·
-M5 auth · M4 Postgres · M6 REST edge · M7 rate limiting · plus an evidence-backed cuts pass.
+M5 auth · M4 Postgres · M6 REST edge · M7 rate limiting · M8a outbox relay ·
+plus an evidence-backed cuts pass.
 
 **Remaining, in order:**
 
 | | Milestone | What it delivers | Scope change |
 |---|---|---|---|
-| **next** | **M8a** Outbox | Relay (`FOR UPDATE SKIP LOCKED`) draining the table M4 already ships | **split** |
-| | **M10** Deploy | Dockerfile, compose, kustomize, e2e tier — and the first real boot of the Keycloak realm | — |
+| **next** | **M10** Deploy | Dockerfile, compose, kustomize, e2e tier — and the first real boot of the Keycloak realm | — |
 | | **M8b** JetStream | Publisher + consumer + DLQ, against the embedded nats-server | **split**, moved after M10 |
 | | **M9** Client | `internal/platform/client`: service config, deadline budget, trace/principal propagation | **reduced** — second service cut |
 | | **M11** Forkability | `cmd/rename`, ADRs, `DELETING.md` | **reduced** — `cmd/scaffold` cut |
