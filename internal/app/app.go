@@ -27,8 +27,10 @@ import (
 	"github.com/example/gomicro/internal/grpcapi"
 	"github.com/example/gomicro/internal/order"
 	"github.com/example/gomicro/internal/order/ordermem"
+	"github.com/example/gomicro/internal/order/orderpg"
 	"github.com/example/gomicro/internal/platform/auth"
 	"github.com/example/gomicro/internal/platform/config"
+	"github.com/example/gomicro/internal/platform/gormx"
 	"github.com/example/gomicro/internal/platform/observability"
 )
 
@@ -149,9 +151,35 @@ func (a *App) buildStore(ctx context.Context) (order.Store, order.Atomic, error)
 		return mem, mem, nil
 
 	case config.StorePostgres:
-		// Wired in M4. Returning an explicit error rather than falling through to a nil
-		// store means the failure names itself instead of panicking on first use.
-		return nil, nil, errors.New("STORE_DRIVER=postgres is not wired yet (see milestone M4)")
+		db, err := gormx.Open(ctx, a.cfg, a.log)
+		if err != nil {
+			return nil, nil, fmt.Errorf("open postgres: %w", err)
+		}
+
+		// Registered as a shutdown step so the pool closes on the way out. Without it a
+		// crash-looping pod leaks its connections until the server times them out, and a
+		// database with a modest max_connections runs out long before the pod stabilises.
+		sqlDB, err := db.DB()
+		if err != nil {
+			return nil, nil, fmt.Errorf("unwrap sql.DB: %w", err)
+		}
+		a.steps = append(a.steps, Step{
+			Name:    "postgres-pool",
+			Timeout: 5 * time.Second,
+			Fn:      func(context.Context) error { return sqlDB.Close() },
+		})
+
+		// NO MIGRATIONS HERE, and no seeding either.
+		//
+		// Migrations run only from cmd/migrate; see that file for why booting them from every
+		// replica turns a slow ALTER into a stalled rollout. Seeding is skipped because a
+		// service that writes fixture rows into a real database on boot will eventually do it
+		// to production.
+		store := orderpg.New(db)
+		a.log.Info("using the postgres store",
+			slog.Int("max_open_conns", a.cfg.Postgres.MaxOpenConns),
+			slog.String("hint", "run `go run ./cmd/migrate up` if the schema is not current"))
+		return store, store, nil
 
 	default:
 		return nil, nil, fmt.Errorf("unknown STORE_DRIVER %q", a.cfg.StoreDriver)

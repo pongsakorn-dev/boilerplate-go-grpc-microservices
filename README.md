@@ -37,7 +37,7 @@ time than one that ships less.
 | Observability: slog + Prometheus + OTel traces | ✅ Done | Trace-correlated logs, `/metrics`, private pprof, OTLP export |
 | Real auth (OIDC/JWKS) + default-deny policy | ✅ Done | Hostile-issuer suite, key rotation, revocation, default-deny policy the server refuses to boot without |
 | Keycloak realm example | ⚠️ Partial | Structurally tested, **never booted against a real Keycloak** — see [`deploy/keycloak/`](deploy/keycloak/) |
-| Postgres via GORM + goose migrations | ⬜ M4 · next | `STORE_DRIVER=postgres` returns an explicit error today |
+| Postgres via GORM + goose migrations | ✅ Done | Same store contract as the in-memory driver, plus N+1, query-plan and rollback guards |
 | REST/JSON edge (grpc-gateway) | ⬜ M6 | `.pb.gw.go` is generated but not yet served |
 | Distributed rate limiting (Redis) | ⬜ M7 | Scope **reduced**: cache-aside was cut |
 | Outbox + relay | ⬜ M8a | The `EventPublisher` port exists and is tested |
@@ -152,21 +152,30 @@ gen/go/                     generated code, committed. Never hand-edited.
 
 cmd/
   orderd/                   the service. ~15 lines; everything lives in internal/app
+  migrate/                  goose runner. The ONLY thing that changes the schema
   devtool/                  cross-platform task helpers (Taskfile can't do filesystem work)
 
 internal/
   order/                    DOMAIN. Imports no gen/, no driver, no gRPC, no telemetry
     ordermem/                 in-memory store — also backs STORE_DRIVER=memory
+    orderpg/                  Postgres adapter. *gorm.DB never leaves here
     ordertest/                builders + the shared store contract
-  grpcapi/                  THE proto boundary. convert / errmap / server / chain
+  grpcapi/                  THE proto boundary. convert / errmap / server / chain / policy
   app/                      composition root: New, Run, Close, shutdown sequencer
   platform/                 cross-cutting, service-agnostic
     config/                   the ONLY package that reads the environment
     apperr/                   Kind enum + the one Kind->code->HTTP table
-    auth/                     Principal and its context plumbing
+    auth/                     Verifier (dev|oidc), JWKS cache, claim mapping, Policy
+      testjwks/                 in-process HOSTILE issuer: alg:none, oct keys, rotation
     interceptor/              recovery, logging, errmap, admission, auth, deadline, validate
+    gormx/                    tenant guard, pool config, slog adapter, query counter
+    migrations/               goose .sql via embed.FS
+    testdb/                   testcontainers harness (build tag `integration` only)
     observability/            slog+TraceHandler, Prometheus, OTel traces, admin mux
   testutil/                 bufconn harness that boots the real server
+
+deploy/
+  keycloak/                 worked OIDC realm: audience mapper, two principal shapes
 
 test/                       ALL cross-cutting guards, incl. proto toolchain and Taskfile
 ```
@@ -258,14 +267,14 @@ compile-time guarantee. That is the only way `go test ./...` is safe with Docker
 
 | Tier | Command | Infra | Measured on this machine |
 |---|---|---|---|
-| Default | `go test ./...` | none | **8.2s** cold cache, **1.1s** cached |
+| Default | `go test ./...` | none | **9s** cold cache, **1s** cached |
 | Codegen | `task verify:codegen` | network | **17.6s** — regenerates and byte-compares |
-| Integration *(M4)* | `task verify:int` | Docker | — |
+| Integration | `task verify:int` | Docker | **20s** with the image cached. **Skips**, never fails, without Docker |
 | End-to-end *(M10)* | not yet — arrives with the compose stack | Docker + compose | — |
 
 ### Guard tests
 
-`test/` and `tools/` hold tests that assert nothing about business behaviour — they exist to
+`test/` holds tests that assert nothing about business behaviour — they exist to
 stop the template rotting. Each has been verified to actually **fail** when violated, not
 merely to pass today:
 
@@ -297,6 +306,22 @@ merely to pass today:
 | `TestTaskTargetsReferenceRealPaths` | A task target pointing at a file that does not exist |
 | `TestBannedToolsAreNotToolDependencies` | A build tool entering the production module graph |
 | `TestErrorsAreMappedBeforeLoggingObservesThem` | Interceptor order regressing to `codes.Unknown` |
+| `TestRecoveryThroughTheRealChain` | A recovered panic leaking its raw value to the client |
+| `TestPolicyCoversEveryDeclaredRPC` | An RPC shipping with no authorisation decision |
+| `TestPolicyRulesAllReferenceRealMethods` | A rule left behind by a rename, protecting nothing |
+| `TestReadAndWriteScopesAreActuallySeparated` | A read-only credential able to mutate |
+| `TestVerifyRejectsHostileTokens` | `alg:none`, wrong `aud`, missing `exp`, unknown `kid` |
+| `TestKeyAlgorithmBindingIsEnforced` | An algorithm substitution within one key type |
+| `TestRevokedKeysStopBeingTrusted` | A revoked signing key trusted until the pod restarts |
+| `TestSlowRefreshDoesNotStallCachedVerifications` | One unauthenticated request stalling all auth |
+| `TestDiscoveryRecoversAfterAFailedFirstAttempt` | A pod serving Unauthenticated forever after an IdP blip |
+| `TestRealmSetsTheAudienceOnEveryTokenIssuingClient` | The Keycloak realm losing its audience mapper |
+| `TestStatusRoundTripsThroughItsName` | Stored status names drifting from the Go constants |
+| `TestTenantScopedOfUnwrapsEveryShapeGORMProduces` | The tenant guard silently not applying to `Find(&[]T{})` |
+| `TestTenantGuardFailsClosed` | A query with no tenant returning **every tenant's rows** |
+| `TestListDoesNotNPlusOne` | 50 orders costing 51 queries instead of 2 |
+| `TestKeysetPaginationSeeksRatherThanFilters` | A rewrite that keeps the index but loses the seek |
+| `TestMigrationsRoundTrip` | A `down` block that does not work, discovered mid-release |
 
 ### The pattern worth stealing: one contract, two implementations
 
@@ -333,6 +358,85 @@ implementation plan; the short version:
 | Time in tests | `testing/synctest` | No `Clock` interface — the stdlib made that abstraction unnecessary in Go 1.25 |
 | Assertions | stdlib + `go-cmp`/`protocmp` | One assertion idiom, not two. Adding testify later is purely additive |
 | Task runner | [Taskfile](Taskfile.yml) via `go tool` | No Makefile: Windows has no `make`. Task's shell has no `rm`/`sed`/`jq` either, so those live in `cmd/devtool` |
+
+---
+
+## Persistence
+
+`STORE_DRIVER=memory` (default) needs nothing. `STORE_DRIVER=postgres` needs a DSN and a
+schema:
+
+```bash
+go run ./cmd/migrate up
+```
+
+### The contract is the point
+
+[`ordertest.RunStoreContract`](internal/order/ordertest/contract.go) is one suite of 15
+behaviours. It runs **unchanged** against the in-memory store (microseconds, no Docker) and
+against real Postgres (testcontainers). That turns *"the fake behaves like the database"* from
+an assumption into a tested property — and a fake nothing holds to a contract is just a second
+implementation of your bugs, which every unit test above it then agrees with.
+
+Assertions only the real database can make live in
+[`orderpg_integration_test.go`](internal/order/orderpg/orderpg_integration_test.go), not in the
+contract: SQLSTATE mapping, query plans, N+1 counts, migration rollback.
+
+### What GORM gives up, and what replaces it
+
+GORM was chosen for reach — it is the ORM most Go teams already know. What it gives up is
+compile-time column checking, so three mechanisms are load-bearing rather than nice-to-have:
+
+| Mechanism | Replaces | Failure it catches |
+|---|---|---|
+| [Fail-closed tenant callback](internal/platform/gormx/tenant.go) | linting `.sql` files | A query with no tenant returns **every tenant's rows** — and looks like a working feature |
+| [Query counter](internal/platform/gormx/counter.go) | nothing; N+1 is invisible | 50 orders costing 51 queries instead of 2. Identical data, identical code review |
+| Plan assertions on captured SQL | `EXPLAIN` by hand, once | A rewrite that keeps the index but loses the seek |
+
+The counter ships as **normal code**, not a test helper — a guard only the template can use
+teaches nothing. Point it at your own hot paths.
+
+### Two decisions worth knowing before you fork
+
+**Money is two integer columns, not `numeric(19,4)`.** The domain type is
+`google.type.Money`'s shape — units plus nanos (10⁻⁹). `numeric(19,4)` holds four decimal
+places, so it *truncates nanos silently*, which is the exact money bug the integral type
+exists to prevent. Want SQL aggregation? Add a generated `numeric(19,9)` column; keep the
+exact representation authoritative.
+
+**Status is stored as its NAME, not the iota.** Storing the number couples every row to the
+declaration order of the Go constants — inserting a status in the middle, which looks
+harmless, reinterprets existing rows. `order_test.go` round-trips every value through
+`String`/`ParseStatus` so the two cannot drift.
+
+### Migrations never run on boot
+
+They run from [`cmd/migrate`](cmd/migrate/main.go) only. Booting them from the server means
+every replica in a rolling deploy races on the same schema; goose serialises them with an
+advisory lock, so a slow `ALTER` now stalls every pod's readiness at once and the symptom is
+*"the deploy is stuck"*. It also ties rolling back the app to rolling back the schema, which
+are different decisions with different risks. In Kubernetes this is a Job that completes
+before the Deployment rolls.
+
+There is no bare `down` — only `down-to <version>`. A one-keystroke rollback of the latest
+migration is how a production table gets dropped by someone who meant to do it in staging.
+
+### The integration tier
+
+```bash
+go test -tags=integration ./...
+```
+
+**A build tag, not `testing.Short()`.** A `Short()` skip still *links* testcontainers into
+every test binary in the module; a build tag makes the default tier's dependency set a
+compile-time property, which [`test/tiers_test.go`](test/tiers_test.go) then asserts. That is
+what makes `go test ./...` safe with the Docker daemon stopped.
+
+One container per package, started in `TestMain`, migrated once into a template database that
+each test then **clones** — `CREATE DATABASE … TEMPLATE` costs tens of milliseconds, so tests
+stay isolated *and* parallel. With Docker down, every test **skips** with a message naming
+your active Docker context (the usual Windows cause is testcontainers resolving the default
+`docker_engine` pipe while Docker Desktop publishes `desktop-linux`).
 
 ---
 
@@ -444,7 +548,7 @@ misconfigured deploy into five rollout attempts.
 | `APP_ENV` | `development` | `development` \| `staging` \| `production` |
 | `GRPC_ADDR` | `:50051` | |
 | `ADMIN_ADDR` | `127.0.0.1:9090` | Keep it private — it serves pprof from M3 |
-| `STORE_DRIVER` | `memory` | `memory` \| `postgres` (M4) |
+| `STORE_DRIVER` | `memory` | `memory` \| `postgres`. Postgres needs `POSTGRES_DSN` and a `migrate up` first |
 
 Settings for subsystems that do not exist yet (Redis, NATS, the gateway) are deliberately
 **absent** rather than present-and-ignored — a config field that reads as wired and is not is
@@ -530,14 +634,13 @@ is built.)
 ## Roadmap
 
 **Done:** M0–M1 foundation · M2 toolchain guards · M3 interceptors + observability ·
-M5 auth · plus an evidence-backed cuts pass.
+M5 auth · M4 Postgres · plus an evidence-backed cuts pass.
 
 **Remaining, in order:**
 
 | | Milestone | What it delivers | Scope change |
 |---|---|---|---|
-| **next** | **M4** Postgres | GORM + goose + testcontainers, the same store contract run against a real database, N+1 query-count guard, schema-drift check | — |
-| | **M6** REST edge | grpc-gateway in **client mode**, so the HTTP path runs the same interceptors | — |
+| **next** | **M6** REST edge | grpc-gateway in **client mode**, so the HTTP path runs the same interceptors | — |
 | | **M7** Rate limiting | Redis GCRA per tenant+method, tested against miniredis | **reduced** — cache-aside cut |
 | | **M8a** Outbox | Table + relay (`FOR UPDATE SKIP LOCKED`) behind the existing `EventPublisher` port | **split** |
 | | **M10** Deploy | Dockerfile, compose, kustomize, e2e tier — and the first real boot of the Keycloak realm | — |

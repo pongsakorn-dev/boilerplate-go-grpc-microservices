@@ -79,6 +79,15 @@ tasks:
     cmds:
       - go test -tags=integration ./...
 
+  db:migrate:
+    desc: Apply the database schema (reads POSTGRES_DSN from the environment)
+    cmds:
+      - go run ./cmd/migrate up
+
+  db:status:
+    desc: Show which migrations have been applied, and which are pending
+    cmds:
+      - go run ./cmd/migrate status
 
   verify:codegen:
     desc: Assert the committed generated code still matches the protos
