@@ -3,7 +3,10 @@
 package e2e
 
 import (
+	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"strconv"
 	"strings"
 	"testing"
@@ -152,4 +155,120 @@ func orderCount(t *testing.T, tenant string) int {
 		t.Fatalf("order_counts returned %q, which is not a number", out)
 	}
 	return n
+}
+
+// TestTheWorkerExposesOutboxHealth is the reason the worker gained a listener.
+//
+// The gauges are unit-tested against a real database in the integration tier. What no other
+// tier covers is that they are REACHABLE: that the worker binds an admin address the compose
+// file actually publishes, that /metrics is served there, and that the outbox series are in
+// the exposition rather than only in the process.
+//
+// That gap is not hypothetical for this repository. ADMIN_ADDR defaults to 127.0.0.1:9090,
+// which is correct on a laptop and unscrapable inside a container -- the metrics would exist,
+// be correct, and be visible to nobody. Only a test that scrapes from outside the container
+// can tell those two states apart.
+func TestTheWorkerExposesOutboxHealth(t *testing.T) {
+	body := scrapeWorkerMetrics(t)
+
+	// The three series an operator alerts on, named exactly. A rename silently breaks every
+	// alert built on them, and nothing else in the repo would notice.
+	for _, metric := range []string{
+		"gomicro_outbox_pending_rows",
+		"gomicro_outbox_quarantined_rows",
+		"gomicro_outbox_oldest_pending_age_seconds",
+		"gomicro_outbox_last_observation_timestamp_seconds",
+	} {
+		if !strings.Contains(body, metric) {
+			t.Errorf("the worker's /metrics does not export %s.\n\n"+
+				"The gauge may well be correct inside the process; it is not reaching a "+
+				"scraper, which is the only thing that makes it an alert.", metric)
+		}
+	}
+
+	// And it is the WORKER's surface, not orderd's: the worker registers no gRPC server
+	// metrics, so their presence would mean the wrong container answered.
+	if strings.Contains(body, "grpc_server_handled_total") {
+		t.Error("the worker's admin port is serving grpc_server_* series.\n\n" +
+			"Either the port mapping reaches orderd instead of the worker, or the worker was " +
+			"given the full metrics registry -- which publishes RPC series that can never " +
+			"move off zero in a process that serves no RPCs.")
+	}
+}
+
+// TestQuarantinedRowsBecomeVisible drives the whole path the gauge exists for.
+//
+// A quarantined row is created directly rather than by provoking a real permanent failure:
+// what is under test here is the observability path -- database to gauge to scrape -- not the
+// relay's decision to quarantine, which relay_integration_test.go already covers.
+func TestQuarantinedRowsBecomeVisible(t *testing.T) {
+	// Start from whatever the stack already has, since earlier tests share it.
+	before := metricValue(t, scrapeWorkerMetrics(t), "gomicro_outbox_quarantined_rows")
+
+	psql(t, `INSERT INTO outbox (tenant_id, aggregate_id, event_type, payload, occurred_at, failed_at, failure_reason)
+	         VALUES ('dev-tenant', gen_random_uuid(), 'order.created', '{}'::jsonb, now(), now(), 'e2e: a deliberately poisoned row')`)
+
+	// OUTBOX_OBSERVE_INTERVAL is 2s in compose.
+	want := before + 1
+	waitFor(t, fmt.Sprintf("the quarantined gauge to reach %v", want), 60*time.Second, func() (bool, string) {
+		got := metricValue(t, scrapeWorkerMetrics(t), "gomicro_outbox_quarantined_rows")
+		return got >= want, fmt.Sprintf("gauge = %v", got)
+	})
+
+	// Clean up so later runs and the shared stack are not left with a poisoned row.
+	psql(t, `DELETE FROM outbox WHERE failure_reason = 'e2e: a deliberately poisoned row'`)
+}
+
+// scrapeWorkerMetrics reads the worker's admin surface from OUTSIDE the container, over the
+// published host port -- the same path Prometheus would take.
+func scrapeWorkerMetrics(t *testing.T) string {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost:9091/metrics", nil)
+	if err != nil {
+		t.Fatalf("build the scrape request: %v", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("scrape the worker's /metrics on the published port: %v\n\n"+
+			"Either the worker is not binding ADMIN_ADDR to an address reachable from "+
+			"outside the container, or the compose file no longer publishes it.", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("the worker's /metrics returned %s", resp.Status)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read the exposition: %v", err)
+	}
+	return string(body)
+}
+
+// metricValue pulls one unlabelled sample out of a Prometheus exposition.
+func metricValue(t *testing.T, exposition, name string) float64 {
+	t.Helper()
+
+	for _, line := range strings.Split(exposition, "\n") {
+		if !strings.HasPrefix(line, name+" ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		v, err := strconv.ParseFloat(fields[1], 64)
+		if err != nil {
+			t.Fatalf("%s has a non-numeric value %q", name, fields[1])
+		}
+		return v
+	}
+	t.Fatalf("no sample named %q in the exposition", name)
+	return 0
 }

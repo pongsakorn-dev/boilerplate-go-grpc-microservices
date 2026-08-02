@@ -23,6 +23,21 @@ type Metrics struct {
 	Server *grpcprom.ServerMetrics
 }
 
+// NewProcessRegistry builds a registry carrying only the runtime and process collectors.
+//
+// For a binary that serves no RPCs -- cmd/worker, which opens no gRPC listener at all. Giving
+// it the full Metrics would publish a complete set of grpc_server_* series that can never move
+// off zero, and a metric that is structurally incapable of changing is worse than an absent
+// one: it invites dashboards and alerts built on a number that will never fire.
+func NewProcessRegistry() *prometheus.Registry {
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+	)
+	return reg
+}
+
 // NewMetrics builds the registry and registers the standard collectors.
 func NewMetrics() *Metrics {
 	reg := prometheus.NewRegistry()

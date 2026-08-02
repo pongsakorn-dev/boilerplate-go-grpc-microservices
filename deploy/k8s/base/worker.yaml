@@ -62,21 +62,35 @@ spec:
             capabilities:
               drop: ["ALL"]
 
-          # NO PROBES, deliberately, and this is the interesting part of the file.
+          ports:
+            # The admin listener carries /metrics and pprof. It is NOT a probe surface --
+            # see below.
+            - name: admin
+              containerPort: 9090
+
+          # STILL NO PROBES, and now for a sharper reason than before.
           #
-          # The worker opens no listener, so there is nothing to probe without adding one --
-          # and adding an HTTP server purely to answer a liveness check means the check
-          # reports that the HTTP server is alive, which is not the question. A relay wedged
-          # on a broker that accepts connections and never acks would pass such a probe
-          # forever.
+          # This container used to open no listener at all, and the argument was that an HTTP
+          # server added to answer a liveness check only reports that the HTTP server is
+          # alive -- not the question, since a relay wedged on a broker that accepts
+          # connections and never acks would pass such a probe forever.
           #
-          # What actually detects a stuck worker is the outbox itself: the age of the oldest
-          # unpublished row, and the count of rows with failed_at set. Both are already in the
-          # database, both are alertable with one query, and neither can be fooled by a
-          # process that is technically running.
+          # There is a listener now, and that argument is unchanged: a /healthz here would
+          # still answer the wrong question, so nothing probes it. What the listener carries
+          # is the signal that DOES detect a wedged relay, which this file previously named
+          # and then left in the database where nothing could reach it:
           #
-          # A fork that wants Kubernetes to restart a wedged worker should add an admin
-          # listener whose /healthz reflects DRAIN PROGRESS -- not process liveness.
+          #   gomicro_outbox_oldest_pending_age_seconds   climbs when nothing is draining
+          #   gomicro_outbox_quarantined_rows             events nobody is coming back for
+          #
+          # Alert on those. The first cannot be satisfied by a process that is merely running,
+          # which is exactly what makes it better than a probe. Alert on staleness of
+          # gomicro_outbox_last_observation_timestamp_seconds too -- if the observer itself
+          # dies, every gauge above freezes at a value that looks healthy.
+          #
+          # A fork that genuinely wants Kubernetes to RESTART a wedged worker still needs a
+          # /healthz reflecting drain progress rather than process liveness; the listener is
+          # now here to hang it on.
 
           resources:
             requests:
@@ -98,6 +112,21 @@ spec:
               value: "2"
             - name: OUTBOX_POLL_INTERVAL
               value: "1s"
+            # How often the outbox gauges are refreshed. On its own clock, NOT the relay's:
+            # a wedged relay must not be able to stop the metric that reports it.
+            - name: OUTBOX_OBSERVE_INTERVAL
+              value: "15s"
+
+            # Bound to the POD IP, not 0.0.0.0 and not localhost. A scraper inside the
+            # cluster must reach /metrics; nothing outside it should. Binding to loopback --
+            # the default, which is right for a laptop -- would make this pod unscrapable and
+            # the metrics above pointless.
+            - name: ADMIN_ADDR
+              value: "$(POD_IP):9090"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
 
           envFrom:
             # Carries POSTGRES_DSN and NATS_URL. With NATS_URL absent the worker still runs

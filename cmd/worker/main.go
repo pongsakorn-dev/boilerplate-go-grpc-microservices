@@ -15,11 +15,14 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
@@ -38,10 +41,13 @@ func main() {
 }
 
 func run() error {
-	// LoadWorker, not Load. The worker opens no listener, so the server's auth rules do not
-	// apply to it -- and applying them stopped it booting with APP_ENV=production at all. The
-	// role is declared by this binary rather than by an environment variable, so a manifest
-	// cannot forget it. See config.Role.
+	// LoadWorker, not Load. The worker serves no RPCs and verifies no tokens, so the server's
+	// auth rules do not apply to it -- and applying them stopped it booting with
+	// APP_ENV=production at all. The role is declared by this binary rather than by an
+	// environment variable, so a manifest cannot forget it. See config.Role.
+	//
+	// It does open ONE listener: the private admin surface below, which carries metrics and
+	// authenticates nobody.
 	cfg, err := config.LoadWorker()
 	if err != nil {
 		return fmt.Errorf("configuration: %w", err)
@@ -102,9 +108,31 @@ func run() error {
 
 	relay := outbox.NewRelay(db, publisher, log, outbox.WithBatchSize(cfg.Outbox.BatchSize))
 
+	// THE WORKER OPENS A LISTENER, and it did not used to. The reasoning is worth keeping.
+	//
+	// This binary shipped with no listener at all, on the argument that an HTTP server added
+	// to answer a liveness probe only reports that the HTTP server is alive -- which is not
+	// the question, since a relay wedged on a broker that accepts connections and never acks
+	// passes such a probe forever. That argument was right and still is: there are NO PROBES
+	// on the worker's pod, and deploy/k8s/base/worker.yaml says why at the point they would go.
+	//
+	// What changed is that the same file named the signal that DOES detect a wedged relay --
+	// the age of the oldest unpublished row, and the count of quarantined ones -- and left
+	// them in the database where nothing could scrape them. A number nobody can reach is not
+	// an alert. This listener exists to carry those two, not to answer a probe.
+	//
+	// NewProcessRegistry rather than NewMetrics: the worker serves no RPCs, so a full set of
+	// grpc_server_* series would be permanently zero here.
+	registry := observability.NewProcessRegistry()
+	observer := outbox.NewObserver(db, log, registry)
+
+	adminSrv := observability.NewAdminServer(cfg, observability.NewAdminMux(registry, nil))
+
 	log.Info("worker starting",
 		"batch_size", cfg.Outbox.BatchSize,
 		"poll_interval", cfg.Outbox.PollInterval.String(),
+		"observe_interval", cfg.Outbox.ObserveInterval.String(),
+		"admin_addr", cfg.AdminAddr,
 		"publisher", publishTo,
 		"consumer", consumer != nil)
 
@@ -115,13 +143,37 @@ func run() error {
 	// not stop the relay from draining the outbox, or a downstream problem becomes an
 	// upstream one.
 	var wg sync.WaitGroup
-	errs := make(chan error, 2)
+	errs := make(chan error, 3)
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		if err := relay.Run(ctx, cfg.Outbox.PollInterval); err != nil {
 			errs <- fmt.Errorf("relay: %w", err)
+		}
+	}()
+
+	// The observer is a THIRD independent goroutine, not a step inside the relay's loop.
+	//
+	// That is the whole point of it: the gauge it maintains exists to detect a relay that has
+	// stopped making progress, and a relay that has stopped making progress would also stop
+	// refreshing a gauge it owned -- freezing it at a value that reads as healthy. See
+	// outbox.Observer.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := observer.Run(ctx, cfg.Outbox.ObserveInterval); err != nil {
+			errs <- fmt.Errorf("observer: %w", err)
+		}
+	}()
+
+	// The admin listener. ErrServerClosed is the ordinary shutdown path, not a failure.
+	go func() {
+		if err := adminSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			// Reported, not fatal. Losing metrics is bad; taking the relay down with them --
+			// so that events stop flowing because a scrape endpoint could not bind -- is
+			// worse. A port collision must not become a delivery outage.
+			log.Error("the admin listener stopped", "error", err.Error())
 		}
 	}()
 
@@ -137,6 +189,15 @@ func run() error {
 
 	wg.Wait()
 	close(errs)
+
+	// Stop the admin listener AFTER the workers have finished, so a final scrape during the
+	// drain still sees real numbers. Its own context, because ctx is already cancelled by the
+	// time this runs.
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelShutdown()
+	if err := adminSrv.Shutdown(shutdownCtx); err != nil {
+		log.Warn("the admin listener did not shut down cleanly", "error", err.Error())
+	}
 
 	// Both return nil only on cancellation, so reaching here normally means SIGTERM. Anything
 	// the relay had claimed rolled back with its transaction and stays unpublished for
