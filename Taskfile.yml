@@ -113,6 +113,17 @@ tasks:
     cmds:
       - docker compose --profile auth --profile obs --profile app down -v
 
+  verify:e2e:
+    desc: Run the SHIPPED artifacts -- real Dockerfile, real compose file, real images
+    cmds:
+      # -count=1 is REQUIRED, not tidiness.
+      #
+      # Go's test cache keys on Go files and their inputs. It knows nothing about the
+      # Dockerfile or the compose file, so editing either and re-running reports a cached PASS
+      # from the previous build. That was observed while writing this tier: a deliberately
+      # broken healthcheck came back green in 0.0s.
+      - go test -tags=e2e -count=1 -timeout 40m ./test/e2e/...
+
   verify:rename:
     desc: Prove the template is forkable -- renames a copy of the repo, then builds and tests it
     cmds:

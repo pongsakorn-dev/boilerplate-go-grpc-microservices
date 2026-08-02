@@ -210,14 +210,91 @@ func removeSelf(root string) error {
 		return fmt.Errorf("read Taskfile.yml: %w", err)
 	}
 
-	updated, removed := removeTaskTarget(string(raw), "verify:rename")
-	if !removed {
-		return nil
+	if updated, removed := removeTaskTarget(string(raw), "verify:rename"); removed {
+		if err := os.WriteFile(taskfile, []byte(updated), 0o644); err != nil {
+			return fmt.Errorf("rewrite Taskfile.yml: %w", err)
+		}
 	}
-	if err := os.WriteFile(taskfile, []byte(updated), 0o644); err != nil {
-		return fmt.Errorf("rewrite Taskfile.yml: %w", err)
+
+	return removeForkToolDocs(root)
+}
+
+// forkToolBegin and forkToolEnd delimit documentation that describes THIS TOOL.
+//
+// Markers rather than pattern-matching on prose. The alternative -- finding and deleting the
+// paragraphs that happen to mention the rename tool -- is a text-surgery problem with no
+// correct answer, and it fails silently by leaving half a section behind.
+//
+// This exists because the guards caught it. `test/taskfile_test.go` fails when the README
+// references a task that no longer exists, so a fork that ran the tool had a red suite on its
+// first run: the tool had removed `verify:rename` from the Taskfile and left the README talking
+// about it. Exactly the failure removeSelf already existed to prevent, one file over.
+const (
+	forkToolBegin = "<!-- fork-tool:begin -->"
+	forkToolEnd   = "<!-- fork-tool:end -->"
+)
+
+// removeForkToolDocs strips the marked regions from every tracked markdown file.
+func removeForkToolDocs(root string) error {
+	files, err := trackedFiles(root)
+	if err != nil {
+		return err
+	}
+
+	for _, rel := range files {
+		if filepath.Ext(rel) != ".md" {
+			continue
+		}
+		abs := filepath.Join(root, filepath.FromSlash(rel))
+
+		raw, err := os.ReadFile(abs)
+		if err != nil {
+			continue // deleted since the listing; not this tool's problem
+		}
+		content := string(raw)
+		if !strings.Contains(content, forkToolBegin) {
+			continue
+		}
+
+		updated, err := stripMarked(content)
+		if err != nil {
+			return fmt.Errorf("%s: %w", rel, err)
+		}
+		if err := os.WriteFile(abs, []byte(updated), 0o644); err != nil {
+			return fmt.Errorf("rewrite %s: %w", rel, err)
+		}
 	}
 	return nil
+}
+
+// stripMarked removes every begin/end region, and refuses on an unbalanced pair.
+//
+// Refuses rather than guesses: an unmatched marker means someone edited the documentation and
+// left it half-marked, and deleting to the end of the file would be a spectacular way to
+// discover that.
+func stripMarked(content string) (string, error) {
+	for {
+		start := strings.Index(content, forkToolBegin)
+		if start < 0 {
+			if strings.Contains(content, forkToolEnd) {
+				return "", fmt.Errorf("a %s marker has no matching %s", forkToolEnd, forkToolBegin)
+			}
+			return content, nil
+		}
+
+		rest := content[start:]
+		offset := strings.Index(rest, forkToolEnd)
+		if offset < 0 {
+			return "", fmt.Errorf("a %s marker has no matching %s", forkToolBegin, forkToolEnd)
+		}
+		end := start + offset + len(forkToolEnd)
+
+		// Take the newline after the closing marker so removals leave no blank gap.
+		if end < len(content) && content[end] == '\n' {
+			end++
+		}
+		content = content[:start] + content[end:]
+	}
 }
 
 // removeTaskTarget drops one target block from a Taskfile.
