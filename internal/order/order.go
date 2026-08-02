@@ -44,6 +44,38 @@ func (s Status) Valid() bool {
 	return s >= StatusPending && s <= StatusCancelled
 }
 
+// ParseStatus is the inverse of String.
+//
+// It exists so persistence can store the NAME rather than the numeric value. Storing the
+// iota would couple every row in the database to the declaration order of the constants
+// above: inserting a new status in the middle, which looks like a harmless edit, would
+// silently reinterpret every existing row. Names also make the table readable in psql
+// during an incident, which is when you most want it.
+//
+// Kept next to String so the two cannot drift; order_test.go round-trips every value.
+func ParseStatus(s string) (Status, error) {
+	switch s {
+	case "PENDING":
+		return StatusPending, nil
+	case "CONFIRMED":
+		return StatusConfirmed, nil
+	case "SHIPPED":
+		return StatusShipped, nil
+	case "CANCELLED":
+		return StatusCancelled, nil
+	case "UNSPECIFIED", "":
+		return StatusUnspecified, nil
+	default:
+		return StatusUnspecified, fmt.Errorf("unknown order status %q", s)
+	}
+}
+
+// AllStatuses is every real status, so tests can iterate exhaustively rather than listing
+// by hand and quietly missing the one added last week.
+func AllStatuses() []Status {
+	return []Status{StatusPending, StatusConfirmed, StatusShipped, StatusCancelled}
+}
+
 // allowedTransitions is the whole state machine, in one readable place.
 var allowedTransitions = map[Status][]Status{
 	StatusPending:   {StatusConfirmed, StatusCancelled},
