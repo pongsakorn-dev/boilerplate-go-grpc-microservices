@@ -1,0 +1,416 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "order/v1/order.proto",
+    "version": "version not set"
+  },
+  "tags": [
+    {
+      "name": "OrderService"
+    }
+  ],
+  "consumes": [
+    "application/json"
+  ],
+  "produces": [
+    "application/json"
+  ],
+  "paths": {
+    "/v1/orders": {
+      "get": {
+        "operationId": "OrderService_ListOrders",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1ListOrdersResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "page_size",
+            "description": "Server clamps this to a documented maximum and echoes the size actually used.",
+            "in": "query",
+            "required": false,
+            "type": "integer",
+            "format": "int32"
+          },
+          {
+            "name": "page_token",
+            "description": "Opaque. Callers must treat it as a blob -- it encodes the keyset cursor, and its\ninternal shape is not part of the API contract.",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          },
+          {
+            "name": "status",
+            "description": "Typed filter fields only, deliberately not an AIP-160 expression language: a CEL-ish\nfilter parser is a large surface with no static query guarantees behind it.",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "enum": [
+              "ORDER_STATUS_UNSPECIFIED",
+              "ORDER_STATUS_PENDING",
+              "ORDER_STATUS_CONFIRMED",
+              "ORDER_STATUS_SHIPPED",
+              "ORDER_STATUS_CANCELLED"
+            ],
+            "default": "ORDER_STATUS_UNSPECIFIED"
+          },
+          {
+            "name": "customer_id",
+            "in": "query",
+            "required": false,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "OrderService"
+        ]
+      },
+      "post": {
+        "operationId": "OrderService_CreateOrder",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1CreateOrderResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/v1CreateOrderRequest"
+            }
+          }
+        ],
+        "tags": [
+          "OrderService"
+        ]
+      }
+    },
+    "/v1/orders/{order_id}": {
+      "get": {
+        "operationId": "OrderService_GetOrder",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1GetOrderResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "order_id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          }
+        ],
+        "tags": [
+          "OrderService"
+        ]
+      }
+    },
+    "/v1/orders/{order_id}:cancel": {
+      "post": {
+        "operationId": "OrderService_CancelOrder",
+        "responses": {
+          "200": {
+            "description": "A successful response.",
+            "schema": {
+              "$ref": "#/definitions/v1CancelOrderResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "order_id",
+            "in": "path",
+            "required": true,
+            "type": "string"
+          },
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": {
+              "$ref": "#/definitions/OrderServiceCancelOrderBody"
+            }
+          }
+        ],
+        "tags": [
+          "OrderService"
+        ]
+      }
+    },
+    "/v1/orders:watch": {
+      "get": {
+        "summary": "Server-streaming exists in the template on purpose: a stream is the only way to\nexercise the grpc.ServerStream context wrapper, mid-stream client cancellation, and\nthe graceful-drain path. All three are invisible to unary tests.",
+        "operationId": "OrderService_WatchOrders",
+        "responses": {
+          "200": {
+            "description": "A successful response.(streaming responses)",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "result": {
+                  "$ref": "#/definitions/v1WatchOrdersResponse"
+                },
+                "error": {
+                  "$ref": "#/definitions/rpcStatus"
+                }
+              },
+              "title": "Stream result of v1WatchOrdersResponse"
+            }
+          },
+          "default": {
+            "description": "An unexpected error response.",
+            "schema": {
+              "$ref": "#/definitions/rpcStatus"
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "type": "string",
+            "enum": [
+              "ORDER_STATUS_UNSPECIFIED",
+              "ORDER_STATUS_PENDING",
+              "ORDER_STATUS_CONFIRMED",
+              "ORDER_STATUS_SHIPPED",
+              "ORDER_STATUS_CANCELLED"
+            ],
+            "default": "ORDER_STATUS_UNSPECIFIED"
+          }
+        ],
+        "tags": [
+          "OrderService"
+        ]
+      }
+    }
+  },
+  "definitions": {
+    "OrderServiceCancelOrderBody": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string"
+        },
+        "idempotency_key": {
+          "type": "string"
+        }
+      }
+    },
+    "protobufAny": {
+      "type": "object",
+      "properties": {
+        "@type": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": {}
+    },
+    "rpcStatus": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/protobufAny"
+          }
+        }
+      }
+    },
+    "v1CancelOrderResponse": {
+      "type": "object",
+      "properties": {
+        "order": {
+          "$ref": "#/definitions/v1Order"
+        }
+      }
+    },
+    "v1CreateOrderRequest": {
+      "type": "object",
+      "properties": {
+        "customer_id": {
+          "type": "string"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1OrderItem"
+          }
+        },
+        "idempotency_key": {
+          "type": "string",
+          "description": "Optional. When present, the RPC is replayable: sending the same key twice yields\none order and two byte-identical responses. The client retry policy in\ninternal/platform/client/servicecfg.json only retries CreateOrder when this is set,\nbecause retrying a non-idempotent mutation is how a template ships duplicate orders."
+        }
+      }
+    },
+    "v1CreateOrderResponse": {
+      "type": "object",
+      "properties": {
+        "order": {
+          "$ref": "#/definitions/v1Order"
+        }
+      }
+    },
+    "v1GetOrderResponse": {
+      "type": "object",
+      "properties": {
+        "order": {
+          "$ref": "#/definitions/v1Order"
+        }
+      }
+    },
+    "v1ListOrdersResponse": {
+      "type": "object",
+      "properties": {
+        "orders": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1Order"
+          }
+        },
+        "next_page_token": {
+          "type": "string",
+          "description": "Empty when there are no further pages."
+        }
+      }
+    },
+    "v1Money": {
+      "type": "object",
+      "properties": {
+        "currency_code": {
+          "type": "string",
+          "description": "ISO-4217 three-letter currency code, e.g. \"USD\"."
+        },
+        "units": {
+          "type": "string",
+          "format": "int64",
+          "description": "Whole units. For \"USD\", 1 unit is 1 dollar."
+        },
+        "nanos": {
+          "type": "integer",
+          "format": "int32",
+          "description": "Fractional part in nanos (10^-9). Must carry the same sign as units."
+        }
+      },
+      "description": "Money mirrors google.type.Money field-for-field (currency_code / units / nanos).\n\nIt is declared here rather than importing google/type/money.proto so the proto tree\nstays self-contained and codegen needs one fewer vendored file. The wire format is\nidentical to google.type.Money, so swapping to the canonical type later is not a\nbreaking change.\n\nMoney is NEVER a double. internal/order/money_test.go has an AST test asserting\nfloat64 appears nowhere in the money path -- floating point silently corrupts\nfinancial data in a way no integration test will catch."
+    },
+    "v1Order": {
+      "type": "object",
+      "properties": {
+        "order_id": {
+          "type": "string"
+        },
+        "tenant_id": {
+          "type": "string",
+          "description": "Populated by the server from the caller identity. This is an OUTPUT field.\n\nNo request message carries a tenant_id, so there is nothing for a client to override.\nThe isolation comes from the field being absent on the request side, not from a\nrejection rule. Cross-tenant invisibility is asserted by\ninternal/order/ordertest/contract.go, in \"an order in another tenant is\nindistinguishable from missing\"."
+        },
+        "customer_id": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/v1OrderStatus"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1OrderItem"
+          }
+        },
+        "total": {
+          "$ref": "#/definitions/v1Money"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "v1OrderItem": {
+      "type": "object",
+      "properties": {
+        "sku": {
+          "type": "string"
+        },
+        "quantity": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "unit_price": {
+          "$ref": "#/definitions/v1Money"
+        }
+      }
+    },
+    "v1OrderStatus": {
+      "type": "string",
+      "enum": [
+        "ORDER_STATUS_UNSPECIFIED",
+        "ORDER_STATUS_PENDING",
+        "ORDER_STATUS_CONFIRMED",
+        "ORDER_STATUS_SHIPPED",
+        "ORDER_STATUS_CANCELLED"
+      ],
+      "default": "ORDER_STATUS_UNSPECIFIED"
+    },
+    "v1WatchOrdersResponse": {
+      "type": "object",
+      "properties": {
+        "order": {
+          "$ref": "#/definitions/v1Order"
+        }
+      }
+    }
+  }
+}

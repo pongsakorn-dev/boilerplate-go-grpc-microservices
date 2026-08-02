@@ -38,7 +38,7 @@ time than one that ships less.
 | Real auth (OIDC/JWKS) + default-deny policy | ✅ Done | Hostile-issuer suite, key rotation, revocation, default-deny policy the server refuses to boot without |
 | Keycloak realm example | ⚠️ Partial | Structurally tested, **never booted against a real Keycloak** — see [`deploy/keycloak/`](deploy/keycloak/) |
 | Postgres via GORM + goose migrations | ✅ Done | Same store contract as the in-memory driver, plus N+1, query-plan and rollback guards |
-| REST/JSON edge (grpc-gateway) | ⬜ M6 | `.pb.gw.go` is generated but not yet served |
+| REST/JSON edge (grpc-gateway) | ✅ Done | Client mode over an in-process connection, so REST runs the **same** interceptors |
 | Distributed rate limiting (Redis) | ⬜ M7 | Scope **reduced**: cache-aside was cut |
 | Outbox + relay | ⬜ M8a | The `EventPublisher` port exists and is tested |
 | NATS JetStream + worker | ⬜ M8b | Deliberately **after** M10, so the deploy story exists first |
@@ -149,6 +149,7 @@ proto/                      .proto sources
   order/v1/order.proto      the example domain
   third_party/              VENDORED deps -> codegen works offline
 gen/go/                     generated code, committed. Never hand-edited.
+gen/openapiv2/              OpenAPI v2 for the REST edge, generated from the same protos
 
 cmd/
   orderd/                   the service. ~15 lines; everything lives in internal/app
@@ -161,6 +162,7 @@ internal/
     orderpg/                  Postgres adapter. *gorm.DB never leaves here
     ordertest/                builders + the shared store contract
   grpcapi/                  THE proto boundary. convert / errmap / server / chain / policy
+  gateway/                  REST edge. Transcodes onto the SAME gRPC service, client mode
   app/                      composition root: New, Run, Close, shutdown sequencer
   platform/                 cross-cutting, service-agnostic
     config/                   the ONLY package that reads the environment
@@ -322,6 +324,10 @@ merely to pass today:
 | `TestListDoesNotNPlusOne` | 50 orders costing 51 queries instead of 2 |
 | `TestKeysetPaginationSeeksRatherThanFilters` | A rewrite that keeps the index but loses the seek |
 | `TestMigrationsRoundTrip` | A `down` block that does not work, discovered mid-release |
+| `TestRESTGoesThroughTheInterceptorChain` | The REST edge bypassing auth, authz, limits and error mapping |
+| `TestUnknownJSONFieldsAreRejected` | A client typo silently becoming an empty field |
+| `TestOpenAPIFieldNamesMatchWhatTheServerEmits` | A published schema that disagrees with the running service |
+| `TestReadmeDocumentsEveryPackage` | A package on disk and nowhere in these docs |
 
 ### The pattern worth stealing: one contract, two implementations
 
@@ -358,6 +364,82 @@ implementation plan; the short version:
 | Time in tests | `testing/synctest` | No `Clock` interface — the stdlib made that abstraction unnecessary in Go 1.25 |
 | Assertions | stdlib + `go-cmp`/`protocmp` | One assertion idiom, not two. Adding testify later is purely additive |
 | Task runner | [Taskfile](Taskfile.yml) via `go tool` | No Makefile: Windows has no `make`. Task's shell has no `rm`/`sed`/`jq` either, so those live in `cmd/devtool` |
+
+---
+
+## The REST edge
+
+`GATEWAY_ADDR` (default `:8080`) serves HTTP+JSON transcoded onto the **same** gRPC service,
+using the `google.api.http` bindings already in the `.proto`. There is no second handler and
+no second copy of any business rule.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/v1/orders
+```
+
+Set `GATEWAY_ADDR=""` to switch it off entirely — a service with only gRPC clients should not
+expose an HTTP surface it never uses.
+
+### Client mode, and why it is the whole design
+
+grpc-gateway can register two ways, and the difference is not a performance tuning knob:
+
+| | What it does | What runs |
+|---|---|---|
+| **Server mode** | Calls the handler implementation directly, in-process | **Nothing.** No auth, no authz, no admission control, no error mapping, no metrics, no tracing |
+| **Client mode** ← | Makes a real gRPC call | The entire interceptor chain |
+
+Server mode is faster and needs no connection. It is also, in the registration code, one
+identifier different from the safe one.
+
+That was measured, not assumed: an anonymous `GET /v1/orders` against a server-mode mux built
+from this repo's own handler returns **500** — and only because `grpcapi`'s `tenantOf` refuses
+to proceed without a principal. A handler that defaulted the tenant instead, which is the more
+common shape, would have returned **200 and somebody else's orders**. "Depends how defensive
+each handler happens to be" is not a security model.
+
+So the gateway dials a real connection, and
+[`TestRESTGoesThroughTheInterceptorChain`](internal/gateway/gateway_test.go) sends an
+unauthenticated request and requires **401** — a code only the auth interceptor produces.
+
+### The connection is in-process
+
+The gateway does not dial `localhost:50051`. `app.New` stands up a second listener for the
+same `grpc.Server` — an in-memory `bufconn` — and the gateway dials that. Same server, same
+chain, no loopback hop, no self-connection polluting connection metrics, and no address that
+can be pointed at the wrong thing.
+
+`grpc.Server.Serve` accepts any number of listeners concurrently, so this costs one goroutine.
+
+### JSON contract
+
+| Setting | Value | Why |
+|---|---|---|
+| `UseProtoNames` | on | `customer_id`, not `customerId` — one name per field across proto, gRPC, REST, SQL and OpenAPI |
+| `EmitUnpopulated` | on | Zero values stay present, so a client can tell "unset" from "zero" |
+| `DiscardUnknown` | **off** | A misspelled field is a `400`, not a silently empty order |
+
+Errors use one shape, modelled on AIP-193 — a **symbolic** code, the stable `reason` clients
+branch on, and the `google.rpc` details a gRPC client would receive:
+
+```json
+{"error":{"code":"NOT_FOUND","reason":"ORDER_NOT_FOUND","message":"order not found","domain":"orderd"}}
+```
+
+grpc-gateway's default body is `{"code": 5, "message": "..."}` — a numeric gRPC code,
+meaningless to a client that never speaks gRPC, and no reason field at all. The HTTP status
+comes from **`apperr`'s table**, the same one that produced the gRPC code, so the two surfaces
+cannot drift apart about what a `NotFound` is.
+
+### OpenAPI
+
+`gen/openapiv2/orderd.swagger.json` is generated from the same protos and committed.
+
+One flag in `buf.gen.yaml` is load-bearing: `json_names_for_fields=false`. The plugin defaults
+to `true`, which documents lowerCamelCase while the server emits proto names — a schema that
+is wrong about every multi-word field, and plausible enough that nobody notices until a
+generated client fails. `TestOpenAPIFieldNamesMatchWhatTheServerEmits` compares the document
+against a real response rather than against itself.
 
 ---
 
@@ -547,7 +629,8 @@ misconfigured deploy into five rollout attempts.
 |---|---|---|
 | `APP_ENV` | `development` | `development` \| `staging` \| `production` |
 | `GRPC_ADDR` | `:50051` | |
-| `ADMIN_ADDR` | `127.0.0.1:9090` | Keep it private — it serves pprof from M3 |
+| `ADMIN_ADDR` | `127.0.0.1:9090` | Keep it private — it serves pprof |
+| `GATEWAY_ADDR` | `:8080` | HTTP+JSON edge. **Empty disables it** — a gRPC-only service should not expose HTTP it never uses |
 | `STORE_DRIVER` | `memory` | `memory` \| `postgres`. Postgres needs `POSTGRES_DSN` and a `migrate up` first |
 
 Settings for subsystems that do not exist yet (Redis, NATS, the gateway) are deliberately
@@ -634,14 +717,13 @@ is built.)
 ## Roadmap
 
 **Done:** M0–M1 foundation · M2 toolchain guards · M3 interceptors + observability ·
-M5 auth · M4 Postgres · plus an evidence-backed cuts pass.
+M5 auth · M4 Postgres · M6 REST edge · plus an evidence-backed cuts pass.
 
 **Remaining, in order:**
 
 | | Milestone | What it delivers | Scope change |
 |---|---|---|---|
-| **next** | **M6** REST edge | grpc-gateway in **client mode**, so the HTTP path runs the same interceptors | — |
-| | **M7** Rate limiting | Redis GCRA per tenant+method, tested against miniredis | **reduced** — cache-aside cut |
+| **next** | **M7** Rate limiting | Redis GCRA per tenant+method, tested against miniredis | **reduced** — cache-aside cut |
 | | **M8a** Outbox | Table + relay (`FOR UPDATE SKIP LOCKED`) behind the existing `EventPublisher` port | **split** |
 | | **M10** Deploy | Dockerfile, compose, kustomize, e2e tier — and the first real boot of the Keycloak realm | — |
 | | **M8b** JetStream | Publisher + consumer + DLQ, against the embedded nats-server | **split**, moved after M10 |
