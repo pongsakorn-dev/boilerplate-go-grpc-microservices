@@ -113,6 +113,11 @@ tasks:
     cmds:
       - docker compose --profile auth --profile obs --profile app down -v
 
+  verify:rename:
+    desc: Prove the template is forkable -- renames a copy of the repo, then builds and tests it
+    cmds:
+      - go test -tags=rename -timeout 30m ./cmd/rename/...
+
   verify:codegen:
     desc: Assert the committed generated code still matches the protos
     cmds:

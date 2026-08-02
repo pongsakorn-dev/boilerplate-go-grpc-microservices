@@ -45,7 +45,7 @@ time than one that ships less.
 | Outbound client + deadline budget | ✅ Done | Budget, opt-in retries, no token forwarding, upstream errors. **No production call site** — see below |
 | Dockerfile, compose, kustomize | ✅ Done | 11.7 MB distroless, no shell. Manifests asserted in the default tier |
 | Keycloak realm example | ✅ Done | Imported by a real Keycloak; a real token accepted end to end — see [`deploy/keycloak/`](deploy/keycloak/) |
-| `cmd/rename`, ADRs, `DELETING.md` | ⬜ M11 | Scope **reduced**: `cmd/scaffold` was cut |
+| `cmd/rename`, decision index, `DELETING.md` | ✅ Done | Rename proven by renaming this repo and testing the result. `cmd/scaffold` **cut** |
 
 > [!NOTE]
 > **`AUTH_MODE=dev` is still the default, and it authenticates nobody.** That is what makes
@@ -157,6 +157,7 @@ cmd/
   migrate/                  goose runner. The ONLY thing that changes the schema
   worker/                   drains the outbox. A separate process on purpose
   devtool/                  cross-platform task helpers (Taskfile can't do filesystem work)
+  rename/                   one-shot fork tool. Regenerates protos, then deletes itself
 
 internal/
   order/                    DOMAIN. Imports no gen/, no driver, no gRPC, no telemetry
@@ -190,6 +191,10 @@ deploy/
   keycloak/                 worked OIDC realm: audience mapper, two principal shapes
   k8s/base/                 orderd + worker Deployments, Service, PDB, HPA
   k8s/overlays/dev/         the ONE overlay. Copying it beats guessing at yours
+
+docs/
+  DELETING.md               per-subsystem removal recipes, in an order that works
+  adr/                      the decision index -- reasoning lives next to the code it decided
 
 test/                       ALL cross-cutting guards, incl. proto toolchain and Taskfile
 ```
@@ -1262,15 +1267,92 @@ healthy daemon can be invisible. `task doctor` detects and explains this.
 
 ## Making it yours
 
-The module path is the placeholder `github.com/example/gomicro`.
+```bash
+go run ./cmd/rename -module github.com/acme/orders
+```
 
-`cmd/rename` (M11) will rewrite `go.mod`, every import, `buf.gen.yaml`'s
-`go_package_prefix`, and the image references in one command, then delete itself. Until it
-lands, change `go.mod` and the `go_package_prefix` in [`buf.gen.yaml`](buf.gen.yaml), then
-run `task gen`.
+That rewrites the module path across ~95 files, rewrites the container image prefix in
+`deploy/` and `Taskfile.yml`, regenerates the protobuf code, and then deletes itself — a fork
+should not carry a tool whose job is done. Add `-dry-run` to see the list first, or `-image` if
+your registry namespace differs from your repository name.
 
-Because managed mode owns `go_package`, **no `.proto` file hard-codes an import path** —
-forking is one line in `buf.gen.yaml`, not one line per proto.
+It refuses to run on a dirty working tree. It rewrites most of the repository and then removes
+itself, so the only practical undo is `git checkout .` — which would take your uncommitted work
+with it.
+
+### The part that makes it a tool and not a `sed` command
+
+Replacing the module path in every tracked file produces a repository that **compiles, passes
+`go vet`, and then panics before `main` runs**:
+
+```
+panic: runtime error: slice bounds out of range [-4:]
+  google.golang.org/protobuf/internal/filedesc.(*File).unmarshalSeed
+  gen/go/order/v1/order.pb.go:997  file_order_v1_order_proto_init()
+```
+
+Generated `.pb.go` files embed the serialized `FileDescriptorProto` as a raw byte string, and
+protobuf wire format is **length-prefixed**. The descriptor contains `go_package`, which
+contains the module path. `github.com/example/gomicro` is 26 characters and
+`github.com/acme/orders` is 22 — and that four-byte difference leaves every following length
+prefix addressing the wrong bytes.
+
+So `gen/` is never rewritten as text. It is **regenerated**, which is correct by construction.
+If codegen cannot run, the tool stops and says so, leaving `gen/` still importing the old path
+so the tree fails to *compile* — a loud failure that names the fix beats a silent one that
+panics in production.
+
+A test reproduces that corruption in milliseconds against the real descriptor, so the reason
+for this design is checked on every run rather than remembered. Because the tool deletes itself,
+the finding outlives it in
+[ADR 0004](docs/adr/0004-generated-code-is-regenerated-not-rewritten.md).
+
+### Proven by doing it
+
+```bash
+task verify:rename
+```
+
+Copies the whole repository, renames it, regenerates, then runs `go build ./...` **and**
+`go test ./...` in the result — 25.8s warm on the development machine. It asserts the tool
+deleted itself and that no file anywhere still names the template.
+
+`go build` alone would not have been enough. That is not a hypothetical: the descriptor bug
+above builds perfectly.
+
+Because managed mode owns `go_package`, **no `.proto` file hard-codes an import path** — the
+prefix lives in one line of [`buf.gen.yaml`](buf.gen.yaml), not one line per proto.
+
+### What it deliberately leaves
+
+The module path is unambiguous — it is an import or it is not. The bare word `gomicro` is not:
+it is also the compose project name, a database user, a password, a Keycloak realm, a Kubernetes
+namespace, a GORM callback key and a wire header. Those have very different blast radii:
+
+- Compose's **project name, database user, password and every DSN** must move *together*, or the
+  stack fails to authenticate against its own database.
+- The **`x-gomicro-*` metadata headers are a wire contract.** Rename them and you break interop
+  with any peer still sending the old name — and nothing fails loudly. The tenant simply arrives
+  empty.
+
+A tool that rewrote some and not others would leave a repository that is internally inconsistent,
+which is worse than one consistently named after the template. So it rewrites none of them and
+prints exactly where they are when it finishes.
+
+Two files it also skips, and you should not:
+
+- **`LICENSE`** — fill in the copyright holder. A broad substitution reaching the Apache appendix
+  would blank it, so the tool skips the file entirely and a test fails until you set it.
+- **`README.md`** — it describes this project, not yours, including the clone URL at the top.
+
+### Deleting what you do not need
+
+[`docs/DELETING.md`](docs/DELETING.md) has a removal recipe for every optional subsystem: the
+exact files, the exact wiring edits, the tests that go with them — **in an order that works**,
+so following it top to bottom never breaks a later step.
+
+Most of them can be turned off with an empty environment variable first, which is a much
+cheaper way to find out whether you actually want them gone.
 
 ### Adding an RPC
 
@@ -1295,18 +1377,20 @@ is built.)
 
 **Done:** M0–M1 foundation · M2 toolchain guards · M3 interceptors + observability ·
 M5 auth · M4 Postgres · M6 REST edge · M7 rate limiting · M8a outbox relay ·
-M10 deploy · M8b JetStream + worker · M9 outbound client · plus an evidence-backed cuts pass.
+M10 deploy · M8b JetStream + worker · M9 outbound client · M11 forkability ·
+plus an evidence-backed cuts pass.
 
-**Remaining, in order:**
+**Every planned milestone has shipped.** What remains is test coverage rather than features,
+and both items are listed in *Known gaps* below rather than as milestones:
 
-| | Milestone | What it delivers | Scope change |
-|---|---|---|---|
-| **next** | **M11** Forkability | `cmd/rename`, ADRs, `DELETING.md` | **reduced** — `cmd/scaffold` cut |
+| | What is left | Why it is not a milestone |
+|---|---|---|
+| | An automated end-to-end tier (`//go:build e2e`) | The paths are verified by hand today; nothing replays them in CI |
+| | Backfill of a few M1–M3 tests | Absorbed piecemeal as later milestones touched the same code |
 
-Every "reduced" and "split" above came out of a review that asked what this template
-over-engineers. The reasoning is recorded in the commit history rather than restated here —
-the short version is that a second service proved the *client*, which is the reusable part, so
-only the client survived.
+Every "reduced", "split" and "cut" above came out of a review that asked what this template
+over-engineers. [ADR 0002](docs/adr/0002-what-was-cut.md) records what was removed and the two
+tests a cut had to pass.
 
 ### Why M5 came before M4
 
