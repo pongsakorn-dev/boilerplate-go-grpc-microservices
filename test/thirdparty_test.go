@@ -96,3 +96,46 @@ func TestVendoredLicenseAndProvenanceExist(t *testing.T) {
 			"root LICENSE is the one that names this project's copyright holder.")
 	}
 }
+
+// TestRootLicenseNamesItsCopyrightHolder is the MIRROR of the placeholder check above, and
+// it was missing.
+//
+// The two LICENSE files in this repo have OPPOSITE requirements, which is exactly why both
+// need guarding:
+//
+//	proto/third_party/LICENSE  must KEEP "[name of copyright owner]" -- it is bufbuild's and
+//	                           Google's licence text, and filling it in misattributes their
+//	                           work to us.
+//	LICENSE                    must have it REPLACED -- an Apache-2.0 project whose appendix
+//	                           still reads "Copyright [yyyy] [name of copyright owner]"
+//	                           identifies no copyright holder, which is the one field the
+//	                           grant depends on.
+//
+// Only the first was checked. The risk is not theoretical: cmd/rename (M11) rewrites the
+// module path with broad text substitution across the tree, and a substitution that catches
+// this line blanks the copyright on the way past. The same class of mechanical accident the
+// header guard above already exists to catch.
+func TestRootLicenseNamesItsCopyrightHolder(t *testing.T) {
+	t.Parallel()
+
+	root := testutil.RepoRoot(t)
+	b, err := os.ReadFile(filepath.Join(root, "LICENSE"))
+	if err != nil {
+		t.Fatalf("read LICENSE: %v", err)
+	}
+	content := string(b)
+
+	for _, placeholder := range []string{"[name of copyright owner]", "[yyyy]"} {
+		if strings.Contains(content, placeholder) {
+			t.Errorf("the root LICENSE still contains the template placeholder %q.\n\n"+
+				"Apache-2.0's grant runs from a named copyright holder. Left unfilled, this "+
+				"project is published under a licence that identifies nobody.", placeholder)
+		}
+	}
+
+	// And the line must actually be there. Deleting the appendix entirely would pass the
+	// placeholder check above while leaving the same hole.
+	if !strings.Contains(content, "Copyright") {
+		t.Error("the root LICENSE carries no copyright line at all")
+	}
+}
