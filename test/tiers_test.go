@@ -14,12 +14,27 @@ import (
 
 // heavyTestDeps are dependencies that must never reach the DEFAULT test tier.
 //
-// Each one either needs a Docker daemon or costs meaningful compile time. The default tier
-// has to stay runnable on a laptop with Docker stopped -- that is the tier a stranger runs
-// first, and it is the one that decides whether they keep going.
+// The criterion is NEEDS A DOCKER DAEMON, not "feels big". The default tier has to stay
+// runnable on a laptop with Docker stopped -- that is the tier a stranger runs first, and it
+// is the one that decides whether they keep going.
+//
+// github.com/nats-io/nats-server WAS on this list, excluded as "large". That was a guess, and
+// when M8b came to use the embedded server it was measured instead, on this machine with a
+// warm standard library:
+//
+//	compile the nats-server tree, cold   8.0s   (once, then cached)
+//	rebuild the test binary, warm        0.7s
+//	test binary size                      24 MB
+//
+// Eight seconds once is not the same kind of cost as needing a daemon, and pretending
+// otherwise had a real consequence: the integration tier requires Docker, so banishing the
+// broker tests there would have meant nobody without Docker ever ran them -- the exact
+// opposite of why the server is embedded in the first place.
+//
+// The rule now says what it actually means, and internal/platform/events/eventstest carries
+// the same numbers next to the code that spends them.
 var heavyTestDeps = []struct{ prefix, why string }{
 	{"github.com/testcontainers/", "needs a Docker daemon"},
-	{"github.com/nats-io/nats-server", "large; belongs behind //go:build integration"},
 	{"github.com/ory/dockertest", "needs a Docker daemon"},
 }
 

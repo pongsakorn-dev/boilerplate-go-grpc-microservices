@@ -80,22 +80,62 @@ type probe struct {
 	Exec      map[string]any `yaml:"exec"`
 }
 
-func loadDeployment(t *testing.T) deployment {
+func loadDeployment(t *testing.T) deployment { return load(t, "deployment.yaml") }
+
+func load(t *testing.T, name string) deployment {
 	t.Helper()
 
-	b, err := os.ReadFile(filepath.Join("base", "deployment.yaml"))
+	b, err := os.ReadFile(filepath.Join("base", name))
 	if err != nil {
-		t.Fatalf("read the base deployment: %v", err)
+		t.Fatalf("read base/%s: %v", name, err)
 	}
 
 	var d deployment
 	if err := yaml.Unmarshal(b, &d); err != nil {
-		t.Fatalf("the deployment manifest is not valid YAML: %v", err)
+		t.Fatalf("base/%s is not valid YAML: %v", name, err)
 	}
 	if len(d.Spec.Template.Spec.Containers) == 0 {
-		t.Fatal("the deployment declares no containers, so every assertion here is vacuous")
+		t.Fatalf("base/%s declares no containers, so every assertion here is vacuous", name)
 	}
 	return d
+}
+
+// everyDeployment returns all workloads, so the security and resource guards cover each of
+// them rather than only the one that happened to exist when they were written.
+//
+// This matters more than it looks. Both guards were added in M10, when orderd was the only
+// Deployment, and they read a hardcoded filename -- so the worker added in M8b would have
+// slipped past every hardening assertion in this file while the suite stayed green.
+func everyDeployment(t *testing.T) map[string]deployment {
+	t.Helper()
+
+	found := map[string]deployment{}
+	entries, err := os.ReadDir("base")
+	if err != nil {
+		t.Fatalf("read base/: %v", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".yaml" {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join("base", e.Name()))
+		if err != nil {
+			t.Fatalf("read base/%s: %v", e.Name(), err)
+		}
+		var kind struct {
+			Kind string `yaml:"kind"`
+		}
+		if err := yaml.Unmarshal(b, &kind); err != nil || kind.Kind != "Deployment" {
+			continue
+		}
+		found[e.Name()] = load(t, e.Name())
+	}
+
+	if len(found) < 2 {
+		t.Fatalf("found %d Deployments in base/, want at least orderd and worker -- a guard "+
+			"that silently covers fewer workloads than exist is worse than no guard", len(found))
+	}
+	return found
 }
 
 // TestGracePeriodExceedsTheDrainSequence is the assertion no YAML linter can make, because it
@@ -136,7 +176,14 @@ func TestGracePeriodExceedsTheDrainSequence(t *testing.T) {
 func TestPodSecurityContextIsHardened(t *testing.T) {
 	t.Parallel()
 
-	d := loadDeployment(t)
+	for name, d := range everyDeployment(t) {
+		t.Run(name, func(t *testing.T) { assertHardened(t, d) })
+	}
+}
+
+func assertHardened(t *testing.T, d deployment) {
+	t.Helper()
+
 	pod := d.Spec.Template.Spec
 
 	if !pod.SecurityContext.RunAsNonRoot {
@@ -223,7 +270,13 @@ func TestAllThreeProbesAreNativeGRPC(t *testing.T) {
 func TestResourcesAreDeclaredWithNoCPULimit(t *testing.T) {
 	t.Parallel()
 
-	d := loadDeployment(t)
+	for name, d := range everyDeployment(t) {
+		t.Run(name, func(t *testing.T) { assertResources(t, d) })
+	}
+}
+
+func assertResources(t *testing.T, d deployment) {
+	t.Helper()
 
 	for _, c := range d.Spec.Template.Spec.Containers {
 		if c.Resources.Requests["cpu"] == "" {

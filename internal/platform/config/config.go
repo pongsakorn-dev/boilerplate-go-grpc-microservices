@@ -34,6 +34,30 @@ const (
 	AuthOIDC = "oidc"
 )
 
+// Role is which binary is reading this configuration.
+//
+// It exists because one Config serves two processes with genuinely different requirements,
+// and validating both against the server's rules produced a real failure: cmd/worker could
+// not start with APP_ENV=production, because AUTH_MODE defaults to dev and dev is refused in
+// production. That refusal is right for a process that serves traffic and meaningless for one
+// that opens no listener -- the worker verifies no tokens, so there is nothing to bypass.
+//
+// It was found by writing deploy/k8s/base/worker.yaml, not by reading the code.
+//
+// THE ROLE COMES FROM THE BINARY, never from the environment. An APP_ROLE variable would move
+// the trap rather than remove it: a worker deployed without it would fail exactly as before,
+// and the manifest that forgot it is the manifest nobody reviews. cmd/worker calls LoadWorker
+// and cannot get this wrong.
+type Role int
+
+const (
+	// RoleServer serves traffic. Auth settings are load-bearing.
+	RoleServer Role = iota
+
+	// RoleWorker drains the outbox and consumes the broker. It has no listener.
+	RoleWorker
+)
+
 // Secret wraps a value that must never reach a log, an error string, or a crash dump.
 //
 // It implements Stringer, json.Marshaler and slog.LogValuer, which are the three routes
@@ -49,6 +73,9 @@ func (s Secret) Reveal() string               { return string(s) }
 
 // Config is the full runtime configuration.
 type Config struct {
+	// Role is set by the binary, not the environment. See the Role type.
+	Role Role
+
 	AppEnv      string
 	ServiceName string
 	Version     string
@@ -80,6 +107,7 @@ type Config struct {
 
 	Redis  RedisConfig
 	Outbox OutboxConfig
+	NATS   NATSConfig
 
 	Telemetry TelemetryConfig
 	Server    ServerConfig
@@ -202,6 +230,61 @@ type OutboxConfig struct {
 	MaxConns int
 }
 
+// NATSConfig configures the JetStream publisher and consumer.
+//
+// The tenant is deliberately ABSENT from every subject setting here, and that is the one
+// decision in this struct worth reading twice. See internal/platform/events for the measured
+// reason: a tenant id containing a dot -- "acme.com", an entirely ordinary value -- becomes
+// extra subject tokens and lands inside another tenant's subject subtree.
+type NATSConfig struct {
+	// URL is the NATS server, e.g. "nats://localhost:4222".
+	//
+	// EMPTY DISABLES the broker, and that is a supported configuration rather than a
+	// degraded one: cmd/worker falls back to outbox.LogPublisher, which prints exactly what
+	// would be published. A fresh clone therefore runs the whole outbox path -- claiming,
+	// batching, the marking transaction -- with no broker installed.
+	URL string
+
+	// Stream is the JetStream stream name. Created or updated at startup, idempotently.
+	Stream string
+
+	// SubjectPrefix is prepended to the event type: "events" + "order.created" becomes the
+	// subject "events.order.created".
+	SubjectPrefix string
+
+	// DLQSubjectPrefix receives messages this consumer gives up on.
+	//
+	// JetStream has NO built-in dead-letter queue. Exceeding MaxDeliver merely stops
+	// redelivery and emits an advisory that nothing consumes by default -- so without this,
+	// a message that fails MaxDeliver times is silently gone. The consumer republishes under
+	// this prefix and only then terminates the original.
+	DLQSubjectPrefix string
+
+	// DuplicateWindow is how long JetStream remembers a Nats-Msg-Id.
+	//
+	// This is what collapses the relay's at-least-once republishing into one stored message.
+	// A republish that arrives AFTER the window is a genuine duplicate the consumer must
+	// handle, which is why processed_events exists as well -- the window is an optimisation,
+	// not the correctness boundary.
+	DuplicateWindow time.Duration
+
+	// StreamMaxAge bounds how long the stream keeps messages. An unbounded stream is a disk
+	// that fills at 03:00 on a date nobody chose.
+	StreamMaxAge time.Duration
+
+	// Consumer is the durable consumer name. Durable so a restart resumes rather than
+	// replaying the stream from the beginning.
+	Consumer string
+
+	// MaxDeliver bounds redelivery of one message before the consumer dead-letters it.
+	MaxDeliver int
+
+	// AckWait is how long the server waits for an ack before redelivering. It must exceed
+	// the handler's worst-case runtime, or a slow handler causes redelivery of work that is
+	// still in progress -- which looks exactly like a duplicate bug.
+	AckWait time.Duration
+}
+
 type ServerConfig struct {
 	// MaxConcurrentStreams must be set: grpc-go's default is effectively unbounded, so
 	// one client can open enough streams to exhaust memory.
@@ -236,18 +319,28 @@ type ShutdownConfig struct {
 	GracePeriod time.Duration
 }
 
-// Load reads the process environment.
+// Load reads the process environment for a service that serves traffic.
 func Load() (Config, error) { return Parse(environ()) }
 
-// Parse builds a Config from an explicit map.
+// LoadWorker reads the process environment for cmd/worker.
+//
+// See Role: the worker opens no listener, so the auth settings a server must get right are
+// irrelevant to it, and refusing to start over them is a bug rather than a safeguard.
+func LoadWorker() (Config, error) { return ParseFor(environ(), RoleWorker) }
+
+// Parse builds a Config from an explicit map, for a traffic-serving process.
 //
 // Tests call this rather than t.Setenv. That is not a style preference: t.Setenv mutates
 // process-global state, so Go refuses to run such a test in parallel, and a config
 // package is exactly where you want a hundred cheap parallel table cases.
-func Parse(env map[string]string) (Config, error) {
+func Parse(env map[string]string) (Config, error) { return ParseFor(env, RoleServer) }
+
+// ParseFor builds a Config for a specific role.
+func ParseFor(env map[string]string, role Role) (Config, error) {
 	p := &parser{env: env}
 
 	cfg := Config{
+		Role:        role,
 		AppEnv:      p.str("APP_ENV", EnvDevelopment),
 		ServiceName: p.str("SERVICE_NAME", "orderd"),
 		Version:     p.str("VERSION", "dev"),
@@ -293,6 +386,18 @@ func Parse(env map[string]string) (Config, error) {
 			BatchSize:    p.intVal("OUTBOX_BATCH_SIZE", 100),
 			PollInterval: p.dur("OUTBOX_POLL_INTERVAL", time.Second),
 			MaxConns:     p.intVal("OUTBOX_MAX_CONNS", 2),
+		},
+
+		NATS: NATSConfig{
+			URL:              p.str("NATS_URL", ""),
+			Stream:           p.str("NATS_STREAM", "EVENTS"),
+			SubjectPrefix:    p.str("NATS_SUBJECT_PREFIX", "events"),
+			DLQSubjectPrefix: p.str("NATS_DLQ_SUBJECT_PREFIX", "dlq"),
+			DuplicateWindow:  p.dur("NATS_DUPLICATE_WINDOW", 2*time.Minute),
+			StreamMaxAge:     p.dur("NATS_STREAM_MAX_AGE", 168*time.Hour),
+			Consumer:         p.str("NATS_CONSUMER", "order-projection"),
+			MaxDeliver:       p.intVal("NATS_MAX_DELIVER", 5),
+			AckWait:          p.dur("NATS_ACK_WAIT", 30*time.Second),
 		},
 
 		Telemetry: TelemetryConfig{
@@ -351,9 +456,19 @@ func (c Config) Validate() error {
 	// runs with no identity provider. Shipping it to production would be a total
 	// authentication bypass, so it is refused before any listener opens rather than
 	// left to a code review.
-	if c.AppEnv == EnvProduction && c.AuthMode == AuthDev {
+	//
+	// Scoped to RoleServer. cmd/worker opens no listener and verifies no tokens, so there is
+	// no unauthenticated traffic for this to prevent -- and applying it there stopped the
+	// worker booting in production at all. See the Role type for how that was found.
+	if c.Role == RoleServer && c.AppEnv == EnvProduction && c.AuthMode == AuthDev {
 		errs = append(errs, errors.New(
 			"AUTH_MODE=dev is refused when APP_ENV=production: the dev verifier accepts any token"))
+	}
+
+	// The worker's own hard requirement, checked here rather than in main so it joins every
+	// other misconfiguration in a single startup error instead of arriving on its own.
+	if c.Role == RoleWorker && c.Postgres.DSN.Reveal() == "" {
+		errs = append(errs, errors.New("POSTGRES_DSN is required: the outbox lives in the database"))
 	}
 
 	if c.StoreDriver == StorePostgres && c.Postgres.DSN.Reveal() == "" {
@@ -416,6 +531,11 @@ func (c Config) Validate() error {
 		errs = append(errs, fmt.Errorf("OUTBOX_MAX_CONNS must be positive, got %d", c.Outbox.MaxConns))
 	}
 
+	// Only validated when a broker is actually configured. NATS_URL empty means cmd/worker
+	// uses outbox.LogPublisher, and a clone with no broker should not have to supply coherent
+	// stream settings for a stream it never creates.
+	errs = append(errs, c.validateNATS()...)
+
 	if c.Postgres.MaxOpenConns <= 0 {
 		errs = append(errs, errors.New("POSTGRES_MAX_OPEN_CONNS must be positive and explicit"))
 	}
@@ -435,6 +555,94 @@ func (c Config) Validate() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// validateNATS checks the broker settings, including two cross-field constraints that are
+// invisible when each value is read on its own.
+//
+// The subject checks here cover OPERATOR-supplied settings, which are fixed for the life of
+// the process and so belong in a startup failure. internal/platform/events validates the
+// event type separately, because that comes from DATA and can only be judged per message.
+// The two are not duplicates of each other; they fail at different times, for different
+// reasons, and only one of them can refuse to boot.
+func (c Config) validateNATS() []error {
+	if c.NATS.URL == "" {
+		return nil
+	}
+
+	var errs []error
+
+	for _, f := range []struct{ name, value string }{
+		{"NATS_STREAM", c.NATS.Stream},
+		{"NATS_SUBJECT_PREFIX", c.NATS.SubjectPrefix},
+		{"NATS_DLQ_SUBJECT_PREFIX", c.NATS.DLQSubjectPrefix},
+		{"NATS_CONSUMER", c.NATS.Consumer},
+	} {
+		if strings.TrimSpace(f.value) == "" {
+			errs = append(errs, fmt.Errorf("%s must not be empty when NATS_URL is set", f.name))
+			continue
+		}
+		// Wildcards and whitespace in a name or prefix are not a style problem. A prefix of
+		// "*" makes every publish land on a subject that a single-token filter matches, and
+		// whitespace is rejected by the NATS client at publish time -- as a per-message
+		// error, forever, on a setting that could have failed here at startup instead.
+		if strings.ContainsAny(f.value, "*> \t\r\n") {
+			errs = append(errs, fmt.Errorf("%s %q must not contain a wildcard (* or >) or whitespace",
+				f.name, f.value))
+		}
+	}
+
+	// THE DEAD-LETTER LOOP.
+	//
+	// The consumer filters {NATS_SUBJECT_PREFIX}.>, and dead-letters to
+	// {NATS_DLQ_SUBJECT_PREFIX}.{original subject}. If the DLQ prefix sits inside the
+	// consumer's own filter, every dead letter is redelivered to the consumer that just gave
+	// up on it, dead-lettered again, and the stream fills with an exponentially growing chain
+	// of failures at the speed of the network.
+	//
+	// Nothing about either value looks wrong in isolation, which is why this is checked here
+	// rather than left to be discovered under load.
+	if prefixed(c.NATS.DLQSubjectPrefix, c.NATS.SubjectPrefix) {
+		errs = append(errs, fmt.Errorf(
+			"NATS_DLQ_SUBJECT_PREFIX %q is inside NATS_SUBJECT_PREFIX %q: the consumer would "+
+				"redeliver its own dead letters forever", c.NATS.DLQSubjectPrefix, c.NATS.SubjectPrefix))
+	}
+
+	if c.NATS.DuplicateWindow <= 0 {
+		errs = append(errs, fmt.Errorf("NATS_DUPLICATE_WINDOW must be positive, got %s", c.NATS.DuplicateWindow))
+	} else if c.NATS.DuplicateWindow <= c.Outbox.PollInterval {
+		// The window has to outlive the relay's retry gap.
+		//
+		// A batch whose marking transaction fails is republished on the NEXT drain -- one
+		// poll interval later. If JetStream has already forgotten the message id by then, the
+		// republish is stored as a second message and every consumer sees the event twice.
+		// The defaults (2m vs 1s) are nowhere near this line; a fork tuning either value can
+		// cross it without touching the other.
+		errs = append(errs, fmt.Errorf(
+			"NATS_DUPLICATE_WINDOW (%s) must exceed OUTBOX_POLL_INTERVAL (%s): a republished "+
+				"batch arriving after the window is stored again instead of deduplicated",
+			c.NATS.DuplicateWindow, c.Outbox.PollInterval))
+	}
+
+	if c.NATS.StreamMaxAge <= 0 {
+		errs = append(errs, fmt.Errorf("NATS_STREAM_MAX_AGE must be positive, got %s", c.NATS.StreamMaxAge))
+	}
+	if c.NATS.MaxDeliver <= 0 {
+		errs = append(errs, fmt.Errorf("NATS_MAX_DELIVER must be positive, got %d", c.NATS.MaxDeliver))
+	}
+	if c.NATS.AckWait <= 0 {
+		errs = append(errs, fmt.Errorf("NATS_ACK_WAIT must be positive, got %s", c.NATS.AckWait))
+	}
+
+	return errs
+}
+
+// prefixed reports whether subject sits inside prefix's subject subtree.
+//
+// Token-aware on purpose: "eventsx" is NOT inside "events", but "events.dlq" is. A plain
+// strings.HasPrefix would get the first case wrong and reject a perfectly valid pair.
+func prefixed(subject, prefix string) bool {
+	return subject == prefix || strings.HasPrefix(subject, prefix+".")
 }
 
 // IsProduction reports whether this is a production deployment.

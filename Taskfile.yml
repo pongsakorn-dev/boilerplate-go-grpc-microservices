@@ -102,7 +102,7 @@ tasks:
       - docker build -f deploy/docker/Dockerfile --target worker -t gomicro/worker:dev .
 
   up:
-    desc: Start postgres and redis. Add --profile auth for Keycloak, obs for Grafana.
+    desc: Start postgres, redis and nats. Add --profile auth for Keycloak, obs for Grafana.
     dir: deploy/compose
     cmds:
       - docker compose up -d

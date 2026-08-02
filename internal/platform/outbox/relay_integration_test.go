@@ -10,6 +10,8 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -343,5 +345,150 @@ func TestRunDrainsABacklogAndStops(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Error("Run did not return after its context was cancelled; the worker would hang " +
 			"on shutdown and be SIGKILLed")
+	}
+}
+
+// permanentRecorder fails permanently on one row and records everything else.
+type permanentRecorder struct {
+	mu     sync.Mutex
+	seen   []int64
+	failOn int64
+}
+
+func (r *permanentRecorder) Publish(_ context.Context, m outbox.Message) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if m.ID == r.failOn {
+		// The shape of a real one: a payload above the NATS server's max_payload is
+		// rejected identically on every attempt, forever.
+		return outbox.Permanent(errors.New("nats: maximum payload exceeded"))
+	}
+	r.seen = append(r.seen, m.ID)
+	return nil
+}
+
+func (r *permanentRecorder) published() []int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]int64(nil), r.seen...)
+}
+
+// TestAPermanentFailureDoesNotStopTheOutbox is the head-of-line block, reproduced and fixed.
+//
+// The relay abandons a whole batch when a publish fails, which is right when the failure is
+// transient: a broker restart heals itself and the rows are reclaimed. It is a total outage
+// when the failure is NOT transient. One event whose payload exceeds the broker's max_payload
+// is rejected identically every time, so the relay reclaims it, fails, rolls back, and never
+// reaches a single row behind it -- the whole service's event stream stopped by one message,
+// with nothing in the logs but the same error repeating.
+//
+// Quarantine is the answer: set that row aside, keep going. Nothing is deleted, so the event
+// is recoverable once someone fixes the cause.
+func TestAPermanentFailureDoesNotStopTheOutbox(t *testing.T) {
+	db := newDB(t)
+	seed(t, db, 5)
+
+	// Row 2 of 5 can never be published, so rows 3-5 sit behind it.
+	rec := &permanentRecorder{failOn: 2}
+	relay := outbox.NewRelay(db, rec, discard())
+	ctx := context.Background()
+
+	// First drain hits the poison row and quarantines it. Row 1 was published before the
+	// failure but rolls back unmarked -- the deliberate whole-batch abandon.
+	if _, err := relay.DrainOnce(ctx); err == nil {
+		t.Fatal("DrainOnce reported success despite a permanent publish failure")
+	}
+
+	var (
+		failedAt sql.NullTime
+		reason   sql.NullString
+	)
+	if err := db.QueryRowContext(ctx,
+		`SELECT failed_at, failure_reason FROM outbox WHERE id = 2`).Scan(&failedAt, &reason); err != nil {
+		t.Fatalf("read row 2: %v", err)
+	}
+	if !failedAt.Valid {
+		t.Fatal("the unpublishable row was not quarantined, so every drain from now on " +
+			"reclaims it and nothing behind it is ever published")
+	}
+	if !strings.Contains(reason.String, "maximum payload exceeded") {
+		t.Errorf("failure_reason = %q, want the cause recorded so an operator can act on it",
+			reason.String)
+	}
+
+	// The second drain must now get PAST it.
+	published, err := relay.DrainOnce(ctx)
+	if err != nil {
+		t.Fatalf("the drain after quarantine still failed: %v", err)
+	}
+	if published != 4 {
+		t.Errorf("published %d rows after quarantine, want the other 4", published)
+	}
+
+	got := rec.published()
+	for _, want := range []int64{1, 3, 4, 5} {
+		if !slices.Contains(got, want) {
+			t.Errorf("row %d was never published; the poison row is still blocking it "+
+				"(published: %v)", want, got)
+		}
+	}
+	if slices.Contains(rec.published(), int64(2)) {
+		// It legitimately appears once, on the attempt that failed; it must not be retried.
+		var attempts int
+		for _, id := range got {
+			if id == 2 {
+				attempts++
+			}
+		}
+		t.Errorf("the quarantined row was published %d times after being set aside", attempts)
+	}
+
+	// NOTHING IS DISCARDED. The row is still there, still unpublished, waiting for an
+	// operator to clear failed_at and let it through.
+	var quarantined int
+	if err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM outbox WHERE failed_at IS NOT NULL AND published_at IS NULL`).Scan(&quarantined); err != nil {
+		t.Fatalf("count quarantined: %v", err)
+	}
+	if quarantined != 1 {
+		t.Errorf("%d rows are quarantined, want 1 -- the event must be recoverable, not deleted",
+			quarantined)
+	}
+}
+
+// TestClearingFailedAtReplaysAQuarantinedRow proves the documented recovery actually works.
+//
+// The comment on Relay.quarantine tells an operator to clear failed_at. A recovery procedure
+// nobody has run is a recovery procedure that does not work.
+func TestClearingFailedAtReplaysAQuarantinedRow(t *testing.T) {
+	db := newDB(t)
+	seed(t, db, 1)
+	ctx := context.Background()
+
+	poison := &permanentRecorder{failOn: 1}
+	if _, err := outbox.NewRelay(db, poison, discard()).DrainOnce(ctx); err == nil {
+		t.Fatal("expected the drain to fail")
+	}
+
+	// The relay now has nothing to do at all.
+	rec := &permanentRecorder{}
+	relay := outbox.NewRelay(db, rec, discard())
+	if n, err := relay.DrainOnce(ctx); err != nil || n != 0 {
+		t.Fatalf("DrainOnce over a fully quarantined outbox = (%d, %v), want (0, nil)", n, err)
+	}
+
+	// The documented fix, verbatim.
+	if _, err := db.ExecContext(ctx,
+		`UPDATE outbox SET failed_at = NULL, failure_reason = NULL WHERE id = 1`); err != nil {
+		t.Fatalf("clear the quarantine: %v", err)
+	}
+
+	if n, err := relay.DrainOnce(ctx); err != nil || n != 1 {
+		t.Fatalf("after clearing failed_at, DrainOnce = (%d, %v), want (1, nil).\n\n"+
+			"The recovery procedure in the quarantine comment does not work.", n, err)
+	}
+	if unpublishedCount(t, db) != 0 {
+		t.Error("the replayed row was not marked published")
 	}
 }

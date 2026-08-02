@@ -36,15 +36,15 @@ time than one that ships less.
 | Full interceptor chain | ✅ Done | recovery, metrics, logging, errmap, admission, auth, deadline, validation |
 | Observability: slog + Prometheus + OTel traces | ✅ Done | Trace-correlated logs, `/metrics`, private pprof, OTLP export |
 | Real auth (OIDC/JWKS) + default-deny policy | ✅ Done | Hostile-issuer suite, key rotation, revocation, default-deny policy the server refuses to boot without |
-| Keycloak realm example | ⚠️ Partial | Structurally tested, **never booted against a real Keycloak** — see [`deploy/keycloak/`](deploy/keycloak/) |
 | Postgres via GORM + goose migrations | ✅ Done | Same store contract as the in-memory driver, plus N+1, query-plan and rollback guards |
 | REST/JSON edge (grpc-gateway) | ✅ Done | Client mode over an in-process connection, so REST runs the **same** interceptors |
 | Distributed rate limiting (Redis) | ✅ Done | GCRA per tenant+method, **fails open**. Cache-aside deliberately cut |
 | Outbox + relay | ✅ Done | Written in the business transaction; drained by `cmd/worker`. **At-least-once** |
-| NATS JetStream + worker | ⬜ M8b | Deliberately **after** M10, so the deploy story exists first |
+| NATS JetStream publisher + consumer | ✅ Done | Synchronous acks, `Nats-Msg-Id` dedup, dead-letter subject, outbox quarantine |
+| Read-model projection + consumer dedup | ✅ Done | `processed_events` written in the **same transaction** as the effect |
 | Typed client + deadline budget | ⬜ M9 | Scope **reduced**: the second service was cut |
 | Dockerfile, compose, kustomize | ✅ Done | 11.7 MB distroless, no shell. Manifests asserted in the default tier |
-| Keycloak realm, actually booted | ✅ Done | Imported by a real Keycloak; a real token accepted end to end |
+| Keycloak realm example | ✅ Done | Imported by a real Keycloak; a real token accepted end to end — see [`deploy/keycloak/`](deploy/keycloak/) |
 | `cmd/rename`, ADRs, `DELETING.md` | ⬜ M11 | Scope **reduced**: `cmd/scaffold` was cut |
 
 > [!NOTE]
@@ -94,7 +94,7 @@ instead of an empty page.
 |---|---|---|
 | gRPC | `:50051` | The API. Reflection and `grpc.health.v1` are registered |
 | Admin | `127.0.0.1:9090` | `/healthz`, `/metrics`, `/debug/pprof`. **Bound privately on purpose** |
-| Gateway | — | REST/JSON arrives in M6, along with its `GATEWAY_ADDR` setting |
+| Gateway | `:8080` | REST/JSON, transcoded onto the same gRPC service. `GATEWAY_ADDR=""` disables it |
 
 Poke it (install [grpcurl](https://github.com/fullstorydev/grpcurl) first — reflection means
 you need no `.proto` file):
@@ -163,6 +163,7 @@ internal/
     ordermem/                 in-memory store — also backs STORE_DRIVER=memory
     orderpg/                  Postgres adapter. *gorm.DB never leaves here
     ordertest/                builders + the shared store contract
+    orderproj/                read model fed by the broker. Dedup + effect in ONE transaction
   grpcapi/                  THE proto boundary. convert / errmap / server / chain / policy
   gateway/                  REST edge. Transcodes onto the SAME gRPC service, client mode
   app/                      composition root: New, Run, Close, shutdown sequencer
@@ -175,6 +176,8 @@ internal/
     gormx/                    tenant guard, pool config, slog adapter, query counter
     migrations/               goose .sql via embed.FS
     outbox/                   the relay: FOR UPDATE SKIP LOCKED, batched, at-least-once
+    events/                   JetStream publisher + consumer, dead-letter, subject rules
+      eventstest/               embedded nats-server. No Docker, so it runs in the default tier
     ratelimit/                GCRA quota over Redis. Tested against miniredis, no Docker
     testdb/                   testcontainers harness (build tag `integration` only)
     observability/            slog+TraceHandler, Prometheus, OTel traces, admin mux
@@ -182,9 +185,9 @@ internal/
 
 deploy/
   docker/                   ONE multi-target Dockerfile -> three distroless images
-  compose/                  local stack. postgres+redis by default, more behind profiles
+  compose/                  local stack. postgres+redis+nats by default, more behind profiles
   keycloak/                 worked OIDC realm: audience mapper, two principal shapes
-  k8s/base/                 Deployment, Service, PDB, HPA
+  k8s/base/                 orderd + worker Deployments, Service, PDB, HPA
   k8s/overlays/dev/         the ONE overlay. Copying it beats guessing at yours
 
 test/                       ALL cross-cutting guards, incl. proto toolchain and Taskfile
@@ -541,11 +544,165 @@ and scaling up for latency multiplies the relay's database load for nothing. Dif
 bottlenecks, different replica counts — and a relay stuck on an unavailable broker shouldn't
 consume resources in the process serving customers.
 
-> [!NOTE]
-> The publisher is currently `outbox.LogPublisher`, a **placeholder** that logs instead of
-> sending. M8b replaces that one line with NATS JetStream. Everything else — claiming,
-> batching, the marking transaction, at-least-once semantics — is already the real thing and
-> none of it changes when the broker arrives.
+### Quarantine: one bad event must not stop the rest
+
+The whole-batch rollback above is right when every failure is transient — a broker restart
+heals itself. It is a **total outage** when a failure is not. A payload above the NATS
+server's `max_payload` (1 MiB by default) is rejected identically on every attempt, so without
+special handling the relay reclaims that row, fails, rolls back, and never reaches a single
+row behind it: the whole service's event stream stopped by one message, with nothing in the
+logs but the same error repeating.
+
+So `Publish` distinguishes **permanent** from transient failures, and a permanent one
+quarantines the row — `failed_at` set, reason recorded, skipped by the claim query. Nothing is
+deleted, so an operator who fixes the cause replays it:
+
+```bash
+psql -c "UPDATE outbox SET failed_at = NULL, failure_reason = NULL WHERE id = 42;"
+```
+
+`TestClearingFailedAtReplaysAQuarantinedRow` runs exactly that statement, because a recovery
+procedure nobody has executed is a recovery procedure that does not work.
+
+The default direction matters: **anything unmarked is transient.** Calling a transient failure
+permanent quarantines data that was fine; calling a permanent one transient only wastes
+retries until someone looks. Only one of those is recoverable.
+
+---
+
+## The broker: NATS JetStream
+
+`NATS_URL` turns the relay's placeholder publisher into a real one. Empty keeps
+`outbox.LogPublisher`, which prints exactly what *would* be sent — so a fresh clone exercises
+claiming, batching, the marking transaction and at-least-once semantics with no broker
+installed anywhere.
+
+```bash
+docker compose -f deploy/compose/docker-compose.yml up -d
+```
+
+```bash
+NATS_URL=nats://localhost:4222 go run ./cmd/worker
+```
+
+### The tenant is not in the subject
+
+The obvious subject layout is `{prefix}.{tenant}.{event_type}`, so a consumer can filter one
+tenant with `events.acme.>`. It is what most examples show. It is a **tenant isolation
+failure**, and not a hypothetical one:
+
+| | |
+|---|---|
+| `tenant_id` | `acme.com` |
+| subject | `events.acme.com.order.created` |
+| a consumer filtering | `events.acme.>` |
+| result | **receives it** |
+
+A dot in a tenant id is not an attack — `acme.com` is an ordinary tenant id, and any identity
+provider issuing domain-shaped or email-shaped tenants produces one on the first customer.
+NATS subjects are dot-delimited with no escaping, so the tenant silently becomes two tokens
+inside a *different* tenant's subtree. `TestTheTenantIsNotInTheSubject` reproduces it against
+a real embedded server, then asserts the shipped publisher does not do it.
+
+Rejecting such tenants at publish time would be worse: the relay would fail forever on a row
+it can never publish, blocking every event behind it, for a customer whose only crime was
+having a domain name. So the subject carries only the event type, and the tenant travels as a
+header. Per-tenant filtering, if you need it, is a per-tenant **stream**.
+
+### What the broker adds, and what it does not
+
+| | |
+|---|---|
+| ✅ **Acked before marked** | `Publish` waits for JetStream to confirm it stored the message. The async API returns as soon as the bytes hit the socket — using it would let the relay mark a row published that the broker never kept |
+| ✅ **Relay duplicates collapse** | Every message carries `Nats-Msg-Id`; JetStream drops a repeat inside `NATS_DUPLICATE_WINDOW`. This is what makes the whole-batch rollback cheap |
+| ❌ **Duplicates not eliminated** | A republish *after* the window is a new message, and redelivery after a crash is not deduplicated at all |
+| ✅ **Effectively-once processing** | `processed_events` — the consumer's dedup row and its effect in one transaction. This is the boundary that actually holds |
+
+The deduplication id is namespaced by service (`orderd-42`, not `42`). Outbox ids are unique
+per *database* and every service's outbox starts at 1, so two services sharing a stream would
+both publish id `1` — and JetStream would silently drop the second as a duplicate. A lost
+event, no error anywhere, discovered eventually by a consumer that never received something
+the publisher believes it sent. `config.Validate` also refuses a `NATS_DUPLICATE_WINDOW`
+shorter than `OUTBOX_POLL_INTERVAL`, because a republished batch arriving after the window is
+stored twice.
+
+### JetStream has no dead-letter queue
+
+Once deliveries exceed `MaxDeliver` the server stops redelivering and emits an advisory on
+`$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES` that **nothing subscribes to** unless you build
+it. Out of the box the message is simply gone, and no log anywhere mentions it.
+
+So the consumer dead-letters explicitly, to `dlq.{original subject}`, with the reason and the
+attempt count in headers. A **poison** message — one marked permanent, such as a payload that
+will never parse — is dead-lettered on the *first* attempt rather than burning five retries to
+reach the same place; anything else is retried with backoff and dead-lettered on the last one.
+
+Three details that are each one line of code and one real failure:
+
+1. **The copy is published before the original is terminated.** Terminating first loses the
+   message whenever the copy fails — and a broker unhealthy enough to reject it is exactly
+   when messages are failing.
+2. **The copy gets a fresh `Nats-Msg-Id`.** Reusing the original's deduplicates the dead
+   letter against the live message still in the stream, so it is never stored and the message
+   vanishes exactly as it would have with no DLQ at all. Found by sabotage.
+3. **The consumer filters `events.>`**, so it never eats its own dead letters. Removing that
+   filter produced **1005 handler runs for one message in two seconds**; `config.Validate`
+   refuses a DLQ prefix nested inside the consumer's filter for the same reason.
+
+### The consumer: dedup and effect in one transaction
+
+`cmd/worker` runs the relay and a consumer concurrently and independently — a consumer stuck
+on a slow projection must not stop the relay draining, or a downstream problem becomes an
+upstream one.
+
+The consumer maintains a read model (`order_counts`), which is the canonical thing an outbox
+feeds and the case where duplicate delivery is *visible*: apply `OrderCreated` twice and the
+count is wrong, and stays wrong tomorrow. Every handler does this:
+
+```sql
+BEGIN;
+  INSERT INTO processed_events (consumer, message_id) VALUES ($1, $2)
+    ON CONFLICT (consumer, message_id) DO NOTHING;
+  -- zero rows affected => already applied, so ack and skip
+  -- ... the business effect ...
+COMMIT;
+```
+
+Any arrangement where those are separate transactions has a window: record first and crash and
+the event is lost forever; apply first and crash and it is applied twice on redelivery.
+Nothing can tell afterwards which side of the window the crash fell on.
+
+`ON CONFLICT` is also what makes it safe with several workers. Two replicas handed the same
+message both reach that `INSERT`; the second blocks on the first's uncommitted row and then
+sees the conflict, instead of reading "not processed yet" and double-counting.
+`TestTwoWorkersHandedTheSameEventApplyItOnce` runs eight goroutines against real Postgres —
+replacing the atomic claim with a read-check-write fails it immediately.
+
+`processed_events` is keyed by **(consumer, message_id)**, not by message alone. Keying on the
+message would let whichever consumer ran first silently suppress the event for every other
+consumer of the same stream.
+
+### Booted, not asserted
+
+Two orders created through the REST edge against the compose stack:
+
+```
+outbox            2 rows written in the business transaction, both marked published
+stream EVENTS     2 messages, subjects [events.>  dlq.>], dup window 120s, file storage
+consumer          order-projection, filter events.>, ack_pending 0, redelivered 0
+order_counts      dev-tenant  ->  2
+processed_events  orderd-1, orderd-2
+```
+
+Then `UPDATE outbox SET published_at = NULL WHERE id = 1`, forcing the relay to republish:
+
+```
+worker log        "jetstream deduplicated a republished event" outbox_id=1
+stream EVENTS     still 2 messages
+order_counts      still 2
+```
+
+That is the interlock the whole design rests on, observed rather than described.
 
 ---
 
@@ -903,9 +1060,18 @@ misconfigured deploy into five rollout attempts.
 | `OUTBOX_BATCH_SIZE` | `100` | Bounds one claim — and therefore how long a transaction is held across broker I/O |
 | `OUTBOX_POLL_INTERVAL` | `1s` | Idle latency only. A full batch is followed immediately |
 | `OUTBOX_MAX_CONNS` | `2` | The relay's pool. Small so background work doesn't eat the connection budget |
+| `NATS_URL` | | The broker. **Empty keeps `outbox.LogPublisher`**, which prints what would be sent |
+| `NATS_STREAM` | `EVENTS` | Created or updated at startup, idempotently |
+| `NATS_SUBJECT_PREFIX` | `events` | Prepended to the event type. The tenant is **not** in the subject — see [The broker](#the-broker-nats-jetstream) |
+| `NATS_DLQ_SUBJECT_PREFIX` | `dlq` | Refused if it sits inside the consumer's filter: that loop is self-amplifying |
+| `NATS_DUPLICATE_WINDOW` | `2m` | How long `Nats-Msg-Id` is remembered. Must exceed `OUTBOX_POLL_INTERVAL` |
+| `NATS_STREAM_MAX_AGE` | `168h` | An unbounded stream is a disk that fills at 03:00 on a date nobody chose |
+| `NATS_CONSUMER` | `order-projection` | Durable name, and the key `processed_events` is namespaced by |
+| `NATS_MAX_DELIVER` | `5` | Attempts before the message is dead-lettered |
+| `NATS_ACK_WAIT` | `30s` | Must exceed the handler's worst case, or slow work looks like a duplicate |
 | `STORE_DRIVER` | `memory` | `memory` \| `postgres`. Postgres needs `POSTGRES_DSN` and a `migrate up` first |
 
-Settings for subsystems that do not exist yet (Redis, NATS, the gateway) are deliberately
+Settings for subsystems that do not exist yet are deliberately
 **absent** rather than present-and-ignored — a config field that reads as wired and is not is
 the same class of problem as a proto field that validates and is then dropped.
 
@@ -991,14 +1157,13 @@ is built.)
 
 **Done:** M0–M1 foundation · M2 toolchain guards · M3 interceptors + observability ·
 M5 auth · M4 Postgres · M6 REST edge · M7 rate limiting · M8a outbox relay ·
-M10 deploy · plus an evidence-backed cuts pass.
+M10 deploy · M8b JetStream + worker · plus an evidence-backed cuts pass.
 
 **Remaining, in order:**
 
 | | Milestone | What it delivers | Scope change |
 |---|---|---|---|
-| **next** | **M8b** JetStream | Publisher + consumer + DLQ, against the embedded nats-server | **split**, after M10 |
-| | **M9** Client | `internal/platform/client`: service config, deadline budget, trace/principal propagation | **reduced** — second service cut |
+| **next** | **M9** Client | `internal/platform/client`: service config, deadline budget, trace/principal propagation | **reduced** — second service cut |
 | | **M11** Forkability | `cmd/rename`, ADRs, `DELETING.md` | **reduced** — `cmd/scaffold` cut |
 
 Every "reduced" and "split" above came out of a review that asked what this template
@@ -1015,10 +1180,27 @@ rather than maintained.
 
 ### Known gaps
 
-- **No automated end-to-end tier yet.** The image, the compose stack, the Keycloak realm and
-  graceful shutdown were each verified by hand during M10 (see *Deployment*), but nothing
-  replays that sequence in CI. It is the last piece of M10 and is listed here rather than
-  quietly dropped.
+- **No automated end-to-end tier yet.** The image, the compose stack, the Keycloak realm,
+  graceful shutdown and the full outbox → JetStream → projection path were each verified by
+  hand (see *Deployment* and *The broker*), but nothing replays those sequences in CI. It is
+  the last piece of M10 and is listed here rather than quietly dropped.
+- **Nothing prunes `outbox` or `processed_events`.** Both grow forever. `processed_events`
+  only needs to outlive `NATS_STREAM_MAX_AGE` — a message the broker has dropped can never be
+  redelivered — so a periodic `DELETE ... WHERE processed_at < now() - interval '8 days'` is
+  safe for the shipped 7-day default. The outbox needs the same treatment for published rows.
+  Neither job is shipped, because the right schedule depends on volume nobody here knows.
+- **Quarantined outbox rows need an alert.** A row with `failed_at` set is skipped forever
+  until a human clears it, and nothing in the system will mention it again. The query is
+  `SELECT count(*) FROM outbox WHERE failed_at IS NOT NULL` — the alert is yours to wire.
+- **The worker has no probes.** It opens no listener, so there is nothing to probe without
+  adding one, and an HTTP server added purely to answer a liveness check reports that the HTTP
+  server is alive, which is not the question. What actually detects a wedged worker is the age
+  of the oldest unpublished outbox row. `deploy/k8s/base/worker.yaml` says so at the point
+  where the probes would go.
+- **The trace does not survive the broker.** The relay reads rows from the database, long
+  after the request that produced them finished, so events carry no `traceparent`. Propagating
+  it means storing the trace context in the outbox row at write time — a real change to the
+  domain's event shape, not a header the relay can invent.
 - **Streams have no admission control.** They are bounded only by
   `grpc.MaxConcurrentStreams`; a long-lived watch holding a concurrency slot sized for the
   database pool would be worse than not limiting it. A fork adding streaming work that
