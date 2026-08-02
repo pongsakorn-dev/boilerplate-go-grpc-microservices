@@ -305,6 +305,7 @@ merely to pass today:
 | `TestAdmissionReleasesSlotOnPanic` | A panicking handler permanently consuming a slot |
 | `TestCommentsDoNotCiteMissingTests` | A comment claiming a proof that does not exist |
 | `TestVendoredProtosKeepTheirLicenseHeaders` | Apache-2.0 attribution being stripped from vendored protos |
+| `TestRootLicenseNamesItsCopyrightHolder` | The root LICENSE losing its copyright holder to a rename substitution |
 | `TestTaskTargetsReferenceRealPaths` | A task target pointing at a file that does not exist |
 | `TestBannedToolsAreNotToolDependencies` | A build tool entering the production module graph |
 | `TestErrorsAreMappedBeforeLoggingObservesThem` | Interceptor order regressing to `codes.Unknown` |
