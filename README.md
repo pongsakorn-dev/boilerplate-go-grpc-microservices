@@ -39,7 +39,7 @@ time than one that ships less.
 | Keycloak realm example | ⚠️ Partial | Structurally tested, **never booted against a real Keycloak** — see [`deploy/keycloak/`](deploy/keycloak/) |
 | Postgres via GORM + goose migrations | ✅ Done | Same store contract as the in-memory driver, plus N+1, query-plan and rollback guards |
 | REST/JSON edge (grpc-gateway) | ✅ Done | Client mode over an in-process connection, so REST runs the **same** interceptors |
-| Distributed rate limiting (Redis) | ⬜ M7 | Scope **reduced**: cache-aside was cut |
+| Distributed rate limiting (Redis) | ✅ Done | GCRA per tenant+method, **fails open**. Cache-aside deliberately cut |
 | Outbox + relay | ⬜ M8a | The `EventPublisher` port exists and is tested |
 | NATS JetStream + worker | ⬜ M8b | Deliberately **after** M10, so the deploy story exists first |
 | Typed client + deadline budget | ⬜ M9 | Scope **reduced**: the second service was cut |
@@ -172,6 +172,7 @@ internal/
     interceptor/              recovery, logging, errmap, admission, auth, deadline, validate
     gormx/                    tenant guard, pool config, slog adapter, query counter
     migrations/               goose .sql via embed.FS
+    ratelimit/                GCRA quota over Redis. Tested against miniredis, no Docker
     testdb/                   testcontainers harness (build tag `integration` only)
     observability/            slog+TraceHandler, Prometheus, OTel traces, admin mux
   testutil/                 bufconn harness that boots the real server
@@ -329,6 +330,10 @@ merely to pass today:
 | `TestUnknownJSONFieldsAreRejected` | A client typo silently becoming an empty field |
 | `TestOpenAPIFieldNamesMatchWhatTheServerEmits` | A published schema that disagrees with the running service |
 | `TestReadmeDocumentsEveryPackage` | A package on disk and nowhere in these docs |
+| `TestRateLimitIsACTUALLYWIREDINTOTheChain` | A correct limiter that the server never calls |
+| `TestLimiterFailsOPENWhenRedisIsDown` | A dead quota store taking the whole service down |
+| `TestRejectionDoesNotExtendThePenalty` | A retrying client extending its own lockout indefinitely |
+| `TestKeysAreIndependent` | One noisy tenant throttling everybody |
 
 ### The pattern worth stealing: one contract, two implementations
 
@@ -365,6 +370,90 @@ implementation plan; the short version:
 | Time in tests | `testing/synctest` | No `Clock` interface — the stdlib made that abstraction unnecessary in Go 1.25 |
 | Assertions | stdlib + `go-cmp`/`protocmp` | One assertion idiom, not two. Adding testify later is purely additive |
 | Task runner | [Taskfile](Taskfile.yml) via `go tool` | No Makefile: Windows has no `make`. Task's shell has no `rm`/`sed`/`jq` either, so those live in `cmd/devtool` |
+
+---
+
+## Rate limiting
+
+`REDIS_ADDR` enables a per-tenant quota shared by every replica. Empty disables it, and the
+service runs unthrottled — a supported configuration for a single replica, or when limits are
+applied at the ingress.
+
+### It is not the admission limiter
+
+Two mechanisms, two positions in the chain, two jobs:
+
+| | Admission | Rate limit |
+|---|---|---|
+| Scope | **Local** to one process | **Distributed** across replicas |
+| Bounds | Concurrency, sized from the DB pool | Requests per tenant per method |
+| Position | **Before** auth | **After** auth |
+| Protects | The process from work it can't execute | A business policy — "this customer bought 600/min" |
+
+Admission runs first so a flood is shed *without paying for signature verification*. The rate
+limiter runs after auth because its key is the tenant, and the tenant comes from the verified
+token — before auth the only available key is client-controlled, which is not a quota but a
+suggestion.
+
+Shipping only the local one is the common mistake: a per-replica limit set at "100rps"
+silently becomes 100 × replicas, resets on every deploy, and changes meaning every time the
+HPA scales.
+
+### GCRA, not a token bucket
+
+A token bucket needs two values per key (tokens, last refill) read-modify-written atomically.
+[GCRA](internal/platform/ratelimit/gcra.go) needs **one**: the theoretical arrival time of the
+next permitted request. One value fits in a short Lua script with no cross-replica race — and
+it answers *"when may I retry?"* **exactly**, because the TAT is that answer.
+
+That precision matters. A limiter that can't say when to come back leaves clients retrying
+immediately, turning a throttle into a self-inflicted flood. Rejections carry `RetryInfo` on
+gRPC and a `Retry-After` header on REST.
+
+Two subtleties the tests pin down:
+
+- **Rejected requests write nothing.** If a rejection advanced the TAT, a client retrying in a
+  loop would push its own recovery further away with every attempt and could lock itself out
+  indefinitely.
+- **The script reads Redis's clock**, not the caller's, so replicas with skewed clocks still
+  agree on the window.
+
+### It fails OPEN — the opposite of auth
+
+| | On failure | Why |
+|---|---|---|
+| Auth | **Denies** | Protects *data*. Without it a request may read what it must not |
+| Rate limit | **Allows** | Protects *capacity*. Without it requests are merely unthrottled |
+
+An unreachable Redis rejecting every request on every replica would convert "quotas are
+briefly unenforced" into a total outage, making the quota store a hard dependency of serving
+at all. It's loud when it happens — a WARN per request, plus grpcprom's existing counters.
+
+Which makes the client timeouts load-bearing. go-redis defaults to a 5s dial, 3s read/write
+and 3 retries, so a dead Redis adds **seconds per request** before the interceptor can fail
+open — the availability protection becoming the outage. Measured across the five requests of
+`TestAnUnreachableRedisDoesNotBreakTheService`: **8.5s** on defaults, **4.2s** with one retry,
+**2.0s** with none. Settings are 200ms dial, 100ms read/write, no retries.
+
+### Why no cache-aside
+
+It was in the plan and was cut. A cache's correctness depends entirely on the invalidation
+rules of the data being cached, so a *generic* one teaches a pattern that is wrong for most
+domains — and it is easy to add later against the existing `order.Store` interface. Rate
+limiting has no such ambiguity: the semantics are the same everywhere.
+
+### Tested without Docker
+
+miniredis runs the real Lua script in-process **and lets the tests move its clock**, which
+matters because rate limiting is entirely about the passage of time — a limiter tested only at
+`t=0` has had half its behaviour checked.
+
+One trap worth knowing if you extend these tests: **miniredis has two independent clocks.**
+`FastForward` advances key expiry but *not* `TIME`; `SetTime` does the reverse. Driving only
+one produces a test that looks like it waits and doesn't — and it can pass for the wrong
+reason. `TestRejectionDoesNotExtendThePenalty` first went green not because capacity had
+recovered, but because `FastForward` had expired the key and handed the next request a fresh
+bucket.
 
 ---
 
@@ -632,6 +721,9 @@ misconfigured deploy into five rollout attempts.
 | `GRPC_ADDR` | `:50051` | |
 | `ADMIN_ADDR` | `127.0.0.1:9090` | Keep it private — it serves pprof |
 | `GATEWAY_ADDR` | `:8080` | HTTP+JSON edge. **Empty disables it** — a gRPC-only service should not expose HTTP it never uses |
+| `REDIS_ADDR` | | Rate limiting. **Empty disables it** and the service runs unthrottled |
+| `RATE_LIMIT_PER_MINUTE` | `600` | Sustained quota per tenant **per method** |
+| `RATE_LIMIT_BURST` | `100` | Instantaneous allowance. Without burst, two back-to-back requests are rejected at any sustained rate |
 | `STORE_DRIVER` | `memory` | `memory` \| `postgres`. Postgres needs `POSTGRES_DSN` and a `migrate up` first |
 
 Settings for subsystems that do not exist yet (Redis, NATS, the gateway) are deliberately
@@ -718,14 +810,13 @@ is built.)
 ## Roadmap
 
 **Done:** M0–M1 foundation · M2 toolchain guards · M3 interceptors + observability ·
-M5 auth · M4 Postgres · M6 REST edge · plus an evidence-backed cuts pass.
+M5 auth · M4 Postgres · M6 REST edge · M7 rate limiting · plus an evidence-backed cuts pass.
 
 **Remaining, in order:**
 
 | | Milestone | What it delivers | Scope change |
 |---|---|---|---|
-| **next** | **M7** Rate limiting | Redis GCRA per tenant+method, tested against miniredis | **reduced** — cache-aside cut |
-| | **M8a** Outbox | Table + relay (`FOR UPDATE SKIP LOCKED`) behind the existing `EventPublisher` port | **split** |
+| **next** | **M8a** Outbox | Relay (`FOR UPDATE SKIP LOCKED`) draining the table M4 already ships | **split** |
 | | **M10** Deploy | Dockerfile, compose, kustomize, e2e tier — and the first real boot of the Keycloak realm | — |
 | | **M8b** JetStream | Publisher + consumer + DLQ, against the embedded nats-server | **split**, moved after M10 |
 | | **M9** Client | `internal/platform/client`: service config, deadline budget, trace/principal propagation | **reduced** — second service cut |

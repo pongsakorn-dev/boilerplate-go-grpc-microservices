@@ -78,6 +78,8 @@ type Config struct {
 	AuthMode string
 	OIDC     OIDCConfig
 
+	Redis RedisConfig
+
 	Telemetry TelemetryConfig
 	Server    ServerConfig
 	Shutdown  ShutdownConfig
@@ -139,6 +141,34 @@ type OIDCConfig struct {
 	// keeps signing with its others -- so every token names a key already cached, and the
 	// revoked one stays trusted until the process restarts.
 	MaxKeyAge time.Duration
+}
+
+// RedisConfig configures the distributed rate limiter.
+//
+// Redis is used for QUOTAS ONLY. Cache-aside was deliberately cut from this template: a cache
+// is easy to add and hard to get right, its correctness depends entirely on the invalidation
+// rules of the data being cached, and shipping a generic one teaches a pattern that is wrong
+// for most domains. Rate limiting has no such ambiguity -- the semantics are the same
+// everywhere.
+type RedisConfig struct {
+	// Addr is host:port. EMPTY DISABLES rate limiting entirely, and that is a supported
+	// configuration: a single-replica service, or one whose quotas are enforced at the
+	// ingress, should not be forced to run Redis. app.New substitutes ratelimit.AllowAll,
+	// which says so in the type rather than by being nil.
+	Addr string
+
+	Password Secret
+	DB       int
+
+	// RateLimitPerMinute is the sustained per-tenant, per-method request quota.
+	RateLimitPerMinute int
+
+	// RateLimitBurst is how many requests may arrive instantaneously.
+	//
+	// Without burst, two requests back to back are rejected even at a generous sustained
+	// rate, because GCRA spaces them exactly Period/Limit apart. Real clients are bursty; a
+	// limiter that ignores that rejects legitimate traffic and gets configured away.
+	RateLimitBurst int
 }
 
 type ServerConfig struct {
@@ -217,6 +247,14 @@ func Parse(env map[string]string) (Config, error) {
 			TenantClaim: p.str("OIDC_TENANT_CLAIM", "tenant_id"),
 			ScopeClaim:  p.str("OIDC_SCOPE_CLAIM", "scope"),
 			MaxKeyAge:   p.dur("OIDC_MAX_KEY_AGE", 15*time.Minute),
+		},
+
+		Redis: RedisConfig{
+			Addr:               p.str("REDIS_ADDR", ""),
+			Password:           Secret(p.str("REDIS_PASSWORD", "")),
+			DB:                 p.intVal("REDIS_DB", 0),
+			RateLimitPerMinute: p.intVal("RATE_LIMIT_PER_MINUTE", 600),
+			RateLimitBurst:     p.intVal("RATE_LIMIT_BURST", 100),
 		},
 
 		Telemetry: TelemetryConfig{
@@ -314,6 +352,22 @@ func (c Config) Validate() error {
 			errs = append(errs, errors.New(
 				"OIDC_TENANT_CLAIM must not be empty: the tenant comes from the verified token, "+
 					"never from the request body"))
+		}
+	}
+
+	// Only validated when Redis is actually configured. A service running without it should
+	// not have to supply coherent quota numbers for a limiter it never builds.
+	if c.Redis.Addr != "" {
+		if c.Redis.RateLimitPerMinute <= 0 {
+			errs = append(errs, fmt.Errorf("RATE_LIMIT_PER_MINUTE must be positive when REDIS_ADDR is set, got %d",
+				c.Redis.RateLimitPerMinute))
+		}
+		if c.Redis.RateLimitBurst <= 0 {
+			// Burst zero admits NOTHING: the GCRA tolerance becomes zero, so even the first
+			// request from an idle key arrives before its own theoretical arrival time. A
+			// limiter that rejects 100% of traffic is worth refusing at startup.
+			errs = append(errs, fmt.Errorf("RATE_LIMIT_BURST must be positive when REDIS_ADDR is set, got %d",
+				c.Redis.RateLimitBurst))
 		}
 	}
 

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"buf.build/go/protovalidate"
+	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
@@ -35,6 +36,7 @@ import (
 	"github.com/example/gomicro/internal/platform/config"
 	"github.com/example/gomicro/internal/platform/gormx"
 	"github.com/example/gomicro/internal/platform/observability"
+	"github.com/example/gomicro/internal/platform/ratelimit"
 )
 
 // App is a fully wired service, not yet listening.
@@ -121,6 +123,12 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 		return nil, err
 	}
 
+	limiter, err := a.buildLimiter()
+	if err != nil {
+		_ = a.closeOpened(ctx)
+		return nil, fmt.Errorf("rate limiter: %w", err)
+	}
+
 	orderSvc := order.NewService(store, atomic)
 
 	a.health = health.NewServer()
@@ -133,6 +141,7 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 		Validator:    validator,
 		Verifier:     verifier,
 		Policy:       grpcapi.DefaultPolicy(),
+		Limiter:      limiter,
 	})
 	if err != nil {
 		_ = a.closeOpened(ctx)
@@ -241,6 +250,79 @@ func (a *App) GatewayHandler() http.Handler {
 		return nil
 	}
 	return a.gatewaySrv.Handler
+}
+
+// buildLimiter selects the rate limiter.
+//
+// No REDIS_ADDR means ratelimit.AllowAll -- a NAMED type, not a nil the interceptor checks
+// for. "Quotas are not enforced here" is a legitimate deployment (single replica, or limits
+// applied at the ingress) and it should be visible in the wiring rather than inferred from
+// the absence of a value.
+func (a *App) buildLimiter() (ratelimit.Limiter, error) {
+	if a.cfg.Redis.Addr == "" {
+		a.log.Info("rate limiting disabled",
+			slog.String("hint", "set REDIS_ADDR to enforce per-tenant quotas across replicas"))
+		return ratelimit.AllowAll{}, nil
+	}
+
+	client := redis.NewClient(&redis.Options{
+		Addr:     a.cfg.Redis.Addr,
+		Password: a.cfg.Redis.Password.Reveal(),
+		DB:       a.cfg.Redis.DB,
+
+		// AGGRESSIVE TIMEOUTS, because this sits on the request path and is allowed to fail.
+		//
+		// go-redis defaults to a 5s dial, 3s read/write and 3 retries with backoff. Against a
+		// dead Redis that is seconds of added latency PER REQUEST before the interceptor gets
+		// to fail open -- so the fail-open decision, which exists to protect availability,
+		// becomes the outage itself. Measured on the defaults: the end-to-end
+		// unreachable-Redis test spent 8.5s on five requests.
+		//
+		// A limiter that cannot answer in a few hundred milliseconds has already failed at its
+		// job, which is to be cheap. Giving up fast and allowing the request beats making
+		// every caller wait to be told there is no limit.
+		DialTimeout:  200 * time.Millisecond,
+		ReadTimeout:  100 * time.Millisecond,
+		WriteTimeout: 100 * time.Millisecond,
+
+		// NO retries (-1 disables them in go-redis; 0 would mean the default of 3).
+		//
+		// Retrying against a struggling Redis adds load to the thing already struggling, for
+		// an answer the service is prepared to do without. Measured across the five requests
+		// of the unreachable-Redis test: 8.5s on library defaults, 4.2s with one retry, 2.0s
+		// with none -- roughly 400ms per request rather than 1.7s. That difference is latency
+		// every caller pays for as long as Redis is down.
+		MaxRetries: -1,
+	})
+
+	// NOT pinged here, deliberately.
+	//
+	// A limiter that fails open at request time (see interceptor/ratelimit.go) must not fail
+	// CLOSED at startup: refusing to boot because Redis is briefly unreachable would make the
+	// quota store a hard dependency of starting at all, which is exactly the coupling the
+	// fail-open decision exists to avoid. A dead Redis surfaces as a warning per request.
+	limiter, err := ratelimit.NewRedis(client, ratelimit.Config{
+		Limit:  a.cfg.Redis.RateLimitPerMinute,
+		Period: time.Minute,
+		Burst:  a.cfg.Redis.RateLimitBurst,
+	})
+	if err != nil {
+		_ = client.Close()
+		return nil, err
+	}
+
+	a.steps = append(a.steps, Step{
+		Name:    "redis-client",
+		Timeout: 5 * time.Second,
+		Fn:      func(context.Context) error { return client.Close() },
+	})
+
+	a.log.Info("rate limiting enabled",
+		slog.String("redis", a.cfg.Redis.Addr),
+		slog.Int("per_minute", a.cfg.Redis.RateLimitPerMinute),
+		slog.Int("burst", a.cfg.Redis.RateLimitBurst))
+
+	return limiter, nil
 }
 
 // Metrics exposes the registry so tests can scrape it without a listener.
