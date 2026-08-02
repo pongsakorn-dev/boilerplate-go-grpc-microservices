@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -131,4 +132,40 @@ func serve(t *testing.T, application *app.App) *grpc.ClientConn {
 	})
 
 	return conn
+}
+
+// NewTestGateway starts the REST edge over the PRODUCTION wiring and returns its base URL.
+//
+// It builds the whole app -- real interceptor chain, real gateway mux, real in-process gRPC
+// connection -- and serves the resulting handler with httptest. No port for the gRPC side is
+// bound: app.New already stands the gateway's bufconn listener up, so the transcoder is live
+// the moment New returns.
+//
+// The point of driving the real app rather than assembling a mux here is the same as
+// NewTestServer's: a harness that wires its own gateway tests a gateway that does not exist.
+func NewTestGateway(t *testing.T, mutate ...func(*config.Config)) (*httptest.Server, *app.App) {
+	t.Helper()
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	application, err := app.New(context.Background(), TestConfig(mutate...), log)
+	if err != nil {
+		t.Fatalf("app.New: %v", err)
+	}
+	application.MarkServing()
+
+	handler := application.GatewayHandler()
+	if handler == nil {
+		t.Fatal("the app has no gateway handler; GATEWAY_ADDR must be set for this harness")
+	}
+
+	srv := httptest.NewServer(handler)
+	t.Cleanup(func() {
+		srv.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = application.Close(ctx)
+	})
+
+	return srv, application
 }

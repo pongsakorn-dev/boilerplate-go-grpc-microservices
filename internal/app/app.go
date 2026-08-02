@@ -21,9 +21,12 @@ import (
 
 	"buf.build/go/protovalidate"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/test/bufconn"
 
+	"github.com/example/gomicro/internal/gateway"
 	"github.com/example/gomicro/internal/grpcapi"
 	"github.com/example/gomicro/internal/order"
 	"github.com/example/gomicro/internal/order/ordermem"
@@ -43,6 +46,16 @@ type App struct {
 	health     *health.Server
 	adminSrv   *http.Server
 	metrics    *observability.Metrics
+
+	// The REST edge, and the in-process plumbing that keeps it honest.
+	//
+	// gatewayLis is a bufconn: the gateway dials the gRPC server THROUGH IT rather than over
+	// loopback TCP. Same interceptors, same server, no network hop, no self-connection
+	// showing up in connection metrics, and nothing to misconfigure -- there is no address
+	// for the gateway to point at the wrong thing.
+	gatewayLis  *bufconn.Listener
+	gatewayConn *grpc.ClientConn
+	gatewaySrv  *http.Server
 
 	// steps are torn down in reverse order by Shutdown.
 	steps []Step
@@ -128,7 +141,106 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 
 	a.adminSrv = a.buildAdminServer()
 
+	if err := a.buildGateway(ctx); err != nil {
+		_ = a.closeOpened(ctx)
+		return nil, fmt.Errorf("gateway: %w", err)
+	}
+
 	return a, nil
+}
+
+// buildGateway wires the REST edge onto the gRPC server through an in-process connection.
+//
+// GATEWAY_ADDR empty means no REST surface at all, and nothing here runs.
+func (a *App) buildGateway(ctx context.Context) error {
+	if a.cfg.GatewayAddr == "" {
+		a.log.Info("REST gateway disabled", slog.String("hint", "set GATEWAY_ADDR to enable it"))
+		return nil
+	}
+
+	// A second listener for the SAME grpc.Server. grpc.Server.Serve may be called on any
+	// number of listeners concurrently, so this costs one goroutine and no duplicated wiring:
+	// the gateway reaches the identical server, with the identical chain.
+	a.gatewayLis = bufconn.Listen(gatewayBufSize)
+
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		// ErrServerStopped on shutdown is expected and not worth logging.
+		if err := a.grpcServer.Serve(a.gatewayLis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+			a.log.Error("in-process gRPC listener stopped", slog.String("error", err.Error()))
+		}
+	}()
+
+	// "passthrough:///" is mandatory. grpc.NewClient runs the target through the DNS
+	// resolver by default, so a bare name becomes a lookup that fails on a machine with a
+	// wildcard resolver and hangs on one without.
+	conn, err := grpc.NewClient("passthrough:///gateway",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return a.gatewayLis.DialContext(ctx)
+		}),
+		// insecure is CORRECT here and nowhere else: this connection never leaves the
+		// process, so there is no transport to secure. TLS on a bufconn would be ceremony
+		// with a real CPU cost on every request.
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		return fmt.Errorf("dial in-process: %w", err)
+	}
+	a.gatewayConn = conn
+
+	mux, err := gateway.NewMux(ctx, conn)
+	if err != nil {
+		return fmt.Errorf("build mux: %w", err)
+	}
+
+	a.gatewaySrv = &http.Server{
+		Addr:    a.cfg.GatewayAddr,
+		Handler: gateway.Handler(mux),
+
+		// Timeouts are set explicitly because net/http's defaults are all zero, meaning no
+		// timeout at all: a client that opens a connection and never sends a byte holds it
+		// forever, and enough of them exhaust the file descriptor limit. This is the HTTP
+		// equivalent of the keepalive enforcement on the gRPC side.
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		// No WriteTimeout: WatchOrders is a server-streaming RPC transcoded to a long-lived
+		// HTTP response, and a write deadline would cut it off mid-stream. The request
+		// deadline interceptor bounds unary work instead.
+		IdleTimeout: 120 * time.Second,
+	}
+
+	a.steps = append(a.steps,
+		Step{
+			Name:    "gateway-conn",
+			Timeout: 5 * time.Second,
+			Fn:      func(context.Context) error { return conn.Close() },
+		},
+		Step{
+			Name:    "gateway-listener",
+			Timeout: 5 * time.Second,
+			Fn: func(context.Context) error {
+				err := a.gatewayLis.Close()
+				<-served
+				return err
+			},
+		},
+	)
+
+	return nil
+}
+
+// gatewayBufSize is the in-process connection buffer. Large enough that a 4 MiB message --
+// the configured gRPC maximum -- never blocks on the buffer itself.
+const gatewayBufSize = 8 << 20
+
+// GatewayHandler exposes the REST mux so tests can drive it with httptest, without binding a
+// port. Nil when GATEWAY_ADDR is empty.
+func (a *App) GatewayHandler() http.Handler {
+	if a.gatewaySrv == nil {
+		return nil
+	}
+	return a.gatewaySrv.Handler
 }
 
 // Metrics exposes the registry so tests can scrape it without a listener.
@@ -242,7 +354,7 @@ func (a *App) Run(ctx context.Context) error {
 	// with no `service` field checks.
 	a.health.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 
 	go func() {
 		a.log.Info("gRPC listening", slog.String("addr", grpcLn.Addr().String()))
@@ -257,6 +369,15 @@ func (a *App) Run(ctx context.Context) error {
 			errCh <- fmt.Errorf("admin serve: %w", err)
 		}
 	}()
+
+	if a.gatewaySrv != nil {
+		go func() {
+			a.log.Info("REST gateway listening", slog.String("addr", a.gatewaySrv.Addr))
+			if err := a.gatewaySrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- fmt.Errorf("gateway serve: %w", err)
+			}
+		}()
+	}
 
 	select {
 	case err := <-errCh:
@@ -293,6 +414,21 @@ func (a *App) Close(ctx context.Context) error {
 	// server, and so on). Shutdown iterates backwards, so they release in the reverse of
 	// the order they were acquired -- the server stops before the pool it depends on.
 	steps := append([]Step(nil), a.steps...)
+
+	// The GATEWAY stops before the gRPC server it depends on.
+	//
+	// Reversed, an in-flight HTTP request would find its in-process connection closed
+	// underneath it and return a 500 for a request that was about to succeed -- during every
+	// deploy. This is the same "drain outside-in" reasoning as the health flip above, applied
+	// one layer down.
+	if a.gatewaySrv != nil {
+		steps = append(steps, Step{
+			Name:    "gateway-server",
+			Timeout: 5 * time.Second,
+			Fn:      func(ctx context.Context) error { return a.gatewaySrv.Shutdown(ctx) },
+		})
+	}
+
 	steps = append(steps,
 		Step{
 			Name:    "admin-server",

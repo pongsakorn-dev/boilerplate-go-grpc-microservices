@@ -80,6 +80,43 @@ var kindInfo = map[Kind]struct {
 	KindInternal:           {codes.Internal, http.StatusInternalServerError, "INTERNAL"},
 }
 
+// HTTPStatusFromCode maps a gRPC code to an HTTP status using THE SAME TABLE.
+//
+// The REST edge needs this direction: by the time an error reaches the gateway it is a gRPC
+// status, and the Kind that produced it is gone. Deriving the answer from kindInfo rather
+// than writing a second switch is what keeps the two surfaces honest -- grpc-gateway ships
+// its own runtime.HTTPStatusFromCode, and using it would mean this service's REST status
+// codes were decided by a dependency's table while its gRPC codes came from ours. They agree
+// today; nothing would tell us when they stopped.
+//
+// Several Kinds share a code (KindUnknown and KindInternal are both Internal), which is fine:
+// they also share an HTTP status, and mapping_test.go asserts that no code maps to two
+// different statuses.
+func HTTPStatusFromCode(code codes.Code) int {
+	for _, info := range kindInfo {
+		if info.Code == code {
+			return info.Status
+		}
+	}
+	// codes.OK and codes.Canceled/DeadlineExceeded have no Kind. 500 is the safe default:
+	// an unmapped code means an error path nobody classified.
+	switch code {
+	case codes.OK:
+		return http.StatusOK
+	case codes.Canceled:
+		// 499, nginx's "client closed request". Not in net/http, and worth distinguishing
+		// from a server fault: a cancelled request is the CALLER hanging up, and counting it
+		// as a 5xx makes your own error-rate alert fire every time someone closes a tab.
+		return 499
+	case codes.DeadlineExceeded:
+		return http.StatusGatewayTimeout
+	case codes.Unimplemented:
+		return http.StatusNotImplemented
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
 // AllKinds is every Kind, so tests can iterate exhaustively rather than listing by hand
 // and quietly missing the one added last week.
 func AllKinds() []Kind {

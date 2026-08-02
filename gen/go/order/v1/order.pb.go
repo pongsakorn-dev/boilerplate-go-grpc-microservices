@@ -215,8 +215,13 @@ func (x *OrderItem) GetUnitPrice() *Money {
 type Order struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	OrderId string                 `protobuf:"bytes,1,opt,name=order_id,json=orderId,proto3" json:"order_id,omitempty"`
-	// Set from the verified token, never from the request body. An inbound tenant_id is
-	// rejected by the auth interceptor -- see auth/tenant_isolation_test.go.
+	// Populated by the server from the caller identity. This is an OUTPUT field.
+	//
+	// No request message carries a tenant_id, so there is nothing for a client to override.
+	// The isolation comes from the field being absent on the request side, not from a
+	// rejection rule. Cross-tenant invisibility is asserted by
+	// internal/order/ordertest/contract.go, in "an order in another tenant is
+	// indistinguishable from missing".
 	TenantId      string                 `protobuf:"bytes,2,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
 	CustomerId    string                 `protobuf:"bytes,3,opt,name=customer_id,json=customerId,proto3" json:"customer_id,omitempty"`
 	Status        OrderStatus            `protobuf:"varint,4,opt,name=status,proto3,enum=order.v1.OrderStatus" json:"status,omitempty"`

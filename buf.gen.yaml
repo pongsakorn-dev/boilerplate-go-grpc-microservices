@@ -36,6 +36,20 @@ plugins:
     out: gen/go
     opt: paths=source_relative
 
+  # The OpenAPI document describing the REST edge.
+  #
+  # json_names_for_fields=false is NOT optional. The plugin defaults to true, which documents
+  # lowerCamelCase field names -- but internal/gateway sets protojson's UseProtoNames, so the
+  # server actually emits snake_case. Left at the default this generates a schema that
+  # disagrees with the running service on the name of every multi-word field, and every client
+  # generated from it would be wrong on first contact.
+  - local: [go, tool, protoc-gen-openapiv2]
+    out: gen/openapiv2
+    opt:
+      - allow_merge=true
+      - merge_file_name=orderd
+      - json_names_for_fields=false
+
 # Only our own protos are generated. third_party is on the include path for imports
 # and nothing more.
 inputs:

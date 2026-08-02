@@ -53,14 +53,21 @@ type Config struct {
 	ServiceName string
 	Version     string
 
-	// Two listeners today; M6 adds the gateway.
+	// Three listeners.
 	//
-	// GRPCAddr is public. AdminAddr is NOT: it carries /metrics and
+	// GRPCAddr and GatewayAddr are public; AdminAddr is NOT. Admin carries /metrics and
 	// /debug/pprof, and net/http/pprof registers itself on http.DefaultServeMux in an
-	// init() function. Serving that on the ingress port hands anyone a heap dumper and a
+	// init() function. Serving that on an ingress port hands anyone a heap dumper and a
 	// CPU-profiler trigger. observability/admin_test.go asserts the split.
 	GRPCAddr  string
 	AdminAddr string
+
+	// GatewayAddr serves HTTP+JSON transcoded onto the same gRPC service.
+	//
+	// Empty DISABLES the REST edge entirely, and that is a supported configuration rather
+	// than an oversight: a service with only gRPC clients should not expose an HTTP surface
+	// it never uses. gateway_test.go asserts the disabled case really binds nothing.
+	GatewayAddr string
 
 	LogLevel  string
 	LogFormat string
@@ -184,8 +191,9 @@ func Parse(env map[string]string) (Config, error) {
 		ServiceName: p.str("SERVICE_NAME", "orderd"),
 		Version:     p.str("VERSION", "dev"),
 
-		GRPCAddr:  p.str("GRPC_ADDR", ":50051"),
-		AdminAddr: p.str("ADMIN_ADDR", "127.0.0.1:9090"),
+		GRPCAddr:    p.str("GRPC_ADDR", ":50051"),
+		AdminAddr:   p.str("ADMIN_ADDR", "127.0.0.1:9090"),
+		GatewayAddr: p.str("GATEWAY_ADDR", ":8080"),
 
 		LogLevel:  p.str("LOG_LEVEL", "info"),
 		LogFormat: p.str("LOG_FORMAT", "json"),
