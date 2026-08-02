@@ -69,6 +69,53 @@ func NewTestServer(t *testing.T, mutate ...func(*config.Config)) *grpc.ClientCon
 	return serve(t, application)
 }
 
+// NewTestServerDialer starts the production server and returns the dial options needed to
+// reach it, for a test that must build its OWN connection.
+//
+// NewTestServer hands back a finished *grpc.ClientConn, which is what almost every test wants
+// and is useless to a test whose subject IS the client -- internal/platform/client has to
+// apply its own interceptors, service config and credentials, so it needs the listener rather
+// than a connection to it.
+//
+// The "passthrough:///" prefix belongs on the target the caller passes to grpc.NewClient:
+// without it the target goes through the DNS resolver and the custom dialer below is never
+// consulted.
+func NewTestServerDialer(t *testing.T, mutate ...func(*config.Config)) []grpc.DialOption {
+	t.Helper()
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	application, err := app.New(context.Background(), TestConfig(mutate...), log)
+	if err != nil {
+		t.Fatalf("app.New: %v", err)
+	}
+
+	lis := bufconn.Listen(bufSize)
+	srv := application.GRPCServer()
+	application.MarkServing()
+
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		_ = srv.Serve(lis)
+	}()
+
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = application.Close(ctx)
+
+		<-served
+		_ = lis.Close()
+	})
+
+	return []grpc.DialOption{
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+	}
+}
+
 // NewTestServerWithLogs is NewTestServer with a caller-supplied logger, for tests that
 // assert on log records.
 func NewTestServerWithLogs(t *testing.T, log *slog.Logger, mutate ...func(*config.Config)) *grpc.ClientConn {
@@ -115,17 +162,23 @@ func serve(t *testing.T, application *app.App) *grpc.ClientConn {
 	t.Cleanup(func() {
 		_ = conn.Close()
 
-		stopped := make(chan struct{})
-		go func() {
-			srv.GracefulStop()
-			close(stopped)
-		}()
-		select {
-		case <-stopped:
-		case <-time.After(5 * time.Second):
-			// A test that leaves a stream open would otherwise hang the whole package.
-			srv.Stop()
-		}
+		// application.Close, NOT a hand-rolled GracefulStop.
+		//
+		// This used to stop only the gRPC server, which left everything else app.New had
+		// built still running -- and app.New builds a gateway whenever GATEWAY_ADDR is set,
+		// which TestConfig leaves at its default. The result was a *grpc.ClientConn and a
+		// second bufconn listener leaked by EVERY call to NewTestServer, measured at six
+		// goroutines per server with goleak. Nothing failed, because nothing was looking:
+		// the only package running goleak (internal/order/ordermem) never starts a server.
+		//
+		// Closing the app also means the harness exercises the PRODUCTION shutdown sequence
+		// -- health flip, drain, reverse-order steps -- rather than a simplified imitation of
+		// it. TestConfig sets SHUTDOWN_DRAIN_DELAY=0s, so that costs no wall-clock time, and
+		// Close already force-stops after the grace period, which is what the timeout here
+		// used to do by hand.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = application.Close(ctx)
 
 		<-served
 		_ = lis.Close()

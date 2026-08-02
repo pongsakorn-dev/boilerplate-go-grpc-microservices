@@ -247,3 +247,48 @@ func TestKindRedactionBoundary(t *testing.T) {
 		}
 	}
 }
+
+// TestNoCodeMapsToTwoStatuses makes an existing claim true.
+//
+// The comment above HTTPStatusFromCode said "mapping_test.go asserts that no code maps to two
+// different statuses". It did not. Nothing did -- found while building the client's reverse
+// mapping, which depends on exactly this property.
+//
+// It matters because HTTPStatusFromCode scans kindInfo, which is a Go MAP, and map iteration
+// order is randomised per run. Two Kinds sharing a gRPC code but disagreeing on the HTTP
+// status would make the same error return 404 or 409 depending on the run, and no test would
+// fail twice in the same way. Several Kinds do legitimately share a code -- KindUnknown and
+// KindInternal are both Internal -- so the invariant is not that codes are unique; it is that
+// they agree.
+func TestNoCodeMapsToTwoStatuses(t *testing.T) {
+	t.Parallel()
+
+	statusForCode := map[codes.Code]int{}
+	kindForCode := map[codes.Code]Kind{}
+
+	for _, kind := range AllKinds() {
+		code, status := kind.GRPCCode(), kind.HTTPStatus()
+
+		if seen, ok := statusForCode[code]; ok && seen != status {
+			t.Errorf("%s maps to HTTP %d via %v and HTTP %d via %v.\n\n"+
+				"HTTPStatusFromCode scans a map, so which one it returns depends on the "+
+				"iteration order -- the same error would answer differently between runs, and "+
+				"a test asserting either value would be flaky rather than wrong.",
+				code, seen, kindForCode[code], status, kind)
+			continue
+		}
+		statusForCode[code] = status
+		kindForCode[code] = kind
+	}
+
+	if len(statusForCode) == 0 {
+		t.Fatal("no kinds were examined, so this guard is vacuous")
+	}
+
+	// And the function agrees with the table it is derived from.
+	for code, want := range statusForCode {
+		if got := HTTPStatusFromCode(code); got != want {
+			t.Errorf("HTTPStatusFromCode(%s) = %d, want %d", code, got, want)
+		}
+	}
+}
