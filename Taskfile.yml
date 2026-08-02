@@ -89,6 +89,30 @@ tasks:
     cmds:
       - go run ./cmd/migrate status
 
+  verify:deploy:
+    desc: Build the kustomize overlays. Needs kubectl (which embeds kustomize v5).
+    cmds:
+      - kubectl kustomize deploy/k8s/overlays/dev
+
+  docker:build:
+    desc: Build all three images from the multi-target Dockerfile
+    cmds:
+      - docker build -f deploy/docker/Dockerfile --target orderd -t gomicro/orderd:dev .
+      - docker build -f deploy/docker/Dockerfile --target migrate -t gomicro/migrate:dev .
+      - docker build -f deploy/docker/Dockerfile --target worker -t gomicro/worker:dev .
+
+  up:
+    desc: Start postgres and redis. Add --profile auth for Keycloak, obs for Grafana.
+    dir: deploy/compose
+    cmds:
+      - docker compose up -d
+
+  down:
+    desc: Stop the local stack and remove its volumes
+    dir: deploy/compose
+    cmds:
+      - docker compose --profile auth --profile obs --profile app down -v
+
   verify:codegen:
     desc: Assert the committed generated code still matches the protos
     cmds:

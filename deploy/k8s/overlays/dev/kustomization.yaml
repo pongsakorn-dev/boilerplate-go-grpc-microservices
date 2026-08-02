@@ -1,0 +1,62 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: gomicro-dev
+namePrefix: dev-
+
+resources:
+  - ../../base
+
+# ONE overlay ships, not three.
+#
+# base + dev/staging/prod is the reflex, and staging/prod would be empty scaffolding here: a
+# template cannot know your namespaces, your registry, your secret manager or your ingress.
+# Copying dev/ is a two-minute job that produces something true; shipping two directories of
+# guesses produces something that looks authoritative and is not.
+
+images:
+  - name: gomicro/orderd
+    newTag: dev
+
+replicas:
+  - name: orderd
+    count: 1
+
+patches:
+  # Dev runs a single replica, so a PDB requiring one available blocks every node drain --
+  # kubectl drain waits forever for a budget that can never be satisfied. Removing it is
+  # correct here and wrong in production, which is exactly the kind of thing an overlay is for.
+  - target:
+      kind: PodDisruptionBudget
+      name: orderd
+    patch: |
+      $patch: delete
+      apiVersion: policy/v1
+      kind: PodDisruptionBudget
+      metadata:
+        name: orderd
+
+  # Same reasoning for the HPA: it would immediately scale past the single replica above.
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: orderd
+    patch: |
+      $patch: delete
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata:
+        name: orderd
+
+  - target:
+      kind: Deployment
+      name: orderd
+    patch: |
+      - op: replace
+        path: /spec/template/spec/containers/0/env/0/value
+        value: development
+      # APP_ENV=development means config.Validate permits AUTH_MODE=dev, so a local cluster
+      # needs no identity provider. The base sets production + oidc; this is the deliberate,
+      # visible relaxation rather than a default that quietly differs.
+      - op: replace
+        path: /spec/template/spec/containers/0/env/5/value
+        value: dev

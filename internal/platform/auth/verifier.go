@@ -58,14 +58,15 @@ func NewVerifier(cfg config.Config, log *slog.Logger) (Verifier, error) {
 
 	case config.AuthOIDC:
 		return NewOIDCVerifier(OIDCOptions{
-			IssuerURL:   cfg.OIDC.IssuerURL,
-			Audience:    cfg.OIDC.Audience,
-			JWKSURL:     cfg.OIDC.JWKSURL,
-			Leeway:      cfg.OIDC.Leeway,
-			TenantClaim: cfg.OIDC.TenantClaim,
-			ScopeClaim:  cfg.OIDC.ScopeClaim,
-			MaxKeyAge:   cfg.OIDC.MaxKeyAge,
-			Log:         log,
+			IssuerURL:    cfg.OIDC.IssuerURL,
+			Audience:     cfg.OIDC.Audience,
+			JWKSURL:      cfg.OIDC.JWKSURL,
+			Leeway:       cfg.OIDC.Leeway,
+			TenantClaim:  cfg.OIDC.TenantClaim,
+			ScopeClaim:   cfg.OIDC.ScopeClaim,
+			ServiceClaim: cfg.OIDC.ServiceClaim,
+			MaxKeyAge:    cfg.OIDC.MaxKeyAge,
+			Log:          log,
 		})
 
 	default:

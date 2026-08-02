@@ -135,6 +135,11 @@ type OIDCConfig struct {
 	TenantClaim string
 	ScopeClaim  string
 
+	// ServiceClaim marks a machine caller, for providers that do not follow RFC 9068's
+	// sub==client_id convention -- which real Keycloak service accounts do not. See
+	// auth/claims.go for the token that proved it.
+	ServiceClaim string
+
 	// MaxKeyAge bounds how long a cached JWKS is served before revalidation.
 	//
 	// This is what makes key REVOCATION take effect. Refetching only when a key id is
@@ -266,13 +271,14 @@ func Parse(env map[string]string) (Config, error) {
 		},
 
 		OIDC: OIDCConfig{
-			IssuerURL:   p.str("OIDC_ISSUER_URL", ""),
-			Audience:    p.str("OIDC_AUDIENCE", ""),
-			JWKSURL:     p.str("OIDC_JWKS_URL", ""),
-			Leeway:      p.dur("OIDC_LEEWAY", 30*time.Second),
-			TenantClaim: p.str("OIDC_TENANT_CLAIM", "tenant_id"),
-			ScopeClaim:  p.str("OIDC_SCOPE_CLAIM", "scope"),
-			MaxKeyAge:   p.dur("OIDC_MAX_KEY_AGE", 15*time.Minute),
+			IssuerURL:    p.str("OIDC_ISSUER_URL", ""),
+			Audience:     p.str("OIDC_AUDIENCE", ""),
+			JWKSURL:      p.str("OIDC_JWKS_URL", ""),
+			Leeway:       p.dur("OIDC_LEEWAY", 30*time.Second),
+			TenantClaim:  p.str("OIDC_TENANT_CLAIM", "tenant_id"),
+			ScopeClaim:   p.str("OIDC_SCOPE_CLAIM", "scope"),
+			ServiceClaim: p.str("OIDC_SERVICE_CLAIM", "token_use"),
+			MaxKeyAge:    p.dur("OIDC_MAX_KEY_AGE", 15*time.Minute),
 		},
 
 		Redis: RedisConfig{

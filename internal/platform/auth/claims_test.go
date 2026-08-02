@@ -184,47 +184,101 @@ func TestMissingScopesAreNotAnAuthenticationFailure(t *testing.T) {
 	}
 }
 
-// TestServiceTokensAreDistinguishedFromUsers checks the RFC 9068 §5 rule that populates
-// Principal.IsService: in the client credentials grant there is no resource owner, so the
-// subject IS the client.
+// TestServiceTokensAreDistinguishedFromUsers pins IsService against BOTH token shapes,
+// including the real one that broke the original implementation.
 //
-// It matters because IsService gates service-only paths. It is a spec-grounded heuristic
-// rather than a guarantee, which is exactly why it is pinned by a test -- a provider that
-// does not follow RFC 9068 changes one function, and this test is what tells you.
+// The first version relied only on RFC 9068 §5 -- in the client credentials grant there is no
+// resource owner, so sub IS the client. That is the portable rule and it is what an
+// in-process issuer built to the spec produces, so the test passed.
+//
+// Then M10 booted the shipped Keycloak realm and fetched an actual client-credentials token:
+//
+//	{"aud":"orderd","azp":"orders-worker","sub":"d57c98ae-746a-450a-ac53-b442bd5780b8",
+//	 "scope":"orders:read orders:write","tenant_id":"acme","typ":"Bearer", ...}
+//
+// No client_id claim at all, and sub is the service account USER's uuid. RFC 9068's rule
+// returns false, so every machine caller was classified as an end user -- a latent bug no
+// in-process test could ever have found, because the fake was built to the spec the real
+// provider does not follow.
 func TestServiceTokensAreDistinguishedFromUsers(t *testing.T) {
 	t.Parallel()
 
 	iss := testjwks.New(t)
-	v := newVerifier(t, iss)
+	v := newVerifier(t, iss, func(o *auth.OIDCOptions) { o.ServiceClaim = "token_use" })
 
-	t.Run("client credentials token", func(t *testing.T) {
-		claims := iss.DefaultClaims()
-		claims["sub"] = "orders-worker"
-		claims["client_id"] = "orders-worker"
+	cases := []struct {
+		name    string
+		claims  func(jwt.MapClaims)
+		service bool
+	}{
+		{
+			// RFC 9068's shape, for providers that follow it. Costs no configuration.
+			name: "RFC 9068: sub equals client_id",
+			claims: func(c jwt.MapClaims) {
+				c["sub"] = "orders-worker"
+				c["client_id"] = "orders-worker"
+			},
+			service: true,
+		},
+		{
+			// THE REAL KEYCLOAK SHAPE, copied from a token this repo actually fetched.
+			name: "Keycloak service account: opaque sub, azp, explicit token_use",
+			claims: func(c jwt.MapClaims) {
+				c["sub"] = "d57c98ae-746a-450a-ac53-b442bd5780b8"
+				c["azp"] = "orders-worker"
+				c["token_use"] = "service"
+			},
+			service: true,
+		},
+		{
+			// The same Keycloak shape WITHOUT the mapper -- what the realm produced before
+			// M10 added it. Correctly not a service, and the reason the realm now sets it.
+			name: "Keycloak service account with no mapper is not detectable",
+			claims: func(c jwt.MapClaims) {
+				c["sub"] = "d57c98ae-746a-450a-ac53-b442bd5780b8"
+				c["azp"] = "orders-worker"
+			},
+			service: false,
+		},
+		{
+			// An end user authenticating THROUGH a client still carries azp. That must not
+			// make them a service, or every browser login gains machine rights.
+			name: "end user with azp is not a service",
+			claims: func(c jwt.MapClaims) {
+				c["sub"] = "user-123"
+				c["azp"] = "orders-web"
+			},
+			service: false,
+		},
+		{
+			// A claim that exists but says something else must not promote anyone.
+			name: "token_use with another value is not a service",
+			claims: func(c jwt.MapClaims) {
+				c["sub"] = "user-123"
+				c["token_use"] = "access"
+			},
+			service: false,
+		},
+	}
 
-		p, err := v.Verify(context.Background(), iss.Sign(claims))
-		if err != nil {
-			t.Fatalf("verify: %v", err)
-		}
-		if !p.IsService {
-			t.Error("a token whose sub equals its client_id was not recognised as a service")
-		}
-	})
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	t.Run("end user token", func(t *testing.T) {
-		claims := iss.DefaultClaims()
-		claims["sub"] = "user-123"
-		// An end-user token from Keycloak still carries azp naming the client the user
-		// logged in through. That must NOT make the user a service.
-		claims["azp"] = "web-frontend"
+			claims := iss.DefaultClaims()
+			delete(claims, "azp")
+			delete(claims, "client_id")
+			tc.claims(claims)
 
-		p, err := v.Verify(context.Background(), iss.Sign(claims))
-		if err != nil {
-			t.Fatalf("verify: %v", err)
-		}
-		if p.IsService {
-			t.Error("an end user authenticating through a client was misread as a service; " +
-				"azp naming a client is normal for user tokens and must not grant service rights")
-		}
-	})
+			p, err := v.Verify(context.Background(), iss.Sign(claims))
+			if err != nil {
+				t.Fatalf("verify: %v", err)
+			}
+			if p.IsService != tc.service {
+				t.Errorf("IsService = %v, want %v.\n\n"+
+					"IsService gates service-only paths; getting it wrong either denies machines "+
+					"or hands end users machine rights.", p.IsService, tc.service)
+			}
+		})
+	}
 }

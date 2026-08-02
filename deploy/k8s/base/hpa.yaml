@@ -1,0 +1,27 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: orderd
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: orderd
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          # Against the REQUEST, not the limit -- and the container has no CPU limit, which is
+          # deliberate (see deployment.yaml). 70% leaves headroom for the scale-up to finish
+          # before saturation.
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      # Slow down, fast up. Scaling down eagerly after a traffic dip means scaling back up
+      # into the next one, and each cycle drops connections that MaxConnectionAge would
+      # otherwise have rebalanced gracefully.
+      stabilizationWindowSeconds: 300

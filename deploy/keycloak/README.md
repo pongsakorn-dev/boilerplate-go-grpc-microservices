@@ -4,17 +4,17 @@
 from. It is a **development** realm — passwords are `alice`/`bob`, the client secret is
 literally `dev-only-not-a-real-secret`, and `sslRequired` is off.
 
-> [!IMPORTANT]
-> **This file has not been booted against a real Keycloak.** Docker was unavailable on the
-> machine where it was written, so what is verified is its *structure*
-> (`test/keycloak_test.go`: the audience mapper exists and targets the right client, both
-> token-issuing clients set `tenant_id`, and the client scopes match the ones
-> `internal/grpcapi/policy.go` requires). Nobody has yet watched Keycloak import it and mint
-> a token this service accepted. That end-to-end run is M10 work and is listed as
-> outstanding in the README status table.
+> [!NOTE]
+> **Verified.** This realm has been imported by a real Keycloak 26.4 and a token from it
+> accepted by the service. Measured end to end during M10:
 >
-> Nothing else in this repo carries a caveat like this, and it should not stay. If you boot
-> it and it works, delete this box. If it does not, the fix belongs here.
+> - `Realm 'gomicro' imported` — no errors
+> - client-credentials token claims: `"aud":"orderd"`, `"tenant_id":"acme"`,
+>   `"scope":"orders:read orders:write"`, `"token_use":"service"`
+> - `orderd` with `AUTH_MODE=oidc`: **401** without a token, **200** with one, and the created
+>   order carried `tenant_id: acme` straight from the claim
+>
+> Booting it also found a real bug — see *The two principal shapes* below.
 
 ## Why Keycloak, when the verifier is provider-agnostic
 

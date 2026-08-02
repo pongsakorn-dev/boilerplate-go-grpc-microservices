@@ -46,7 +46,10 @@
       "standardFlowEnabled": false,
       "directAccessGrantsEnabled": false,
       "serviceAccountsEnabled": true,
-      "defaultClientScopes": ["orders:read", "orders:write"],
+      "defaultClientScopes": [
+        "orders:read",
+        "orders:write"
+      ],
       "protocolMappers": [
         {
           "name": "audience-orderd",
@@ -69,6 +72,18 @@
             "access.token.claim": "true",
             "id.token.claim": "false"
           }
+        },
+        {
+          "name": "token-use-service",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "config": {
+            "claim.name": "token_use",
+            "claim.value": "service",
+            "jsonType.label": "String",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
         }
       ]
     },
@@ -80,13 +95,21 @@
       "publicClient": true,
       "standardFlowEnabled": true,
       "directAccessGrantsEnabled": true,
-      "redirectUris": ["http://localhost:*"],
-      "webOrigins": ["+"],
+      "redirectUris": [
+        "http://localhost:*"
+      ],
+      "webOrigins": [
+        "+"
+      ],
       "attributes": {
         "pkce.code.challenge.method": "S256"
       },
-      "defaultClientScopes": ["orders:read"],
-      "optionalClientScopes": ["orders:write"],
+      "defaultClientScopes": [
+        "orders:read"
+      ],
+      "optionalClientScopes": [
+        "orders:write"
+      ],
       "protocolMappers": [
         {
           "name": "audience-orderd",
@@ -123,7 +146,9 @@
       "firstName": "Alice",
       "lastName": "Acme",
       "attributes": {
-        "tenant_id": ["acme"]
+        "tenant_id": [
+          "acme"
+        ]
       },
       "credentials": [
         {
@@ -141,7 +166,9 @@
       "firstName": "Bob",
       "lastName": "Globex",
       "attributes": {
-        "tenant_id": ["globex"]
+        "tenant_id": [
+          "globex"
+        ]
       },
       "credentials": [
         {

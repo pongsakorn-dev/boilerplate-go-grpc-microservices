@@ -43,7 +43,8 @@ time than one that ships less.
 | Outbox + relay | ✅ Done | Written in the business transaction; drained by `cmd/worker`. **At-least-once** |
 | NATS JetStream + worker | ⬜ M8b | Deliberately **after** M10, so the deploy story exists first |
 | Typed client + deadline budget | ⬜ M9 | Scope **reduced**: the second service was cut |
-| Dockerfile, compose, kustomize, e2e | ⬜ M10 | Also where the Keycloak realm finally gets booted |
+| Dockerfile, compose, kustomize | ✅ Done | 11.7 MB distroless, no shell. Manifests asserted in the default tier |
+| Keycloak realm, actually booted | ✅ Done | Imported by a real Keycloak; a real token accepted end to end |
 | `cmd/rename`, ADRs, `DELETING.md` | ⬜ M11 | Scope **reduced**: `cmd/scaffold` was cut |
 
 > [!NOTE]
@@ -180,7 +181,11 @@ internal/
   testutil/                 bufconn harness that boots the real server
 
 deploy/
+  docker/                   ONE multi-target Dockerfile -> three distroless images
+  compose/                  local stack. postgres+redis by default, more behind profiles
   keycloak/                 worked OIDC realm: audience mapper, two principal shapes
+  k8s/base/                 Deployment, Service, PDB, HPA
+  k8s/overlays/dev/         the ONE overlay. Copying it beats guessing at yours
 
 test/                       ALL cross-cutting guards, incl. proto toolchain and Taskfile
 ```
@@ -338,6 +343,10 @@ merely to pass today:
 | `TestKeysAreIndependent` | One noisy tenant throttling everybody |
 | `TestConcurrentRelaysDoNotBlockOnEachOther` | A second relay that waits instead of helping |
 | `TestAFailedPublishAbandonsTheWholeBatch` | A half-marked batch losing events on broker failure |
+| `TestGracePeriodExceedsTheDrainSequence` | A manifest that SIGKILLs the pod mid-request on every deploy |
+| `TestAllThreeProbesAreNativeGRPC` | A probe checking a port that isn't the one serving traffic |
+| `TestResourcesAreDeclaredWithNoCPULimit` | A CPU limit causing CFS-throttled p99 latency |
+| `TestAdminPortIsNotInTheService` | pprof reachable by anything in the cluster |
 
 ### The pattern worth stealing: one contract, two implementations
 
@@ -374,6 +383,89 @@ implementation plan; the short version:
 | Time in tests | `testing/synctest` | No `Clock` interface — the stdlib made that abstraction unnecessary in Go 1.25 |
 | Assertions | stdlib + `go-cmp`/`protocmp` | One assertion idiom, not two. Adding testify later is purely additive |
 | Task runner | [Taskfile](Taskfile.yml) via `go tool` | No Makefile: Windows has no `make`. Task's shell has no `rm`/`sed`/`jq` either, so those live in `cmd/devtool` |
+
+---
+
+## Deployment
+
+```bash
+task up              # postgres + redis. Add --profile auth for Keycloak, obs for Grafana
+task docker:build    # all three images from one Dockerfile
+task verify:deploy   # build the kustomize overlays (needs kubectl)
+```
+
+### One Dockerfile, three targets
+
+`orderd`, `migrate` and `worker` share a build stage, so the Go version can't drift between
+them. Measured:
+
+| Image | Size |
+|---|---|
+| `orderd` | **11.7 MB** |
+| `worker` | 7.1 MB |
+| `migrate` | 4.3 MB |
+
+`distroless/static:nonroot` — no shell, no package manager, no libc. An attacker with
+arbitrary file write and no way to execute a shell is dramatically less dangerous than one
+with `/bin/sh`. Verified: `docker run --entrypoint /bin/sh` fails, and the image runs as
+`nonroot:nonroot`.
+
+Which is also why every `ENTRYPOINT` is **exec form**. Shell form wraps the process in
+`/bin/sh -c` — which doesn't exist here, and where it does, it makes the shell PID 1 so
+SIGTERM never reaches the Go process. The pod then sits out its whole grace period and gets
+SIGKILLed mid-request on every deploy.
+
+Verified rather than asserted: `docker stop` returned in **5.7s** — the drain delay plus
+shutdown — not the 30s timeout, with `shutdown signal received` and `health set to
+NOT_SERVING, draining` in the logs.
+
+### Compose starts two containers, not eight
+
+Postgres and Redis by default. Keycloak (`--profile auth`), Grafana/Tempo/Prometheus
+(`--profile obs`) and the app itself (`--profile app`) are opt-in. A compose file that starts
+eight services is one people stop using — the JVM alone costs more startup than the rest of
+the stack combined.
+
+The application is deliberately *not* in the default set: running it on the host against these
+containers iterates faster, and hot reload actually works, which it doesn't across a Windows
+bind mount because inotify events don't cross it.
+
+### Manifests are asserted in the default tier
+
+`deploy/k8s/manifest_test.go` runs in plain `go test ./...` — no cluster, no kubectl, no new
+dependencies. The assertion that matters most spans two files and no YAML linter can make it:
+
+> `terminationGracePeriodSeconds` (40s) must exceed `SHUTDOWN_DRAIN_DELAY` +
+> `SHUTDOWN_GRACE_PERIOD` (5s + 25s), read from the **Go defaults the binary compiles in**.
+
+Get it wrong and the kubelet SIGKILLs mid-request on every deploy, presenting as intermittent
+5xx during rollouts that nobody can reproduce afterwards. Two numbers, two files, no reference
+between them.
+
+Also asserted: all three probes are **native `grpc:`** (GA since 1.27 — no `grpc_health_probe`
+binary in a distroless image) and hit the RPC port rather than a port that could be healthy
+while the real one isn't; `readOnlyRootFilesystem`, `runAsNonRoot`, `drop: [ALL]`,
+`seccompProfile: RuntimeDefault`; and the admin port is **absent from the Service**, because
+exposing `/debug/pprof` cluster-wide hands a heap dumper to anything that can resolve the name.
+
+**No CPU limit, deliberately.** A CPU limit causes CFS throttling: a Go service that briefly
+exceeds its quota is stalled for the rest of each 100ms period, producing p99 latency with no
+visible CPU saturation. Requests schedule; CPU limits mostly just hurt. Memory keeps its limit
+because memory isn't compressible.
+
+> **Why `yaml.v3` and not krusty.** Building the overlays with `sigs.k8s.io/kustomize/api`
+> would also verify composition — but it adds 22 modules and, decisively, `kustomize/api`
+> requires `google.golang.org/protobuf`, so a *manifest linter* would join MVS for this
+> service's production protobuf runtime. That's the same argument this repo already used to
+> keep `buf` and `go-task` out of the tool directive. So: `yaml.v3` (already a dependency)
+> checks the content everywhere, and `task verify:deploy` checks composition with kubectl.
+
+### One overlay, not three
+
+`base` + `dev`. Staging and prod would be empty scaffolding: a template can't know your
+namespaces, registry, secret manager or ingress. Copying `dev/` is a two-minute job producing
+something true; shipping two directories of guesses produces something that looks
+authoritative and isn't.
 
 ---
 
@@ -822,6 +914,7 @@ the same class of problem as a proto field that validates and is then dropped.
 | `OIDC_AUDIENCE` | | Required for `oidc`. **Never defaulted** — an empty audience accepts every token the issuer ever minted, including other applications' |
 | `OIDC_TENANT_CLAIM` | `tenant_id` | Dotted paths walk nested claims (`realm_access.tenant`) |
 | `OIDC_SCOPE_CLAIM` | `scope` | Accepts the space-delimited string or a JSON array |
+| `OIDC_SERVICE_CLAIM` | `token_use` | Marks a machine caller. Needed because real Keycloak service tokens do **not** satisfy RFC 9068's `sub == client_id` |
 | `OIDC_LEEWAY` | `30s` | Clock skew tolerance on `exp`/`nbf` — not a grace period |
 | `OIDC_MAX_KEY_AGE` | `15m` | How long a cached JWKS is served before revalidation. This is what makes key **revocation** take effect |
 | `POSTGRES_MAX_OPEN_CONNS` | `10` | Explicit on purpose: pool defaults read the *node's* CPU count, not the cgroup limit, so 20 replicas exhaust `max_connections` |
@@ -898,14 +991,13 @@ is built.)
 
 **Done:** M0–M1 foundation · M2 toolchain guards · M3 interceptors + observability ·
 M5 auth · M4 Postgres · M6 REST edge · M7 rate limiting · M8a outbox relay ·
-plus an evidence-backed cuts pass.
+M10 deploy · plus an evidence-backed cuts pass.
 
 **Remaining, in order:**
 
 | | Milestone | What it delivers | Scope change |
 |---|---|---|---|
-| **next** | **M10** Deploy | Dockerfile, compose, kustomize, e2e tier — and the first real boot of the Keycloak realm | — |
-| | **M8b** JetStream | Publisher + consumer + DLQ, against the embedded nats-server | **split**, moved after M10 |
+| **next** | **M8b** JetStream | Publisher + consumer + DLQ, against the embedded nats-server | **split**, after M10 |
 | | **M9** Client | `internal/platform/client`: service config, deadline budget, trace/principal propagation | **reduced** — second service cut |
 | | **M11** Forkability | `cmd/rename`, ADRs, `DELETING.md` | **reduced** — `cmd/scaffold` cut |
 
@@ -923,8 +1015,10 @@ rather than maintained.
 
 ### Known gaps
 
-- **The Keycloak realm has never been imported by a running Keycloak** (Docker was
-  unavailable). Its structure is tested; its acceptance by Keycloak is not. M10.
+- **No automated end-to-end tier yet.** The image, the compose stack, the Keycloak realm and
+  graceful shutdown were each verified by hand during M10 (see *Deployment*), but nothing
+  replays that sequence in CI. It is the last piece of M10 and is listed here rather than
+  quietly dropped.
 - **Streams have no admission control.** They are bounded only by
   `grpc.MaxConcurrentStreams`; a long-lived watch holding a concurrency slot sized for the
   database pool would be worse than not limiting it. A fork adding streaming work that

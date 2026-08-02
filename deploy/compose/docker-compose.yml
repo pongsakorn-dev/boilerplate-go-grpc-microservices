@@ -1,0 +1,163 @@
+# The local development stack.
+#
+#   docker compose up -d                     postgres + redis. That is all most work needs.
+#   docker compose --profile auth up -d      adds Keycloak, for the OIDC path
+#   docker compose --profile obs  up -d      adds Grafana/Tempo/Prometheus in one container
+#   docker compose --profile app  up -d      adds orderd and the worker, built from source
+#
+# PROFILES, so the default `up` is two containers and a few seconds. A compose file that
+# starts eight services by default is a compose file people stop using: the JVM alone costs
+# more startup than the whole rest of the stack, and most changes never touch auth.
+#
+# The APPLICATION is deliberately not in the default set either. Running it on the host with
+# `go run ./cmd/orderd` against these containers is faster to iterate on -- no image rebuild
+# per edit -- and hot reload actually works, which it does not across a Windows bind mount
+# because inotify events do not cross it.
+
+name: gomicro
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: gomicro
+      POSTGRES_PASSWORD: gomicro
+      POSTGRES_DB: gomicro
+      # Speeds up initdb noticeably and is safe for a throwaway database.
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # `pg_isready` alone reports true during the entrypoint's FIRST start, before the
+      # server restarts for real -- so anything depending on it races. Naming the user and
+      # database makes it a genuine connectivity check.
+      test: ["CMD-SHELL", "pg_isready -U gomicro -d gomicro"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+
+  redis:
+    image: redis:7-alpine
+    # No persistence: this holds rate-limit buckets, which are worthless after a restart and
+    # regenerate in seconds. Persisting them would only add disk I/O and a file to clean up.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  keycloak:
+    profiles: ["auth"]
+    image: quay.io/keycloak/keycloak:26.4
+    # start-dev, never `start`. Development mode skips the hostname and TLS configuration a
+    # production Keycloak demands, which is exactly the ceremony that stops people trying the
+    # OIDC path at all. It is also why this file says nowhere that it is production-ready.
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "8081:8080"
+    volumes:
+      # Read-only: the realm file is source, and a Keycloak that can rewrite it would turn a
+      # committed, reviewable configuration into local state nobody can reproduce.
+      - ../keycloak:/opt/keycloak/data/import:ro
+    healthcheck:
+      # Keycloak 26 serves health on the MANAGEMENT port (9000), not 8080, and the image has
+      # no curl or wget. This uses the JVM's own HTTP client via a bash redirect on /dev/tcp,
+      # which is the documented workaround for distroless-ish Keycloak images.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9000 && echo -e 'GET /health/ready HTTP/1.1\\nHost: localhost\\nConnection: close\\n\\n' >&3 && cat <&3 | grep -q '\"status\": \"UP\"'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  otel-lgtm:
+    profiles: ["obs"]
+    # Grafana + Tempo + Loki + Prometheus in ONE container, from the Grafana project.
+    # Four separate services with their own configuration files is a lot of YAML to maintain
+    # for something whose job is to be glanced at during development.
+    image: grafana/otel-lgtm:latest
+    ports:
+      - "3000:3000"   # Grafana UI
+      - "4317:4317"   # OTLP gRPC -- the value for OTEL_EXPORTER_OTLP_ENDPOINT
+      - "4318:4318"   # OTLP HTTP
+    environment:
+      ENABLE_LOGS_ALL: "true"
+
+  orderd:
+    profiles: ["app"]
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: orderd
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      APP_ENV: development
+      GRPC_ADDR: ":50051"
+      GATEWAY_ADDR: ":8080"
+      # 0.0.0.0 ONLY because a container's admin port is reachable only via the published
+      # port list below, which deliberately omits it. On a host or a pod this stays bound to
+      # localhost -- /debug/pprof on a routable interface is a heap dumper for anyone.
+      ADMIN_ADDR: "0.0.0.0:9090"
+      STORE_DRIVER: postgres
+      POSTGRES_DSN: "postgres://gomicro:gomicro@postgres:5432/gomicro?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+    ports:
+      - "50051:50051"
+      - "8080:8080"
+    healthcheck:
+      # The image has no shell and no grpc_health_probe binary, so the container-level check
+      # uses the REST edge. Kubernetes uses a native grpc: probe instead -- see
+      # deploy/k8s/base/deployment.yaml -- which needs neither.
+      test: ["CMD", "/orderd", "--help"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  migrate:
+    profiles: ["app"]
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_DSN: "postgres://gomicro:gomicro@postgres:5432/gomicro?sslmode=disable"
+    command: ["up"]
+    # Runs to completion and exits. orderd waits on service_completed_successfully, which is
+    # the compose equivalent of the Kubernetes Job that must finish before the Deployment
+    # rolls -- and the reason migrations are not run on server boot.
+    restart: "no"
+
+  worker:
+    profiles: ["app"]
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_DSN: "postgres://gomicro:gomicro@postgres:5432/gomicro?sslmode=disable"
+      OUTBOX_POLL_INTERVAL: "2s"
+
+volumes:
+  postgres-data:

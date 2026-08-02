@@ -47,6 +47,10 @@ type OIDCOptions struct {
 	// e.g. "realm_access.tenant".
 	TenantClaim string
 
+	// ServiceClaim marks a machine caller. Empty means RFC 9068's sub==client_id rule only,
+	// which real Keycloak service accounts do NOT satisfy -- see auth/claims.go.
+	ServiceClaim string
+
 	// ScopeClaim is where granted scopes live. Accepts either the OAuth2 space-delimited
 	// string form or a JSON array; providers disagree and both are common.
 	ScopeClaim string

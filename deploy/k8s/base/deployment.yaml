@@ -1,0 +1,146 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orderd
+  labels:
+    app.kubernetes.io/name: orderd
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: orderd
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: orderd
+    spec:
+      # terminationGracePeriodSeconds MUST exceed SHUTDOWN_DRAIN_DELAY + SHUTDOWN_GRACE_PERIOD.
+      #
+      # The shutdown sequence is: flip health to NOT_SERVING, wait DrainDelay (5s) for
+      # Kubernetes to remove this pod from Service endpoints, then GracefulStop for up to
+      # GracePeriod (25s). Total 30s. If this number were lower, the kubelet would SIGKILL the
+      # process mid-request on every single deploy -- and the symptom is intermittent 5xx
+      # during rollouts that nobody can reproduce.
+      #
+      # 40 > 30 with headroom. deploy/k8s/manifest_test.go reads BOTH numbers -- this YAML and
+      # the defaults compiled into internal/platform/config -- and fails if the inequality
+      # ever stops holding. That is a cross-file constraint no YAML linter can check.
+      terminationGracePeriodSeconds: 40
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: orderd
+          image: gomicro/orderd
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: grpc
+              containerPort: 50051
+            - name: http
+              containerPort: 8080
+            - name: admin
+              containerPort: 9090
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+
+          # NATIVE grpc: PROBES, GA since Kubernetes 1.27.
+          #
+          # The alternative is baking grpc_health_probe into the image, which means the image
+          # is no longer distroless/static, has a second binary to keep patched, and grows a
+          # shell-shaped hole. The native probe dials the port and calls
+          # grpc.health.v1.Health/Check itself.
+          #
+          # All three probes hit the RPC port on purpose: that is the port that actually
+          # serves traffic, so a probe against anything else can report healthy while the
+          # thing customers use is broken.
+          startupProbe:
+            # Startup probe first, so the OTHER two get generous per-check timeouts without
+            # having to tolerate a slow boot. Without it, initialDelaySeconds has to cover the
+            # worst-case start, which delays detection of a genuinely dead pod for just as long.
+            grpc:
+              port: 50051
+            periodSeconds: 2
+            failureThreshold: 30
+
+          readinessProbe:
+            grpc:
+              port: 50051
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 2
+
+          livenessProbe:
+            grpc:
+              port: 50051
+            periodSeconds: 10
+            timeoutSeconds: 3
+            # Deliberately slack. A liveness probe that trips on a slow dependency restarts
+            # every replica at once during a database blip, converting a recoverable outage
+            # into a self-inflicted total one. Readiness is what gates traffic; liveness only
+            # catches a wedged process.
+            failureThreshold: 6
+
+          # REQUESTS AND LIMITS ARE BOTH SET, and cpu has no limit on purpose.
+          #
+          # A pod with no requests is scheduled anywhere and evicted first. A CPU LIMIT,
+          # though, causes CFS throttling: a Go service that briefly needs more than its quota
+          # is stalled for the rest of the 100ms period, which shows up as p99 latency nobody
+          # can explain. Memory has a limit because memory is not compressible -- exceeding it
+          # must OOM-kill rather than degrade the node.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+
+          env:
+            - name: APP_ENV
+              value: production
+            - name: GRPC_ADDR
+              value: ":50051"
+            - name: GATEWAY_ADDR
+              value: ":8080"
+            # Bound to the POD IP, not 0.0.0.0 and not localhost. /debug/pprof must be
+            # reachable by a scraper inside the cluster and by nothing outside it.
+            - name: ADMIN_ADDR
+              value: "$(POD_IP):9090"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: STORE_DRIVER
+              value: postgres
+            # AUTH_MODE is set EXPLICITLY rather than relying on the default.
+            #
+            # config.Validate refuses AUTH_MODE=dev when APP_ENV=production, so a mistake here
+            # fails the pod at startup rather than serving unauthenticated traffic. Naming it
+            # anyway means the manifest states the intent instead of inheriting it.
+            - name: AUTH_MODE
+              value: oidc
+
+          envFrom:
+            - secretRef:
+                name: orderd-secrets
+
+          # readOnlyRootFilesystem means anything that writes needs an explicit volume. The
+          # binary writes nothing, so this is only /tmp for the runtime's own use.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir: {}

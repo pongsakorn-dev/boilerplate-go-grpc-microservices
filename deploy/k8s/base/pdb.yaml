@@ -1,0 +1,13 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: orderd
+spec:
+  # minAvailable, not maxUnavailable.
+  #
+  # maxUnavailable: 1 permits going to zero when there is only one replica, which is exactly
+  # the case where a node drain causes an outage. minAvailable: 1 refuses that.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: orderd

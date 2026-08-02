@@ -182,7 +182,7 @@ func TestReadmeStatusTableHasNoStaleMilestones(t *testing.T) {
 	// M\d+[a-z]? -- the optional letter matters. A bare M\d+ matches "M8" inside BOTH "M8a"
 	// and "M8b", so finishing M8a would flag M8b as stale even though it is genuinely still
 	// pending. Found the first time a milestone was split in two.
-	milestone := regexp.MustCompile(`M\d+[a-z]?`)
+	milestone := regexp.MustCompile(`M\d+[a-z]?`) // for the Done line
 	done := map[string]bool{}
 	for _, m := range milestone.FindAllString(doneLine, -1) {
 		done[m] = true
@@ -191,15 +191,22 @@ func TestReadmeStatusTableHasNoStaleMilestones(t *testing.T) {
 		t.Fatal("the `**Done:**` line names no milestones, so this guard is vacuous")
 	}
 
+	// Only the token IMMEDIATELY AFTER the marker counts.
+	//
+	// Scanning the whole line was wrong twice. A row's NOTES legitimately mention other
+	// milestones -- "⬜ M8b | Deliberately after M10, so the deploy story exists first" -- and
+	// reading M10 out of that prose flagged a genuinely pending row as stale the moment M10
+	// shipped. The marker is the claim; the rest of the line is commentary.
+	marked := regexp.MustCompile(`⬜\s*(M\d+[a-z]?)`)
+
 	for _, line := range strings.Split(content, "\n") {
-		if !strings.Contains(line, "⬜") {
+		m := marked.FindStringSubmatch(line)
+		if m == nil {
 			continue
 		}
-		for _, m := range milestone.FindAllString(line, -1) {
-			if done[m] {
-				t.Errorf("%s is listed as done in the roadmap but still marked ⬜ here:\n  %s",
-					m, strings.TrimSpace(line))
-			}
+		if done[m[1]] {
+			t.Errorf("%s is listed as done in the roadmap but still marked ⬜ here:\n  %s",
+				m[1], strings.TrimSpace(line))
 		}
 	}
 }

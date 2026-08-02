@@ -51,27 +51,54 @@ func (v *OIDCVerifier) principalFrom(claims jwt.MapClaims) (Principal, error) {
 		Subject:   sub,
 		TenantID:  tenant,
 		Scopes:    scopesClaim(claims, v.opts.ScopeClaim),
-		IsService: isServiceToken(claims, sub),
+		IsService: isServiceToken(claims, sub, v.opts.ServiceClaim),
 	}, nil
 }
 
 // isServiceToken distinguishes a machine caller from an end user.
 //
-// The rule is RFC 9068 §5 (JWT Profile for OAuth 2.0 Access Tokens): in the client
-// credentials grant there is no resource owner, so the subject IS the client. A token whose
-// `sub` equals its `client_id` was therefore issued to a machine.
+// TWO RULES, because the standard one does not survive contact with a real provider.
 //
-// This is a heuristic grounded in a spec rather than a guarantee, and it matters because
-// Principal.IsService gates service-only paths. A fork whose provider does not follow RFC
-// 9068 -- or that prefers an explicit `token_use` style claim -- changes this one function.
-func isServiceToken(claims jwt.MapClaims, sub string) bool {
+// RFC 9068 §5 (JWT Profile for OAuth 2.0 Access Tokens) says that in the client credentials
+// grant there is no resource owner, so `sub` IS the client -- which makes `sub == client_id`
+// the portable test. That was the only rule here until the shipped Keycloak realm was
+// actually booted in M10, and a genuine client-credentials token turned out to carry:
+//
+//	{"aud":"orderd","azp":"orders-worker","sub":"d57c98ae-...","tenant_id":"acme", ...}
+//
+// No `client_id` claim at all, and `sub` is the service account USER's uuid rather than the
+// client id. RFC 9068's rule returns false, so every machine caller would have been
+// classified as an end user. Nothing in this repo reads IsService yet, so it was a latent
+// bug -- and one that no amount of in-process testing would ever have found, because the
+// in-process issuer was built to the spec the real provider does not follow.
+//
+// So the second rule is an EXPLICIT claim, configured like every other claim mapping in this
+// package. The shipped realm sets it with a hardcoded protocol mapper; a provider that does
+// follow RFC 9068 needs no configuration at all.
+func isServiceToken(claims jwt.MapClaims, sub, serviceClaim string) bool {
+	// Rule 1: RFC 9068. Free when the provider follows it.
 	for _, key := range []string{"client_id", "azp"} {
 		if id, ok := claims[key].(string); ok && id != "" && id == sub {
 			return true
 		}
 	}
-	return false
+
+	// Rule 2: an explicit claim, for providers that do not.
+	if serviceClaim == "" {
+		return false
+	}
+	val, err := stringClaim(claims, serviceClaim)
+	if err != nil {
+		return false
+	}
+	return val == ServiceTokenValue
 }
+
+// ServiceTokenValue is what OIDC_SERVICE_CLAIM must contain to mark a machine caller.
+//
+// A fixed value rather than "any non-empty value", so a claim that happens to exist for an
+// unrelated reason cannot silently promote every end user to a service.
+const ServiceTokenValue = "service"
 
 // stringClaim reads a string claim, following a dotted path into nested objects.
 func stringClaim(claims jwt.MapClaims, path string) (string, error) {
