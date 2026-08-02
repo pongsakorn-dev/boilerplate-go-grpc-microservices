@@ -78,7 +78,8 @@ type Config struct {
 	AuthMode string
 	OIDC     OIDCConfig
 
-	Redis RedisConfig
+	Redis  RedisConfig
+	Outbox OutboxConfig
 
 	Telemetry TelemetryConfig
 	Server    ServerConfig
@@ -171,6 +172,31 @@ type RedisConfig struct {
 	RateLimitBurst int
 }
 
+// OutboxConfig configures the relay in cmd/worker.
+//
+// Read by the WORKER, not the API server: the server writes outbox rows inside its business
+// transactions and never drains them. Keeping the settings here anyway means one config
+// package for the whole system, which is the rule that makes a misconfiguration a startup
+// error instead of a nil pointer.
+type OutboxConfig struct {
+	// BatchSize bounds one claim.
+	//
+	// The claim transaction stays open while every message in the batch is published, so
+	// this is directly how long a database transaction is held across network I/O. Large
+	// batches amortise round trips and bloat vacuum; small ones do the opposite.
+	BatchSize int
+
+	// PollInterval is the wait between drains that found nothing.
+	//
+	// A drain that filled its batch goes again IMMEDIATELY rather than waiting, so this
+	// bounds idle latency, not throughput: a backlog clears at full speed regardless.
+	PollInterval time.Duration
+
+	// MaxConns bounds the relay's database pool. Small on purpose -- background work should
+	// not compete with request-serving replicas for the database's connection budget.
+	MaxConns int
+}
+
 type ServerConfig struct {
 	// MaxConcurrentStreams must be set: grpc-go's default is effectively unbounded, so
 	// one client can open enough streams to exhaust memory.
@@ -255,6 +281,12 @@ func Parse(env map[string]string) (Config, error) {
 			DB:                 p.intVal("REDIS_DB", 0),
 			RateLimitPerMinute: p.intVal("RATE_LIMIT_PER_MINUTE", 600),
 			RateLimitBurst:     p.intVal("RATE_LIMIT_BURST", 100),
+		},
+
+		Outbox: OutboxConfig{
+			BatchSize:    p.intVal("OUTBOX_BATCH_SIZE", 100),
+			PollInterval: p.dur("OUTBOX_POLL_INTERVAL", time.Second),
+			MaxConns:     p.intVal("OUTBOX_MAX_CONNS", 2),
 		},
 
 		Telemetry: TelemetryConfig{
@@ -369,6 +401,13 @@ func (c Config) Validate() error {
 			errs = append(errs, fmt.Errorf("RATE_LIMIT_BURST must be positive when REDIS_ADDR is set, got %d",
 				c.Redis.RateLimitBurst))
 		}
+	}
+
+	if c.Outbox.BatchSize <= 0 {
+		errs = append(errs, fmt.Errorf("OUTBOX_BATCH_SIZE must be positive, got %d", c.Outbox.BatchSize))
+	}
+	if c.Outbox.MaxConns <= 0 {
+		errs = append(errs, fmt.Errorf("OUTBOX_MAX_CONNS must be positive, got %d", c.Outbox.MaxConns))
 	}
 
 	if c.Postgres.MaxOpenConns <= 0 {

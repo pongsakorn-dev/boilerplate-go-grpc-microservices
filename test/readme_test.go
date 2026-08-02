@@ -179,7 +179,10 @@ func TestReadmeStatusTableHasNoStaleMilestones(t *testing.T) {
 		t.Skip("the roadmap has no `**Done:**` line to compare against")
 	}
 
-	milestone := regexp.MustCompile(`M\d+`)
+	// M\d+[a-z]? -- the optional letter matters. A bare M\d+ matches "M8" inside BOTH "M8a"
+	// and "M8b", so finishing M8a would flag M8b as stale even though it is genuinely still
+	// pending. Found the first time a milestone was split in two.
+	milestone := regexp.MustCompile(`M\d+[a-z]?`)
 	done := map[string]bool{}
 	for _, m := range milestone.FindAllString(doneLine, -1) {
 		done[m] = true
