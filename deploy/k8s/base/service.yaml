@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: orderd
+  labels:
+    app.kubernetes.io/name: orderd
+spec:
+  selector:
+    app.kubernetes.io/name: orderd
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: grpc
+    - name: http
+      port: 8080
+      targetPort: http
+
+  # The ADMIN PORT IS DELIBERATELY ABSENT.
+  #
+  # It carries /metrics and /debug/pprof. Exposing it through a Service makes it reachable by
+  # anything that can resolve the name, which in a default cluster is everything -- a heap
+  # dumper and a CPU-profiler trigger for any pod that wanders past. Prometheus scrapes pod
+  # IPs directly, so it needs no Service entry.
