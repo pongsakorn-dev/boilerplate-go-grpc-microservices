@@ -16,8 +16,9 @@ import (
 //
 // The consequence of getting this wrong is invisible in every unary test: unary
 // interceptors take and return a context directly, so they work. Streams silently do not,
-// and a streaming handler calling auth.TenantFrom(ctx) simply finds nothing. M4 will add a
-// stream test asserting the principal IS visible inside a streaming handler.
+// and a streaming handler calling auth.TenantFrom(ctx) simply finds nothing.
+// grpcapi/auth_test.go::TestStreamingHandlersSeeThePrincipal asserts the principal IS
+// visible inside a streaming handler, by reading the tenant off a streamed message.
 type wrappedServerStream struct {
 	grpc.ServerStream
 	ctx context.Context

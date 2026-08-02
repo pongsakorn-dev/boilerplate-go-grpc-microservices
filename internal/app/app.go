@@ -27,6 +27,7 @@ import (
 	"github.com/example/gomicro/internal/grpcapi"
 	"github.com/example/gomicro/internal/order"
 	"github.com/example/gomicro/internal/order/ordermem"
+	"github.com/example/gomicro/internal/platform/auth"
 	"github.com/example/gomicro/internal/platform/config"
 	"github.com/example/gomicro/internal/platform/observability"
 )
@@ -61,12 +62,15 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 
 	a := &App{cfg: cfg, log: log}
 
-	// A dev-mode verifier accepts anything. Warn on EVERY startup, not once: a single
-	// line at first boot scrolls out of a log buffer within minutes, and the whole point
-	// is that someone notices it in an environment where it should not appear.
-	if cfg.AuthMode == config.AuthDev {
-		log.Warn("AUTH_MODE=dev: every request is accepted without verification. " +
-			"Never run this outside local development.")
+	// The verifier is built HERE, in the composition root, and passed down.
+	//
+	// auth.NewVerifier owns the AUTH_MODE switch, including the unknown-mode arm that
+	// returns an error and the dev-mode warning emitted on every startup. Building it early
+	// means a bad OIDC configuration -- missing audience, http:// issuer, absent tenant
+	// claim -- fails here, before any listener binds, rather than on the first request.
+	verifier, err := auth.NewVerifier(cfg, log)
+	if err != nil {
+		return nil, fmt.Errorf("build verifier: %w", err)
 	}
 
 	// Tracing first: it must be installed before anything that creates spans, and the
@@ -112,6 +116,8 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (*App, error)
 		Health:       a.health,
 		Metrics:      a.metrics,
 		Validator:    validator,
+		Verifier:     verifier,
+		Policy:       grpcapi.DefaultPolicy(),
 	})
 	if err != nil {
 		_ = a.closeOpened(ctx)
