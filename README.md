@@ -288,7 +288,7 @@ compile-time guarantee. That is the only way `go test ./...` is safe with Docker
 
 | Tier | Command | Infra | Measured on this machine |
 |---|---|---|---|
-| Default | `go test ./...` | none | **9s** cold cache, **1s** cached |
+| Default | `go test ./...` | none | **12s** cold cache, **1.5s** cached |
 | Codegen | `task verify:codegen` | network | **17.6s** — regenerates and byte-compares |
 | Integration | `task verify:int` | Docker | **20s** with the image cached. **Skips**, never fails, without Docker |
 | End-to-end | `task verify:e2e` | Docker + compose | **92s** — the shipped images, the shipped compose file, real SIGTERM |
@@ -328,6 +328,8 @@ merely to pass today:
 | `TestCommentsDoNotCiteMissingTests` | A comment claiming a proof that does not exist |
 | `TestVendoredProtosKeepTheirLicenseHeaders` | Apache-2.0 attribution being stripped from vendored protos |
 | `TestRootLicenseNamesItsCopyrightHolder` | The root LICENSE losing its copyright holder to a rename substitution |
+| `TestEveryTenantScopedTableHasAGuardedModel` | A new tenant table whose model forgot `TenantColumn`, so every query silently returns every tenant's rows |
+| `TestNoExemptionOutlivesItsTable` | That guard's allowlist outliving the table it excuses |
 | `TestTaskTargetsReferenceRealPaths` | A task target pointing at a file that does not exist |
 | `TestBannedToolsAreNotToolDependencies` | A build tool entering the production module graph |
 | `TestErrorsAreMappedBeforeLoggingObservesThem` | Interceptor order regressing to `codes.Unknown` |
@@ -396,7 +398,7 @@ implementation plan; the short version:
 | Wiring | [manual constructors](internal/app/app.go) | A missing dependency is a compile error, not a runtime one. Adding fx/wire later is additive; removing either is a rewrite. `google/wire` is archived |
 | Time in tests | `testing/synctest` | No `Clock` interface — the stdlib made that abstraction unnecessary in Go 1.25 |
 | Assertions | stdlib + `go-cmp`/`protocmp` | One assertion idiom, not two. Adding testify later is purely additive |
-| Task runner | [Taskfile](Taskfile.yml) via `go tool` | No Makefile: Windows has no `make`. Task's shell has no `rm`/`sed`/`jq` either, so those live in `cmd/devtool` |
+| Task runner | [Taskfile](Taskfile.yml) via `go run …@v3.52.0` | No Makefile: Windows has no `make`. **Not** the `tool` directive — go-task requires grpc, protobuf and `x/net`, so it would join version selection for the runtime your service ships. Task's shell has no `rm`/`sed`/`jq` either, so those live in `cmd/devtool` |
 
 ---
 
@@ -1456,14 +1458,28 @@ is built.)
 **Done:** M0–M1 foundation · M2 toolchain guards · M3 interceptors + observability ·
 M5 auth · M4 Postgres · M6 REST edge · M7 rate limiting · M8a outbox relay ·
 M10 deploy · M8b JetStream + worker · M9 outbound client · M11 forkability ·
-plus an evidence-backed cuts pass.
+plus an evidence-backed cuts pass and the M1–M3 test backfill.
 
-**Every planned milestone has shipped**, and so has the end-to-end tier that was the last gap.
-What remains is one piece of test backfill, listed in *Known gaps* rather than as a milestone:
+**Every planned milestone has shipped**, along with the end-to-end tier and the backfill that
+were the last two gaps. The backfill closed three specifically: the server hardening options,
+the health-check trace filter, and the structural half of the tenant guard — all three of which
+were code that ran in production and that no test observed.
 
-| | What is left | Why it is not a milestone |
+What remains is operational rather than architectural. Nothing below blocks using this
+template; each is a thing a fork will want and a thing this repo would rather name than
+half-build. They are ordered by dependency:
+
+| | What is left | Depends on |
 |---|---|---|
-| | Backfill of a few M1–M3 tests | Absorbed piecemeal as later milestones touched the same code |
+| 1 | Retention for `outbox` and `processed_events` — both grow forever | — |
+| 2 | A metric for quarantined rows and for the oldest unpublished one | — |
+| 3 | Keycloak in the e2e tier, so OIDC is not hand-verified | — |
+| 4 | `grpc_client_*` metrics | 2 — same registry, and `MustRegister` panics on a duplicate |
+| 5 | Trace context carried through the outbox into the consumer | — (largest blast radius: a migration plus the event shape) |
+| 6 | An executable `DELETING.md` — the `profile` tier the plan named | 1, 2, 4, 5 — each changes the subsystem inventory it encodes |
+
+Items 1, 2, 3 and 5 are described in full under *Known gaps*, including the exact predicates
+and the reasoning about what is safe.
 
 Every "reduced", "split" and "cut" above came out of a review that asked what this template
 over-engineers. [ADR 0002](docs/adr/0002-what-was-cut.md) records what was removed and the two

@@ -83,6 +83,27 @@ func NewTestServer(t *testing.T, mutate ...func(*config.Config)) *grpc.ClientCon
 func NewTestServerDialer(t *testing.T, mutate ...func(*config.Config)) []grpc.DialOption {
 	t.Helper()
 
+	lis := NewTestServerListener(t, mutate...)
+
+	return []grpc.DialOption{
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+	}
+}
+
+// NewTestServerListener starts the production server and returns the in-memory listener it is
+// serving on, for a test whose subject is the HTTP/2 transport BELOW gRPC.
+//
+// NewTestServerDialer is the right helper for almost everything, because a DialOption is what
+// grpc.NewClient consumes. It is useless to a test that must not use grpc-go's client at all
+// -- and hardening_test.go's keepalive assertion is exactly that case, because
+// grpc.WithKeepaliveParams silently clamps the ping interval to a 10-second minimum, which
+// puts the behaviour being asserted forty seconds away. Speaking raw frames to this listener
+// costs milliseconds instead.
+func NewTestServerListener(t *testing.T, mutate ...func(*config.Config)) *bufconn.Listener {
+	t.Helper()
+
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	application, err := app.New(context.Background(), TestConfig(mutate...), log)
@@ -109,11 +130,7 @@ func NewTestServerDialer(t *testing.T, mutate ...func(*config.Config)) []grpc.Di
 		_ = lis.Close()
 	})
 
-	return []grpc.DialOption{
-		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
-			return lis.DialContext(ctx)
-		}),
-	}
+	return lis
 }
 
 // NewTestServerWithLogs is NewTestServer with a caller-supplied logger, for tests that
