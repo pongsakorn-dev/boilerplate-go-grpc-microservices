@@ -57,16 +57,30 @@ func NewVerifier(cfg config.Config, log *slog.Logger) (Verifier, error) {
 		return DevVerifier{}, nil
 
 	case config.AuthOIDC:
+		// Loud on EVERY startup, same as AUTH_MODE=dev above and for the same reason.
+		//
+		// This one is easier to miss because everything else about the service is correct:
+		// tokens really are verified, signatures really are checked, and the only thing given
+		// up is the confidentiality of the channel carrying them. That makes it precisely the
+		// setting somebody copies out of a compose file into a manifest without noticing.
+		// APP_ENV=production refuses it outright; this covers staging and everywhere else.
+		if cfg.OIDC.AllowInsecureIssuer {
+			log.Warn("OIDC_ALLOW_INSECURE_ISSUER=true: tokens and signing keys may cross this network in cleartext",
+				slog.String("issuer", cfg.OIDC.IssuerURL),
+				slog.String("remedy", "unset it and give the issuer a TLS certificate before this reaches any network you do not control"))
+		}
+
 		return NewOIDCVerifier(OIDCOptions{
-			IssuerURL:    cfg.OIDC.IssuerURL,
-			Audience:     cfg.OIDC.Audience,
-			JWKSURL:      cfg.OIDC.JWKSURL,
-			Leeway:       cfg.OIDC.Leeway,
-			TenantClaim:  cfg.OIDC.TenantClaim,
-			ScopeClaim:   cfg.OIDC.ScopeClaim,
-			ServiceClaim: cfg.OIDC.ServiceClaim,
-			MaxKeyAge:    cfg.OIDC.MaxKeyAge,
-			Log:          log,
+			IssuerURL:           cfg.OIDC.IssuerURL,
+			Audience:            cfg.OIDC.Audience,
+			JWKSURL:             cfg.OIDC.JWKSURL,
+			Leeway:              cfg.OIDC.Leeway,
+			TenantClaim:         cfg.OIDC.TenantClaim,
+			ScopeClaim:          cfg.OIDC.ScopeClaim,
+			ServiceClaim:        cfg.OIDC.ServiceClaim,
+			MaxKeyAge:           cfg.OIDC.MaxKeyAge,
+			AllowInsecureIssuer: cfg.OIDC.AllowInsecureIssuer,
+			Log:                 log,
 		})
 
 	default:

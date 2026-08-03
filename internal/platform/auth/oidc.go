@@ -55,6 +55,18 @@ type OIDCOptions struct {
 	// string form or a JSON array; providers disagree and both are common.
 	ScopeClaim string
 
+	// AllowInsecureIssuer permits an http:// issuer on a NON-loopback host.
+	//
+	// False by default, and config.Validate refuses it outright when APP_ENV=production. It
+	// exists for one case: a containerised service reaching its identity provider by container
+	// name, where the address is necessarily not loopback and there is no TLS to speak of.
+	// That case is the OIDC end-to-end tier, and without it that tier cannot exist.
+	//
+	// It relaxes ONLY the transport check. Signature, issuer, audience and expiry are verified
+	// exactly as before -- this does not make a token easier to forge, it makes one easier to
+	// intercept, which is why it is refused anywhere real traffic flows.
+	AllowInsecureIssuer bool
+
 	// HTTPClient is injectable so tests drive an in-process issuer. Nil means a sane
 	// default with a timeout -- never http.DefaultClient, which has none, so a hung IdP
 	// would pin a goroutine and an admission slot until the caller's deadline.
@@ -151,10 +163,10 @@ func NewOIDCVerifier(opts OIDCOptions) (*OIDCVerifier, error) {
 	if opts.TenantClaim == "" {
 		errs = append(errs, errors.New("OIDC_TENANT_CLAIM is required: the tenant must come from the verified token"))
 	}
-	if err := requireSecureURL(opts.IssuerURL, "OIDC_ISSUER_URL"); opts.IssuerURL != "" && err != nil {
+	if err := requireSecureURL(opts.IssuerURL, "OIDC_ISSUER_URL", opts.AllowInsecureIssuer); opts.IssuerURL != "" && err != nil {
 		errs = append(errs, err)
 	}
-	if err := requireSecureURL(opts.JWKSURL, "OIDC_JWKS_URL"); opts.JWKSURL != "" && err != nil {
+	if err := requireSecureURL(opts.JWKSURL, "OIDC_JWKS_URL", opts.AllowInsecureIssuer); opts.JWKSURL != "" && err != nil {
 		errs = append(errs, err)
 	}
 	if len(errs) > 0 {
@@ -358,7 +370,7 @@ func (v *OIDCVerifier) discover(ctx context.Context) (string, error) {
 	if doc.JWKSURI == "" {
 		return "", errors.New("oidc discovery document has no jwks_uri")
 	}
-	if err := requireSecureURL(doc.JWKSURI, "jwks_uri"); err != nil {
+	if err := requireSecureURL(doc.JWKSURI, "jwks_uri", v.opts.AllowInsecureIssuer); err != nil {
 		return "", err
 	}
 	return doc.JWKSURI, nil
@@ -368,9 +380,15 @@ func (v *OIDCVerifier) discover(ctx context.Context) (string, error) {
 //
 // Bearer tokens and signing keys over cleartext are a wiretap away from a full compromise.
 // The loopback exemption is what lets the test suite run an in-process httptest issuer and
-// what lets a laptop point at a compose-hosted Keycloak, without weakening anything that
+// what lets a laptop point at a published Keycloak port, without weakening anything that
 // crosses a network.
-func requireSecureURL(raw, field string) error {
+//
+// WHAT LOOPBACK DOES NOT COVER, discovered by needing it: a service reaching its identity
+// provider by CONTAINER NAME. http://keycloak:8080 is not loopback, and it is the only address
+// that resolves inside a compose network -- so the exemption that was supposed to make a local
+// Keycloak workable stopped exactly at the boundary where the service is itself containerised.
+// That is what allowInsecure is for, and it is refused when APP_ENV=production.
+func requireSecureURL(raw, field string, allowInsecure bool) error {
 	if raw == "" {
 		return nil
 	}
@@ -382,10 +400,13 @@ func requireSecureURL(raw, field string) error {
 	case "https":
 		return nil
 	case "http":
-		if isLoopback(u.Hostname()) {
+		if isLoopback(u.Hostname()) || allowInsecure {
 			return nil
 		}
-		return fmt.Errorf("%s uses http:// with non-loopback host %q: bearer tokens and signing keys must not cross a network in cleartext", field, u.Hostname())
+		return fmt.Errorf("%s uses http:// with non-loopback host %q: bearer tokens and signing "+
+			"keys must not cross a network in cleartext. If this is a container name on a "+
+			"development network, set OIDC_ALLOW_INSECURE_ISSUER=true -- which APP_ENV=production "+
+			"refuses", field, u.Hostname())
 	default:
 		return fmt.Errorf("%s has unsupported scheme %q", field, u.Scheme)
 	}

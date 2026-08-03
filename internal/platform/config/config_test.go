@@ -601,3 +601,73 @@ func TestRetentionRejectsNonsense(t *testing.T) {
 		})
 	}
 }
+
+// TestInsecureIssuerIsRefusedInProduction is the production half of the escape hatch added for
+// the OIDC end-to-end tier.
+//
+// OIDC_ALLOW_INSECURE_ISSUER permits an http:// issuer on a routable host, which is the only
+// thing that works when a container reaches its identity provider by container name. In
+// production it would mean bearer tokens and signing keys crossing a real network in
+// cleartext: readable by anything on the path, and a full compromise rather than a degradation.
+//
+// It is the same shape as AUTH_MODE=dev and refused for the same reason. The setting is easier
+// to miss than that one, because everything else about the service stays correct -- tokens are
+// still verified, signatures still checked -- so the only thing given up is the confidentiality
+// of the channel. That makes it exactly the line somebody copies out of a compose file.
+func TestInsecureIssuerIsRefusedInProduction(t *testing.T) {
+	t.Parallel()
+
+	oidcEnv := func(env string, insecure string) map[string]string {
+		return map[string]string{
+			"APP_ENV":                    env,
+			"AUTH_MODE":                  config.AuthOIDC,
+			"OIDC_ISSUER_URL":            "https://issuer.example/realms/gomicro",
+			"OIDC_AUDIENCE":              "orderd",
+			"OIDC_ALLOW_INSECURE_ISSUER": insecure,
+		}
+	}
+
+	t.Run("refused in production", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := config.Parse(oidcEnv(config.EnvProduction, "true"))
+		if err == nil {
+			t.Fatal("OIDC_ALLOW_INSECURE_ISSUER=true was accepted with APP_ENV=production.\n\n" +
+				"Bearer tokens and signing keys would be permitted to cross a real network " +
+				"in cleartext.")
+		}
+		if !strings.Contains(err.Error(), "OIDC_ALLOW_INSECURE_ISSUER") {
+			t.Errorf("the error does not name the setting: %v", err)
+		}
+	})
+
+	t.Run("allowed outside production", func(t *testing.T) {
+		t.Parallel()
+
+		if _, err := config.Parse(oidcEnv(config.EnvDevelopment, "true")); err != nil {
+			t.Fatalf("the flag was refused in development, where the OIDC e2e tier needs it: %v", err)
+		}
+	})
+
+	t.Run("production is fine without it", func(t *testing.T) {
+		t.Parallel()
+
+		if _, err := config.Parse(oidcEnv(config.EnvProduction, "false")); err != nil {
+			t.Fatalf("a correct production OIDC configuration was rejected: %v", err)
+		}
+	})
+
+	// A typo must not read as "false". A security flag whose misspelling silently disables it
+	// is one whose misspelling could as easily enable it in the next helper somebody writes.
+	t.Run("an unparseable value is an error, not a default", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := config.Parse(oidcEnv(config.EnvDevelopment, "yes-please"))
+		if err == nil {
+			t.Fatal("OIDC_ALLOW_INSECURE_ISSUER=yes-please was silently treated as a boolean")
+		}
+		if !strings.Contains(err.Error(), "OIDC_ALLOW_INSECURE_ISSUER") {
+			t.Errorf("the error does not name the setting: %v", err)
+		}
+	})
+}

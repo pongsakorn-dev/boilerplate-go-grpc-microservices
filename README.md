@@ -292,7 +292,7 @@ compile-time guarantee. That is the only way `go test ./...` is safe with Docker
 | Default | `go test ./...` | none | **12s** cold cache, **1.5s** cached |
 | Codegen | `task verify:codegen` | network | **17.6s** — regenerates and byte-compares |
 | Integration | `task verify:int` | Docker | **20s** with the image cached. **Skips**, never fails, without Docker |
-| End-to-end | `task verify:e2e` | Docker + compose | **92s** — the shipped images, the shipped compose file, real SIGTERM |
+| End-to-end | `task verify:e2e` | Docker + compose | **~140s** — the shipped images and compose file, real SIGTERM, and a second stack running `AUTH_MODE=oidc` against a real Keycloak |
 <!-- fork-tool:begin -->
 | Rename | `task verify:rename` | none | **26s** — renames a copy of this repo, then builds and tests it |
 <!-- fork-tool:end -->
@@ -1376,6 +1376,7 @@ the same class of problem as a proto field that validates and is then dropped.
 | `OIDC_SERVICE_CLAIM` | `token_use` | Marks a machine caller. Needed because real Keycloak service tokens do **not** satisfy RFC 9068's `sub == client_id` |
 | `OIDC_LEEWAY` | `30s` | Clock skew tolerance on `exp`/`nbf` — not a grace period |
 | `OIDC_MAX_KEY_AGE` | `15m` | How long a cached JWKS is served before revalidation. This is what makes key **revocation** take effect |
+| `OIDC_ALLOW_INSECURE_ISSUER` | `false` | Permits an `http://` issuer on a **non-loopback** host — a container reaching its IdP by container name. **Refused when `APP_ENV=production`**, and warned about on every startup. Only `docker-compose.oidc.yml` sets it |
 | `POSTGRES_MAX_OPEN_CONNS` | `10` | Explicit on purpose: pool defaults read the *node's* CPU count, not the cgroup limit, so 20 replicas exhaust `max_connections` |
 | `GRPC_MAX_CONCURRENT_STREAMS` | `250` | grpc-go's default is effectively unbounded — this is a DoS control |
 | `GRPC_MAX_CONNECTION_AGE` | `30m` | Forces periodic GOAWAY so rolling deploys actually rebalance |
@@ -1544,16 +1545,15 @@ half-build. They are ordered by dependency:
 
 | | What is left | Depends on |
 |---|---|---|
-| 1 | Keycloak in the e2e tier, so OIDC is not hand-verified | — |
-| 2 | `grpc_client_*` metrics | — |
-| 3 | Trace context carried through the outbox into the consumer | — (largest blast radius: a migration plus the event shape) |
-| 4 | An executable `DELETING.md` — the `profile` tier the plan named | 2, 3 — each changes the subsystem inventory it encodes |
+| 1 | `grpc_client_*` metrics | — |
+| 2 | Trace context carried through the outbox into the consumer | — (largest blast radius: a migration plus the event shape) |
+| 3 | An executable `DELETING.md` — the `profile` tier the plan named | 1, 2 — each changes the subsystem inventory it encodes |
 
-Items 1 and 3 are described in full under *Known gaps*, including the reasoning about what is
-safe.
+Item 2 is described in full under *Known gaps*.
 
-Retention shipped as [`cmd/prune`](cmd/prune/main.go), and outbox health as
-[`outbox.Observer`](internal/platform/outbox/observer.go); neither is on this list any more.
+Retention shipped as [`cmd/prune`](cmd/prune/main.go), outbox health as
+[`outbox.Observer`](internal/platform/outbox/observer.go), and OIDC coverage as
+[`test/e2e/oidc`](test/e2e/oidc/oidc_test.go); none are on this list any more.
 
 Every "reduced", "split" and "cut" above came out of a review that asked what this template
 over-engineers. [ADR 0002](docs/adr/0002-what-was-cut.md) records what was removed and the two
@@ -1568,11 +1568,13 @@ rather than maintained.
 
 ### Known gaps
 
-- **The e2e tier does not cover Keycloak.** The realm import and a real token being accepted
-  end to end were verified by hand (see *Authentication*) and are not replayed by
-  `task verify:e2e`, because the shipped compose file does not configure `orderd` for OIDC —
-  wiring that would mean a second compose profile whose only consumer is a test. Everything
-  else in the deployment story is now automated.
+- **The OIDC e2e tier needs a cleartext issuer.** `test/e2e/oidc` sets
+  `OIDC_ALLOW_INSECURE_ISSUER=true`, because a container reaches Keycloak by container name and
+  the transport guard's loopback exemption does not stretch that far. Signature, issuer,
+  audience and expiry are all still verified — only the channel is in the clear, on a private
+  compose network. `APP_ENV=production` refuses the flag outright. Giving the dev Keycloak a
+  certificate would remove the need for it, at the cost of a TLS story in a fixture whose whole
+  point is being easy to run.
 - **The prune schedule is a guess.** `cmd/prune` ships and the CronJob runs nightly at 03:17,
   but the right *frequency* depends on volume nobody here knows. A service writing a thousand
   events a second wants it hourly; one writing a thousand a day could run it monthly. The

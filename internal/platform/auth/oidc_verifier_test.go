@@ -393,3 +393,81 @@ func TestLoopbackPlaintextIsAllowed(t *testing.T) {
 		}
 	}
 }
+
+// TestInsecureIssuerIsOptInAndNarrow covers the escape hatch added for the OIDC e2e tier.
+//
+// The transport guard refuses http:// on a non-loopback host, and loopback is already exempt.
+// What that misses is a CONTAINERISED service reaching its identity provider by container
+// name: http://keycloak:8080 is not loopback, and it is the only address that resolves inside
+// a compose network. Without the flag the OIDC end-to-end tier cannot exist at all, which is
+// how it was found.
+//
+// Two properties matter here and both are asserted: the flag must actually permit that case,
+// and it must be OFF unless asked for. A guard that quietly relaxes for APP_ENV=development is
+// one that ships relaxed the first time somebody copies a compose file into a manifest --
+// which is why the production refusal lives in config.Validate and is tested there.
+func TestInsecureIssuerIsOptInAndNarrow(t *testing.T) {
+	t.Parallel()
+
+	base := func() auth.OIDCOptions {
+		return auth.OIDCOptions{
+			Audience:    "orderd",
+			TenantClaim: "tenant_id",
+			ScopeClaim:  "scope",
+			Log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		}
+	}
+
+	t.Run("refused by default", func(t *testing.T) {
+		t.Parallel()
+
+		opts := base()
+		opts.IssuerURL = "http://keycloak:8080/realms/gomicro"
+
+		_, err := auth.NewOIDCVerifier(opts)
+		if err == nil {
+			t.Fatal("a cleartext issuer on a routable host was accepted with no opt-in.\n\n" +
+				"Bearer tokens and signing keys would cross the network in the clear.")
+		}
+		// The message has to name the way out, or the next person turns off the wrong thing.
+		if !strings.Contains(err.Error(), "OIDC_ALLOW_INSECURE_ISSUER") {
+			t.Errorf("the rejection does not name the opt-in: %v", err)
+		}
+	})
+
+	t.Run("permitted when opted in", func(t *testing.T) {
+		t.Parallel()
+
+		opts := base()
+		opts.IssuerURL = "http://keycloak:8080/realms/gomicro"
+		opts.AllowInsecureIssuer = true
+
+		if _, err := auth.NewOIDCVerifier(opts); err != nil {
+			t.Fatalf("AllowInsecureIssuer did not permit a container-name issuer: %v\n\n"+
+				"This is the only configuration that works inside a compose network, so the "+
+				"OIDC end-to-end tier cannot run without it.", err)
+		}
+	})
+
+	t.Run("it relaxes the transport check and nothing else", func(t *testing.T) {
+		t.Parallel()
+
+		// The flag must not become a general "skip validation" switch. A missing audience is
+		// still refused with it on -- that check is about which tokens are accepted, not about
+		// how they travel.
+		opts := base()
+		opts.IssuerURL = "http://keycloak:8080/realms/gomicro"
+		opts.AllowInsecureIssuer = true
+		opts.Audience = ""
+
+		_, err := auth.NewOIDCVerifier(opts)
+		if err == nil {
+			t.Fatal("with AllowInsecureIssuer set, a verifier with NO audience was accepted.\n\n" +
+				"The flag is meant to relax the transport requirement only. Accepting any " +
+				"audience means accepting tokens the issuer minted for other applications.")
+		}
+		if !strings.Contains(err.Error(), "OIDC_AUDIENCE") {
+			t.Errorf("the error does not name the missing audience: %v", err)
+		}
+	})
+}

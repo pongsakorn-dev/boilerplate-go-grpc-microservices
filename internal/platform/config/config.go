@@ -181,6 +181,24 @@ type OIDCConfig struct {
 	// keeps signing with its others -- so every token names a key already cached, and the
 	// revoked one stays trusted until the process restarts.
 	MaxKeyAge time.Duration
+
+	// AllowInsecureIssuer permits an http:// issuer on a NON-loopback host.
+	//
+	// The verifier normally refuses one, because bearer tokens and signing keys crossing a
+	// network in cleartext are a wiretap away from full compromise. Loopback is exempt
+	// already, which covers an in-process test issuer and a laptop pointed at a published
+	// Keycloak port.
+	//
+	// What it does NOT cover is a service reaching an identity provider by container name --
+	// http://keycloak:8080 is not loopback, and that is the only address that works from
+	// inside a compose network. Without this flag the OIDC end-to-end tier cannot exist, and
+	// the highest-consequence configuration in the repository stays hand-verified.
+	//
+	// So it is a deliberate, named, logged opt-in rather than a quiet exemption for
+	// APP_ENV=development: Validate REFUSES it when APP_ENV=production, and NewVerifier warns
+	// on every startup it is on. Same shape as AUTH_MODE=dev, for the same reason -- a
+	// security control that can be relaxed silently will be.
+	AllowInsecureIssuer bool
 }
 
 // RedisConfig configures the distributed rate limiter.
@@ -460,6 +478,8 @@ func ParseFor(env map[string]string, role Role) (Config, error) {
 			ScopeClaim:   p.str("OIDC_SCOPE_CLAIM", "scope"),
 			ServiceClaim: p.str("OIDC_SERVICE_CLAIM", "token_use"),
 			MaxKeyAge:    p.dur("OIDC_MAX_KEY_AGE", 15*time.Minute),
+
+			AllowInsecureIssuer: p.boolVal("OIDC_ALLOW_INSECURE_ISSUER", false),
 		},
 
 		Redis: RedisConfig{
@@ -567,6 +587,23 @@ func (c Config) Validate() error {
 	if c.Role == RoleServer && c.AppEnv == EnvProduction && c.AuthMode == AuthDev {
 		errs = append(errs, errors.New(
 			"AUTH_MODE=dev is refused when APP_ENV=production: the dev verifier accepts any token"))
+	}
+
+	// The same treatment for the cleartext-issuer escape hatch, and for the same reason.
+	//
+	// It exists so a containerised service can reach an identity provider by container name
+	// over plain HTTP, which is the only thing that works inside a compose network and is
+	// exactly what the OIDC end-to-end tier needs. In production it would mean bearer tokens
+	// and signing keys crossing a real network in cleartext -- readable by anything on the
+	// path, and a full compromise rather than a degradation.
+	//
+	// Refused here, before any listener opens, rather than left to a reviewer noticing one
+	// environment variable in a manifest.
+	if c.AppEnv == EnvProduction && c.OIDC.AllowInsecureIssuer {
+		errs = append(errs, errors.New(
+			"OIDC_ALLOW_INSECURE_ISSUER=true is refused when APP_ENV=production: it permits an "+
+				"http:// issuer on a routable host, so bearer tokens and signing keys would "+
+				"cross the network in cleartext"))
 	}
 
 	// The worker's own hard requirement, checked here rather than in main so it joins every
@@ -823,6 +860,25 @@ func (p *parser) str(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// boolVal parses a flag, and REFUSES anything it does not recognise.
+//
+// No silent default on a bad value: a security flag whose typo reads as "false" is one whose
+// typo could just as easily read as "true" in the next helper somebody writes. strconv accepts
+// 1/t/T/TRUE/true/True and their false counterparts, which covers every spelling a manifest is
+// likely to carry.
+func (p *parser) boolVal(key string, def bool) bool {
+	raw, ok := p.env[key]
+	if !ok || raw == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(raw)
+	if err != nil {
+		p.errs = append(p.errs, fmt.Errorf("%s: %q is not a boolean (try true or false)", key, raw))
+		return def
+	}
+	return b
 }
 
 func (p *parser) intVal(key string, def int) int {

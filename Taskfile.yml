@@ -133,7 +133,14 @@ tasks:
       # Dockerfile or the compose file, so editing either and re-running reports a cached PASS
       # from the previous build. That was observed while writing this tier: a deliberately
       # broken healthcheck came back green in 0.0s.
-      - go test -tags=e2e -count=1 -timeout 40m ./test/e2e/...
+      #
+      # -p 1 is REQUIRED TOO, and for a different reason. There are two packages here --
+      # test/e2e runs the stack with AUTH_MODE=dev, test/e2e/oidc runs it against Keycloak --
+      # and each brings up a compose stack publishing the SAME host ports. Go runs packages
+      # concurrently by default, so without this the second stack loses a port race to the
+      # first. Both stacks publish the shipped ports on purpose: remapping seven services
+      # would mean neither tier was testing the compose file anybody actually uses.
+      - go test -tags=e2e -count=1 -p 1 -timeout 60m ./test/e2e/...
 
   verify:rename:
     desc: Prove the template is forkable -- renames a copy of the repo, then builds and tests it

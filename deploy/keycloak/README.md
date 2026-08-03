@@ -5,14 +5,23 @@ from. It is a **development** realm — passwords are `alice`/`bob`, the client 
 literally `dev-only-not-a-real-secret`, and `sslRequired` is off.
 
 > [!NOTE]
-> **Verified.** This realm has been imported by a real Keycloak 26.4 and a token from it
-> accepted by the service. Measured end to end during M10:
+> **Verified automatically**, by [`test/e2e/oidc`](../../test/e2e/oidc/oidc_test.go), on every
+> `task verify:e2e`. It imports this realm into a real Keycloak 26.4, points `orderd` at it
+> with `AUTH_MODE=oidc`, and requires all five of: an anonymous call refused, a
+> client-credentials token accepted, a **user** token holding only `orders:read` denied on a
+> write, a garbage token refused, and health reachable with no credential at all.
 >
-> - `Realm 'gomicro' imported` — no errors
-> - client-credentials token claims: `"aud":"orderd"`, `"tenant_id":"acme"`,
->   `"scope":"orders:read orders:write"`, `"token_use":"service"`
-> - `orderd` with `AUTH_MODE=oidc`: **401** without a token, **200** with one, and the created
->   order carried `tenant_id: acme` straight from the claim
+> It used to read "verified by hand", and the difference was not cosmetic. The M10 check used a
+> **client-credentials token only**, and Keycloak 26 sets `sub` on service-account tokens
+> whatever the client scopes say — so it happened to work. Every *user* token this realm issued
+> carried no `sub` at all, because `orders-web` declares an explicit `defaultClientScopes` list
+> and Keycloak 26 moved the subject claim into the `basic` scope. The verifier correctly
+> rejected those tokens. Nobody knew, because the one path anyone tested was the one path that
+> worked.
+>
+> Fixed with an explicit `oidc-sub-mapper` on `orders-web` rather than by adding `basic` to its
+> scopes: this realm defines its own `clientScopes` list, so Keycloak's built-in scopes do not
+> exist here and naming one has no effect.
 >
 > Booting it also found a real bug — see *The two principal shapes* below.
 

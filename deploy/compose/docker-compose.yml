@@ -93,9 +93,22 @@ services:
       - ../keycloak:/opt/keycloak/data/import:ro
     healthcheck:
       # Keycloak 26 serves health on the MANAGEMENT port (9000), not 8080, and the image has
-      # no curl or wget. This uses the JVM's own HTTP client via a bash redirect on /dev/tcp,
-      # which is the documented workaround for distroless-ish Keycloak images.
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9000 && echo -e 'GET /health/ready HTTP/1.1\\nHost: localhost\\nConnection: close\\n\\n' >&3 && cat <&3 | grep -q '\"status\": \"UP\"'"]
+      # no curl or wget. This speaks HTTP by hand through a bash /dev/tcp redirect, which is
+      # the documented workaround for distroless-ish Keycloak images.
+      #
+      # CRLF, NOT LF, and that is the whole reason this line works.
+      #
+      # It shipped using `echo -e` with bare \n separators and NEVER PASSED ONCE. HTTP/1.1
+      # requires CRLF between header lines; Quarkus enforces it and answers 400 Bad Request,
+      # so the grep never matched, the container sat unhealthy for its full 170-second retry
+      # budget, and anything with `depends_on: condition: service_healthy` could not start.
+      #
+      # Nothing noticed because nothing depended on it: Keycloak sits behind `--profile auth`,
+      # and the milestone that added it verified the realm by hand rather than by waiting on
+      # this check. The OIDC e2e tier is the first thing to require it, and found it
+      # immediately. printf rather than `echo -e` because printf's escape handling is
+      # specified rather than shell-dependent.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9000 && printf 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '\"status\": \"UP\"'"]
       interval: 5s
       timeout: 5s
       retries: 30
