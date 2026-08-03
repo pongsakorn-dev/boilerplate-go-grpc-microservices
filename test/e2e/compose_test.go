@@ -42,6 +42,38 @@ const project = "gomicro-e2e"
 
 const composeFile = "../../deploy/compose/docker-compose.yml"
 
+// unavailable explains why the stack could not be started, or is nil.
+//
+// A PACKAGE VARIABLE RATHER THAN AN EARLY os.Exit, and the difference is the whole point.
+//
+// This used to be `os.Exit(0)` on a machine with no Docker daemon -- correct in intent, since a
+// laptop without Docker has broken nothing, and wrong in effect: `go test` prints
+//
+//	ok  github.com/example/gomicro/test/e2e   1.828s
+//
+// which is indistinguishable from a real pass. A CI leg with no daemon reports the entire
+// end-to-end tier green while running none of it, and this is the only tier covering the
+// shipped images, the compose file, graceful shutdown and OIDC against a real Keycloak.
+//
+// Observed here, not imagined: a run in this session came back "ok" in 1.8 seconds and was
+// nearly reported as a pass. The timing is the only tell, and only if somebody is looking.
+//
+// Recording the reason and letting every test call t.Skip puts `--- SKIP:` lines in the output
+// and in the CI log, where a human or a grep can see them.
+var unavailable error
+
+// requireStack skips the calling test when the compose stack is not running.
+//
+// Every test in this package must call it first. skips_test.go enforces that structurally, so
+// a test added later cannot quietly run against a stack that was never brought up.
+func requireStack(t *testing.T) {
+	t.Helper()
+
+	if unavailable != nil {
+		t.Skipf("the compose stack is not available: %v", unavailable)
+	}
+}
+
 // TestMain builds the images, brings the stack up, and tears it down once.
 //
 // Once, not per test: `compose up` is the dominant cost here, and a per-test stack would turn a
@@ -50,7 +82,10 @@ const composeFile = "../../deploy/compose/docker-compose.yml"
 func TestMain(m *testing.M) {
 	if err := requireDocker(); err != nil {
 		fmt.Fprintf(os.Stderr, "e2e: %v\n", err)
-		os.Exit(0) // skip, not fail: a machine without Docker has not broken anything
+
+		// Run the tests anyway. Each one skips, which is what makes the skip visible.
+		unavailable = err
+		os.Exit(m.Run())
 	}
 
 	// TEAR DOWN FIRST, then check ports.
@@ -144,7 +179,7 @@ func requireDocker() error {
 	defer cancel()
 
 	if err := exec.CommandContext(ctx, "docker", "info").Run(); err != nil {
-		return fmt.Errorf("no Docker daemon; skipping the e2e tier (%v)", err)
+		return fmt.Errorf("no Docker daemon; skipping the e2e tier: %w", err)
 	}
 	return nil
 }

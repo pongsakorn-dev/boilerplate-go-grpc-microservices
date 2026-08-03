@@ -115,10 +115,20 @@ func copyRepo(t *testing.T) string {
 func grepTree(t *testing.T, root, needle string) []string {
 	t.Helper()
 
+	// BOTH ERRORS ARE SWALLOWED ON PURPOSE, which is what nilerr flags below.
+	//
+	// This walk answers "does the renamed tree still mention the old module path anywhere?".
+	// A file that cannot be walked or read cannot contain the needle, so skipping it is the
+	// correct answer to the question asked -- and aborting the walk would turn a transient
+	// permission blip on some unrelated file into a failure of the rename test.
+	//
+	// The risk this accepts is a file that DOES contain the needle being skipped because it
+	// was unreadable, which would make this report a false clean. That is bounded: the tree
+	// was created by this test moments earlier, in a directory it owns.
 	var found []string
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			return nil
+			return nil //nolint:nilerr // an unwalkable entry cannot contain the needle
 		}
 		if d.IsDir() {
 			if d.Name() == ".git" {
@@ -128,7 +138,7 @@ func grepTree(t *testing.T, root, needle string) []string {
 		}
 		data, err := os.ReadFile(path)
 		if err != nil {
-			return nil
+			return nil //nolint:nilerr // an unreadable file cannot contain the needle
 		}
 		if strings.Contains(string(data), needle) {
 			rel, _ := filepath.Rel(root, path)

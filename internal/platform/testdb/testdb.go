@@ -79,8 +79,15 @@ func RequireDocker(t *testing.T) {
 }
 
 // activeDockerContext reports the context Docker is configured to use, best-effort.
+//
+// BOUNDED, because this runs on the path where Docker is already suspect -- it exists only to
+// make a skip message specific. An unbounded exec here would let a wedged docker CLI hang the
+// very helper whose job is to explain that Docker is not working.
 func activeDockerContext() string {
-	out, err := exec.Command("docker", "context", "show").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, "docker", "context", "show").Output()
 	if err != nil {
 		return "unknown (docker CLI not on PATH)"
 	}
