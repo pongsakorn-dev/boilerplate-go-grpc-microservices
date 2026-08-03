@@ -113,14 +113,26 @@ spec:
               value: ":50051"
             - name: GATEWAY_ADDR
               value: ":8080"
-            # Bound to the POD IP, not 0.0.0.0 and not localhost. /debug/pprof must be
-            # reachable by a scraper inside the cluster and by nothing outside it.
-            - name: ADMIN_ADDR
-              value: "$(POD_IP):9090"
+            # POD_IP IS DECLARED FIRST, AND THE ORDER IS LOAD-BEARING.
+            #
+            # The kubelet expands $(VAR) in an env value using only the variables defined
+            # EARLIER in the same container's list -- it is a single in-order pass, and an
+            # unresolved reference is left in place verbatim rather than reported. Declared
+            # after ADMIN_ADDR, as this pair was until the manifest guard below caught it, the
+            # container receives the literal string "$(POD_IP):9090", net.Listen rejects it,
+            # and the admin listener never binds. No metrics, no pprof, and nothing says why.
+            #
+            # It survived a full end-to-end tier because compose sets ADMIN_ADDR to a literal
+            # 0.0.0.0:9090 -- so the only environment that exercises this expansion is the one
+            # no test had ever started.
             - name: POD_IP
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            # Bound to the POD IP, not 0.0.0.0 and not localhost. /debug/pprof must be
+            # reachable by a scraper inside the cluster and by nothing outside it.
+            - name: ADMIN_ADDR
+              value: "$(POD_IP):9090"
             - name: STORE_DRIVER
               value: postgres
             # AUTH_MODE is set EXPLICITLY rather than relying on the default.

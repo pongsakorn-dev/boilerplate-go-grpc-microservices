@@ -822,7 +822,8 @@ task verify:e2e
 ```
 
 Everything else here tests the code. This tests **what is deployed**: the real Dockerfile, the
-real compose file, the real images, real SIGTERM. 92 seconds, behind `//go:build e2e` because
+real compose file, the real images, real SIGTERM. ~95s for this package and ~145s for the
+tier including the OIDC stack, behind `//go:build e2e` because
 it needs a Docker daemon.
 
 The distinction is not academic. On its first run it found two defects that had shipped, both

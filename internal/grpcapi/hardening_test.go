@@ -384,3 +384,82 @@ func validCreateRequest(customerID string) *orderv1.CreateOrderRequest {
 		}},
 	}
 }
+
+// TestAConnectionIsRetiredByAge pins grpc.KeepaliveParams, the fourth hardening option and the
+// one this file claimed to cover while testing nothing of the sort.
+//
+// WHY IT MATTERS. HTTP/2 multiplexes everything onto one long-lived connection, and gRPC
+// clients keep it forever by default. So a client that connected when three pods existed keeps
+// talking to those three pods -- through a rolling deploy, through a scale-up, through the HPA
+// adding capacity that then sits idle. MaxConnectionAge forces a periodic GOAWAY so clients
+// redial and rediscover; without it a deployment never rebalances and nobody sees an error,
+// only a load imbalance nobody can explain.
+//
+// The grace period is the other half: GOAWAY says "finish what you are doing", and the
+// connection closes only after MaxConnectionAgeGrace, so in-flight RPCs are not cut.
+//
+// Raw HTTP/2 again, for the same reason as the keepalive test above: this asserts on a GOAWAY
+// frame, and grpc-go's client handles GOAWAY by transparently reconnecting -- which is correct
+// behaviour and makes the event invisible from the client API.
+func TestAConnectionIsRetiredByAge(t *testing.T) {
+	t.Parallel()
+
+	// Short enough to observe, long enough that the connection is genuinely established first.
+	const maxAge = 300 * time.Millisecond
+
+	lis := testutil.NewTestServerListener(t, func(c *config.Config) {
+		c.Server.MaxConnectionAge = maxAge
+		c.Server.MaxConnectionAgeGrace = 100 * time.Millisecond
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	conn, err := lis.DialContext(ctx)
+	if err != nil {
+		t.Fatalf("dial the in-memory listener: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if _, err := io.WriteString(conn, http2.ClientPreface); err != nil {
+		t.Fatalf("write the HTTP/2 client preface: %v", err)
+	}
+
+	fr := http2.NewFramer(conn, conn)
+
+	var writeMu sync.Mutex
+	write := func(fn func() error) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return fn()
+	}
+
+	if err := write(func() error { return fr.WriteSettings() }); err != nil {
+		t.Fatalf("write SETTINGS: %v", err)
+	}
+
+	established := make(chan struct{})
+	closed := make(chan error, 1)
+	go readFrames(fr, write, established, closed)
+
+	// A GOAWAY must arrive on its own, with no stream opened and nothing asked of the server.
+	// Ageing is the server's decision, not a response to anything the client did.
+	select {
+	case err := <-closed:
+		// NO_ERROR is the correct code for a deliberate retirement: it means "stop using this
+		// connection", not "something went wrong". ENHANCE_YOUR_CALM here would mean the
+		// keepalive enforcement fired instead, which is a different option entirely.
+		if strings.Contains(err.Error(), "ENHANCE_YOUR_CALM") {
+			t.Fatalf("the connection was retired with ENHANCE_YOUR_CALM: %v\n\n"+
+				"That is the keepalive ENFORCEMENT policy rejecting a ping flood, not "+
+				"MaxConnectionAge retiring the connection. This test proves nothing about "+
+				"connection age.", err)
+		}
+
+	case <-time.After(10 * time.Second):
+		t.Fatalf("no GOAWAY arrived within 10s on a connection with MaxConnectionAge=%s.\n\n"+
+			"grpc.KeepaliveParams is not being applied, so HTTP/2 connections live forever: a "+
+			"client pins itself to whichever pods existed when it started, and no rolling "+
+			"deploy or scale-up ever rebalances traffic.", maxAge)
+	}
+}

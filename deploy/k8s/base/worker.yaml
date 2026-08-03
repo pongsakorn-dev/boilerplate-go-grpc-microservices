@@ -117,16 +117,20 @@ spec:
             - name: OUTBOX_OBSERVE_INTERVAL
               value: "15s"
 
+            # POD_IP FIRST. The kubelet resolves $(VAR) only against variables declared
+            # EARLIER in this list; a forward reference is left literal, so ADMIN_ADDR would
+            # arrive as the string "$(POD_IP):9090" and the listener would never bind --
+            # taking the outbox gauges above with it. See deployment.yaml for the full note.
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
             # Bound to the POD IP, not 0.0.0.0 and not localhost. A scraper inside the
             # cluster must reach /metrics; nothing outside it should. Binding to loopback --
             # the default, which is right for a laptop -- would make this pod unscrapable and
             # the metrics above pointless.
             - name: ADMIN_ADDR
               value: "$(POD_IP):9090"
-            - name: POD_IP
-              valueFrom:
-                fieldRef:
-                  fieldPath: status.podIP
 
           envFrom:
             # Carries POSTGRES_DSN and NATS_URL. With NATS_URL absent the worker still runs
