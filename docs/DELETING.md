@@ -225,9 +225,17 @@ JWT verification, the JWKS cache, and the hostile-issuer test suite.
   production. Do not do this because auth is inconvenient during development — dev mode already
   covers that, out of the box, with a warning on every startup.
 - **Delete:** `internal/platform/auth/oidc.go`, `internal/platform/auth/jwks.go`,
-  `internal/platform/auth/testjwks/`, `deploy/keycloak/`
-- **Wiring:** in `internal/platform/auth/verifier.go`, remove the `oidc` arm of `NewVerifier`.
-  Keep the erroring default arm: an unknown `AUTH_MODE` must fail, never fall back.
+  `internal/platform/auth/testjwks/`, `deploy/keycloak/`, `test/e2e/oidc/`,
+  `deploy/compose/docker-compose.oidc.yml`, and the `keycloak` service in compose.
+- **Wiring:** in `internal/platform/auth/verifier.go`, remove the `oidc` arm of `NewVerifier`
+  and the `AllowInsecureIssuer` startup warning above it. Keep the erroring default arm: an
+  unknown `AUTH_MODE` must fail, never fall back.
+- **Config:** remove `OIDCConfig`, its `OIDC_*` entries, and the two `Validate` blocks that
+  refer to them — the `AUTH_MODE=oidc` completeness check and the
+  `OIDC_ALLOW_INSECURE_ISSUER` production refusal.
+- **Taskfile:** `verify:e2e` passes `-p 1` only because two e2e packages publish the same host
+  ports. With `test/e2e/oidc/` gone there is one package left and the flag is no longer needed,
+  though leaving it costs nothing.
 - **Config:** remove `OIDCConfig`, the `OIDC` field, its `OIDC_*` entries, and the
   `AUTH_MODE=oidc` block in `Validate`.
 - **Dependencies:** `github.com/golang-jwt/jwt/v5` leaves `go.mod`.

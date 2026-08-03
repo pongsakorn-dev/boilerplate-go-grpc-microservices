@@ -1,0 +1,57 @@
+# An OVERLAY, not a second stack definition. Use it with the base file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.oidc.yml \
+#     --profile app --profile auth up --build --wait
+#
+# It changes exactly one thing about the shipped stack: orderd verifies real tokens from the
+# Keycloak realm in deploy/keycloak/ instead of running AUTH_MODE=dev. Everything else -- the
+# images, the migration Job, the worker, the healthchecks -- is the base file untouched, which
+# is the point: what runs under OIDC has to be the same artifact that runs without it.
+#
+# WHY AN OVERLAY RATHER THAN A PROFILE. A profile can add services but cannot change the
+# environment of one that already exists, and the whole subject here is orderd's environment.
+# Duplicating orderd as a second service would mean two definitions of the thing under test,
+# and the copy would drift.
+#
+# WHY THE ISSUER IS AN INTERNAL HOSTNAME. Keycloak stamps `iss` from the host it was asked on,
+# so a token fetched from the host via localhost:8081 carries iss=http://localhost:8081/... and
+# orderd -- which knows Keycloak as http://keycloak:8080 -- rejects it. Rather than pinning
+# KC_HOSTNAME and teaching the host to resolve a container name, every token in the OIDC e2e
+# tier is fetched from INSIDE the compose network, so issuer and audience agree by
+# construction. See test/e2e/oidc.
+
+services:
+  orderd:
+    environment:
+      # THE LINE THIS WHOLE FILE EXISTS FOR.
+      #
+      # AUTH_MODE=oidc is the highest-consequence setting in the repository and, until this
+      # overlay, the only one no automated tier exercised. This service once shipped a build
+      # where the server never called the verifier at all: AUTH_MODE=oidc validated, booted
+      # without warning, and served every request as a full-scope dev principal. Nothing in
+      # the test suite noticed, because nothing ran the real thing.
+      AUTH_MODE: oidc
+      OIDC_ISSUER_URL: "http://keycloak:8080/realms/gomicro"
+      # Without an audience, this service accepts any token the realm ever issued -- including
+      # tokens minted for entirely different applications. config.Validate refuses to start
+      # AUTH_MODE=oidc without it.
+      OIDC_AUDIENCE: orderd
+
+      # REQUIRED HERE, AND REFUSED IN PRODUCTION.
+      #
+      # The verifier rejects an http:// issuer on a non-loopback host, because bearer tokens
+      # and signing keys in cleartext are a wiretap away from full compromise. Loopback is
+      # already exempt -- which covers an in-process test issuer and a laptop pointed at the
+      # published Keycloak port -- but NOT a container reaching another container by name, and
+      # http://keycloak:8080 is the only address that resolves inside this network.
+      #
+      # So it is an explicit opt-in rather than a quiet exemption for development: orderd logs
+      # a warning on every startup with it set, and config.Validate refuses to start at all
+      # when APP_ENV=production. Give Keycloak a certificate before this pattern goes anywhere
+      # real. This flag was added for this file; nothing else in the repository sets it.
+      OIDC_ALLOW_INSECURE_ISSUER: "true"
+    depends_on:
+      keycloak:
+        # Not merely started: orderd fetches JWKS from the issuer, and a Keycloak still
+        # importing its realm answers 404 for the realm that does not exist yet.
+        condition: service_healthy
