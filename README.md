@@ -1545,15 +1545,16 @@ half-build. They are ordered by dependency:
 
 | | What is left | Depends on |
 |---|---|---|
-| 1 | `grpc_client_*` metrics | — |
-| 2 | Trace context carried through the outbox into the consumer | — (largest blast radius: a migration plus the event shape) |
-| 3 | An executable `DELETING.md` — the `profile` tier the plan named | 1, 2 — each changes the subsystem inventory it encodes |
+| 1 | Trace context carried through the outbox into the consumer | — (largest blast radius: a migration plus the event shape) |
+| 2 | An executable `DELETING.md` — the `profile` tier the plan named | 1 — it changes the subsystem inventory that test encodes |
 
-Item 2 is described in full under *Known gaps*.
+Item 1 is described in full under *Known gaps*.
 
 Retention shipped as [`cmd/prune`](cmd/prune/main.go), outbox health as
-[`outbox.Observer`](internal/platform/outbox/observer.go), and OIDC coverage as
-[`test/e2e/oidc`](test/e2e/oidc/oidc_test.go); none are on this list any more.
+[`outbox.Observer`](internal/platform/outbox/observer.go), OIDC coverage as
+[`test/e2e/oidc`](test/e2e/oidc/oidc_test.go), and client metrics as
+[`Metrics.ClientFor`](internal/platform/observability/metrics.go); none are on this list any
+more.
 
 Every "reduced", "split" and "cut" above came out of a review that asked what this template
 over-engineers. [ADR 0002](docs/adr/0002-what-was-cut.md) records what was removed and the two
@@ -1589,13 +1590,18 @@ rather than maintained.
   never acks would pass it forever. The signal that *cannot* be satisfied by a merely-running
   process is the age of the oldest unpublished row. `deploy/k8s/base/worker.yaml` says so at
   the point where the probes would go.
-- **The outbound client has no metrics.** `observability.Metrics` has a `Server` field and no
-  `Client` one, so there are no `grpc_client_*` series. Adding them is a few lines, but the
-  registry uses `MustRegister`, which **panics** on a duplicate — so a fork wiring client
-  metrics must add exactly one `ClientMetrics` to the shared registry, give it the same
-  histogram buckets as the server (otherwise client and server latency are not comparable in
-  PromQL), and note that grpcprom labels carry no target, so two upstreams collapse into one
-  series. Left out rather than half-built, since nothing here calls an upstream yet.
+- **Client metrics are opt-in, and nothing in this repo opts in.** `Options.Metrics` is nil by
+  default and publishes nothing; set it to `app.Metrics()` and each upstream gets its own
+  labelled `grpc_client_*` series. It is not automatic because `Dial` takes a `config.Config`,
+  which carries no registry — and a package-global one is exactly the process-wide mutable
+  state `observability.Metrics` exists to avoid. No call site here sets it, because nothing
+  here calls an upstream.
+- **Client series do not exist until the first call.** The server calls `InitializeMetrics`, so
+  every registered method has a zero-valued series from startup. The client has no equivalent
+  and cannot: nothing declares which methods a client might call. So an alert on
+  `grpc_client_handled_total` for a method never yet called evaluates to *no data* rather than
+  zero, and never fires. Write client alerts with `absent()` or over a recording rule with a
+  default, not on the raw series.
 - **The client is unary-first.** Stream interceptors are wired and the budget bounds how long
   ESTABLISHING a stream may take, but nothing asserts client-stream behaviour end to end.
 - **The trace does not survive the broker.** The relay reads rows from the database, long

@@ -51,6 +51,10 @@ second service was cut from the plan — so removing it costs nothing today.
 - **Wiring:** none. No production code imports it.
 - **Config:** remove `UpstreamConfig` from `internal/platform/config/config.go`, its three
   `UPSTREAM_*` entries in `Parse`, and the `Upstream` block in `Validate`.
+- **Metrics:** remove `Metrics.ClientFor` and the `clients` map from
+  `internal/platform/observability/metrics.go`. Keep `latencyBuckets` — the server histogram
+  still uses it — but its comment explains a client/server comparison that no longer exists, so
+  shorten it rather than leaving a reason for a thing that is gone.
 - **Tests deleted with it:** all of `internal/platform/client/*_test.go`.
 
 ---
