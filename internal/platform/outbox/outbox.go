@@ -48,6 +48,14 @@ type Message struct {
 	Payload []byte
 
 	OccurredAt time.Time
+
+	// TraceParent is the W3C trace context of the request that WROTE this row, captured at
+	// write time by the store adapter and carried as data because there is nothing left to
+	// propagate from by the time the relay runs.
+	//
+	// Empty is normal rather than an error: a row written outside any span -- a backfill, a
+	// migration, a test -- yields an event that simply begins its own trace.
+	TraceParent string
 }
 
 // Publisher sends a message onward.

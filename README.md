@@ -718,6 +718,30 @@ order_counts      still 2
 
 That is the interlock the whole design rests on, observed rather than described.
 
+### The trace crosses the broker
+
+Every other hop in this system propagates trace context in-band — gRPC metadata, an HTTP
+header, something the caller is holding while the callee runs. The outbox is the one place
+where producer and consumer are separated by **time** rather than by a network: the request
+that wrote the row returned long ago, its context is cancelled, and the relay is a different
+process on a timer that has never heard of it.
+
+So the context is stored as data. `orderpg` renders the active span into `outbox.trace_parent`
+at write time — in the adapter, because `internal/order` imports no telemetry SDK and
+`test/layout_test.go` enforces that — the relay selects the column, the publisher sends it as a
+W3C `traceparent` header, and the consumer resumes it and opens a child span. A dead letter
+keeps it too, which is the case where it matters most.
+
+The column is nullable and empty is normal: a row written outside any span simply produces an
+event that begins its own trace.
+
+**Finding it took an end-to-end test, and it found a second defect first.** The same
+`traceparent` sent over both surfaces produced a populated `trace_parent` via gRPC and an empty
+one via REST. grpc-gateway's default header matcher forwards `Grpc-Metadata-*` and a fixed list
+of permanent HTTP headers; W3C Trace Context is on neither, so an instrumented HTTP client's
+trace was discarded at the edge while the gRPC path worked perfectly — which is why every
+existing test passed. `internal/gateway` now forwards `traceparent` and `tracestate` explicitly.
+
 ### Watching the outbox
 
 Two failures here are completely silent from outside the process. A **quarantined** row — one
@@ -1545,16 +1569,14 @@ half-build. They are ordered by dependency:
 
 | | What is left | Depends on |
 |---|---|---|
-| 1 | Trace context carried through the outbox into the consumer | — (largest blast radius: a migration plus the event shape) |
-| 2 | An executable `DELETING.md` — the `profile` tier the plan named | 1 — it changes the subsystem inventory that test encodes |
+| 1 | An executable `DELETING.md` — the `profile` tier the plan named | — |
 
-Item 1 is described in full under *Known gaps*.
-
-Retention shipped as [`cmd/prune`](cmd/prune/main.go), outbox health as
+That is the last item. Everything else on this list has shipped: retention as
+[`cmd/prune`](cmd/prune/main.go), outbox health as
 [`outbox.Observer`](internal/platform/outbox/observer.go), OIDC coverage as
-[`test/e2e/oidc`](test/e2e/oidc/oidc_test.go), and client metrics as
-[`Metrics.ClientFor`](internal/platform/observability/metrics.go); none are on this list any
-more.
+[`test/e2e/oidc`](test/e2e/oidc/oidc_test.go), client metrics as
+[`Metrics.ClientFor`](internal/platform/observability/metrics.go), and trace propagation
+through the broker as [`outbox.trace_parent`](internal/platform/migrations/00005_outbox_trace.sql).
 
 Every "reduced", "split" and "cut" above came out of a review that asked what this template
 over-engineers. [ADR 0002](docs/adr/0002-what-was-cut.md) records what was removed and the two
@@ -1604,10 +1626,11 @@ rather than maintained.
   default, not on the raw series.
 - **The client is unary-first.** Stream interceptors are wired and the budget bounds how long
   ESTABLISHING a stream may take, but nothing asserts client-stream behaviour end to end.
-- **The trace does not survive the broker.** The relay reads rows from the database, long
-  after the request that produced them finished, so events carry no `traceparent`. Propagating
-  it means storing the trace context in the outbox row at write time — a real change to the
-  domain's event shape, not a header the relay can invent.
+- **The consumer's span is a child, not a link.** One event maps to one causing request here,
+  so the projection lands on the same waterfall as the RPC — which is what you want when asking
+  why *this* order's read model is stale. A fan-out consumer that handles many messages per
+  span should use a link instead; that is the standard advice, and it is the wrong shape for
+  this one. See `dispatch` in `internal/platform/events/consumer.go`.
 - **Streams have no admission control.** They are bounded only by
   `grpc.MaxConcurrentStreams`; a long-lived watch holding a concurrency slot sized for the
   database pool would be worse than not limiting it. A fork adding streaming work that

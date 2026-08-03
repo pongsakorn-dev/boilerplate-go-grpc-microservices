@@ -81,6 +81,13 @@ type outboxRow struct {
 	Payload     []byte     `gorm:"column:payload;type:jsonb"`
 	OccurredAt  time.Time  `gorm:"column:occurred_at"`
 	PublishedAt *time.Time `gorm:"column:published_at"`
+
+	// TraceParent is the W3C trace context of the request that wrote this row.
+	//
+	// Stored rather than propagated, because the relay that publishes this event runs later in
+	// another process and has nothing left to propagate from. Empty when there was no active
+	// span, which is valid and yields an event that starts its own trace.
+	TraceParent string `gorm:"column:trace_parent"`
 }
 
 func (outboxRow) TableName() string { return "outbox" }

@@ -492,3 +492,61 @@ func TestClearingFailedAtReplaysAQuarantinedRow(t *testing.T) {
 		t.Error("the replayed row was not marked published")
 	}
 }
+
+// TestTheRelayCarriesTheTraceParent covers the middle link of trace propagation, which is the
+// one with no other test standing behind it.
+//
+// orderpg's test proves the trace is WRITTEN; events' test proves a message carrying one is
+// resumed by the consumer. Between them sits the claim query, and it is a plain SELECT column
+// list -- exactly the kind of thing a later edit drops without any test noticing, because both
+// neighbours keep passing. The trace would then vanish silently at the one hop where nothing
+// else can recover it.
+func TestTheRelayCarriesTheTraceParent(t *testing.T) {
+	db := newDB(t)
+
+	const traceParent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+
+	_, err := db.Exec(`
+		INSERT INTO outbox (tenant_id, aggregate_id, event_type, payload, occurred_at, trace_parent)
+		VALUES ('acme', gen_random_uuid(), 'order.created', '{}'::jsonb, now(), $1)`, traceParent)
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	rec := &recordingPublisher{}
+	relay := outbox.NewRelay(db, rec, discard())
+
+	if _, err := relay.DrainOnce(context.Background()); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+
+	published := rec.published()
+	if len(published) != 1 {
+		t.Fatalf("the relay published %d messages, want 1", len(published))
+	}
+	if got := published[0].TraceParent; got != traceParent {
+		t.Errorf("the relay published TraceParent %q, want %q.\n\n"+
+			"The claim query is not selecting trace_parent, so the trace is dropped between "+
+			"the row and the broker -- at the one hop where there is nothing left to recover "+
+			"it from.", got, traceParent)
+	}
+}
+
+// recordingPublisher captures what the relay handed onward.
+type recordingPublisher struct {
+	mu   sync.Mutex
+	msgs []outbox.Message
+}
+
+func (p *recordingPublisher) Publish(_ context.Context, m outbox.Message) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.msgs = append(p.msgs, m)
+	return nil
+}
+
+func (p *recordingPublisher) published() []outbox.Message {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]outbox.Message(nil), p.msgs...)
+}

@@ -10,6 +10,12 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/example/gomicro/internal/platform/config"
 )
 
@@ -30,6 +36,14 @@ type Event struct {
 	// reasons that have nothing to do with whether the effect landed, and that decision
 	// belongs to the deduplication table.
 	Deliveries uint64
+
+	// TraceParent is the W3C trace context of the request that originally caused this event.
+	//
+	// A Handler does not normally need to read it: dispatch has already put it in the handler's
+	// context, so a span started there is a child of the original request and a log line
+	// carries its trace id. It is on the struct so a dead letter can preserve it -- a
+	// dead-lettered event whose trace ends at the DLQ is the one you most want to follow back.
+	TraceParent string
 }
 
 // Handler applies an event.
@@ -142,7 +156,40 @@ func (c *Consumer) dispatch(ctx context.Context, msg jetstream.Msg) {
 	hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.cfg.AckWait)
 	defer cancel()
 
+	// RESUME THE TRACE THE EVENT CAME FROM, then open a span for the handling.
+	//
+	// Extract alone would be enough to correlate logs -- the handler's context would carry the
+	// original trace id. The span is what makes it a trace rather than a coincidence: without
+	// one, the gap between "the RPC returned" and "the projection updated" is invisible, and
+	// that gap is the entire latency of the asynchronous path.
+	//
+	// The span is a CHILD of the request that wrote the outbox row, not a link. That is a real
+	// choice: a link would model these as separate traces that reference each other, which is
+	// the usual advice for batch consumers where one span handles many messages. Here one
+	// message maps to one causing request, so a child span puts the projection on the same
+	// waterfall as the RPC -- which is the view somebody actually wants when asking why a read
+	// model is stale.
+	hctx = propagation.TraceContext{}.Extract(hctx, propagation.MapCarrier{
+		HeaderTraceParent: e.TraceParent,
+	})
+
+	hctx, span := otel.Tracer("gomicro/events").Start(hctx, "consume "+e.Type,
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(
+			attribute.String("messaging.message.id", e.ID),
+			attribute.String("messaging.destination.name", c.cfg.Stream),
+			attribute.String("event.type", e.Type),
+			attribute.String("tenant.id", e.TenantID),
+			attribute.Int64("messaging.message.delivery_count", int64(e.Deliveries)),
+		))
+
 	err = c.handler.Handle(hctx, e)
+
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	span.End()
 
 	switch {
 	case err == nil:
@@ -240,6 +287,7 @@ func eventFrom(msg jetstream.Msg, md *jetstream.MsgMetadata) Event {
 		AggregateID: h.Get(HeaderAggregateID),
 		Payload:     msg.Data(),
 		Deliveries:  md.NumDelivered,
+		TraceParent: h.Get(HeaderTraceParent),
 	}
 
 	if t, err := time.Parse(time.RFC3339Nano, h.Get(HeaderOccurredAt)); err == nil {
