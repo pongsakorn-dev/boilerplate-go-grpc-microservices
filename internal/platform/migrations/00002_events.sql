@@ -45,9 +45,10 @@ CREATE TABLE processed_events (
     PRIMARY KEY (consumer, message_id)
 );
 
--- Supports pruning, which this template does not ship.
+-- Supports pruning, which cmd/prune does (added in a later milestone, with migration 00003).
 --
--- Said plainly rather than left implicit: processed_events grows forever. It only needs to
+-- Said plainly rather than left implicit: processed_events grows forever unless something
+-- deletes from it. It only needs to
 -- outlive the stream's retention (NATS_STREAM_MAX_AGE), because a message the broker has
 -- dropped can never be redelivered, so DELETE FROM processed_events WHERE processed_at <
 -- now() - interval '8 days' is a safe periodic job for the shipped 7-day default.

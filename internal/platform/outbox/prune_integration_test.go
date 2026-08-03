@@ -225,14 +225,27 @@ func TestPrunedQueriesUseTheirIndexes(t *testing.T) {
 	db := newDB(t)
 	now := time.Now()
 
+	const (
+		recent    = 2000
+		aged      = 20
+		retention = 24 * time.Hour
+	)
+
 	// The window: rows too recent to prune. Enough of them that a sequential scan is
 	// expensive, because on a tiny table Postgres correctly ignores every index.
-	for i := range 2000 {
-		insertOutbox(t, db, now.Add(-time.Duration(i)*time.Minute), outboxState{published: true})
-		insertProcessed(t, db, "c", fmt.Sprintf("recent-%d", i), now.Add(-time.Duration(i)*time.Minute))
+	//
+	// SECONDS, NOT MINUTES. At one minute apart these 2000 rows would span 33 hours, so 559 of
+	// them would fall past a 24-hour cutoff -- making 28% of the table eligible and the fixture
+	// the opposite of the shape the comment above describes. Seconds keep the whole window
+	// inside half an hour. (Written as minutes first; the assertion below is what would have
+	// caught it, and is why the assertion exists rather than the comment alone.)
+	for i := range recent {
+		at := now.Add(-time.Duration(i) * time.Second)
+		insertOutbox(t, db, at, outboxState{published: true})
+		insertProcessed(t, db, "c", fmt.Sprintf("recent-%d", i), at)
 	}
 	// The thin slice that has aged out.
-	for i := range 20 {
+	for i := range aged {
 		insertOutbox(t, db, now.AddDate(0, 0, -30), outboxState{published: true})
 		insertProcessed(t, db, "c", fmt.Sprintf("aged-%d", i), now.AddDate(0, 0, -30))
 	}
@@ -240,7 +253,29 @@ func TestPrunedQueriesUseTheirIndexes(t *testing.T) {
 		t.Fatalf("analyze: %v", err)
 	}
 
-	cutoff := now.Add(-24 * time.Hour)
+	cutoff := now.Add(-retention)
+
+	// THE FIXTURE ASSERTS ITS OWN SHAPE, because a data-shape comment is exactly the kind of
+	// claim that rots without anything failing.
+	//
+	// Every planner assertion below is conditional on the eligible set being a thin slice: at
+	// high selectivity a sequential scan IS the cheapest plan and Postgres is right to choose
+	// one, so a drifted fixture would not fail here -- it would quietly stop testing the index
+	// while still reporting PASS.
+	var eligible int
+	err := db.QueryRow(
+		`SELECT count(*) FROM outbox WHERE published_at IS NOT NULL AND published_at < $1`,
+		cutoff).Scan(&eligible)
+	if err != nil {
+		t.Fatalf("count eligible rows: %v", err)
+	}
+	if eligible != aged {
+		t.Fatalf("%d of %d outbox rows are past the cutoff, want exactly %d.\n\n"+
+			"The fixture is not the steady state it claims to be. At this selectivity a "+
+			"sequential scan may legitimately be the cheapest plan, so the index assertions "+
+			"below would pass or fail for reasons that have nothing to do with the index.",
+			eligible, recent+aged, aged)
+	}
 
 	for _, tc := range []struct{ name, query, index string }{
 		{

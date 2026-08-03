@@ -178,19 +178,58 @@ property, whatever its README says.
   `prune` targets from `deploy/docker/Dockerfile` and `Taskfile.yml`'s `docker:build`. Also
   remove the `db:prune` and `db:prune:dry-run` targets.
 
-**Keeping the outbox but not the pruning** is a supported halfway house, and it is the one
-worth naming: delete `cmd/prune/`, `internal/platform/outbox/prune.go`, the CronJob, the
-`RETENTION_*` config and the Dockerfile target, and keep everything else. You then own the fact
-that both tables grow without bound — which is fine for a service that publishes a few thousand
-events a day and is not fine for one that publishes a few thousand a second.
+### Two halfway houses
 
-**Keeping the outbox but not its metrics** is the other one. Delete
-`internal/platform/outbox/observer.go`, `00004_outbox_observability.sql`, the
-`OUTBOX_OBSERVE_INTERVAL` field, and the observer goroutine, admin listener and registry in
-`cmd/worker/main.go` — which returns that binary to opening no listener at all, so also drop
-the `admin` port and `ADMIN_ADDR` from `worker.yaml` and compose. Understand what you are
-giving up first: a quarantined row and a wedged relay both become invisible again, and the
-worker has no probes precisely because those metrics were the alternative.
+Both keep the outbox and drop one thing built on it. Neither is covered by
+`task verify:profile`: that test walks the numbered sections' **Delete** bullets, and these are
+prose. So they are the instructions here most likely to rot, and the lists below were verified
+by executing them once by hand.
+
+> [!WARNING]
+> The first drafts of both paragraphs left the repository **unable to compile**, because neither
+> named the test files referencing the deleted code. `go test ./...` failed on
+> `TestTaskTargetsReferenceRealPaths` before any build tag was involved. If you edit these, run
+> `go build ./... && go test ./...` **and** `task lint` afterwards — the latter compiles the
+> tagged tiers, which is where the leftovers hide.
+
+**Keeping the outbox but not the pruning.** Delete `cmd/prune/`,
+`internal/platform/outbox/prune.go`, `internal/platform/migrations/00003_retention.sql`,
+`deploy/k8s/base/prune-cronjob.yaml` and its line in `kustomization.yaml`, the `prune` target in
+`deploy/docker/Dockerfile`, and the `prune` line in `Taskfile.yml`'s `docker:build`. Then:
+
+- **Taskfile:** also remove the `db:prune` and `db:prune:dry-run` targets.
+  `test/taskpaths_test.go` runs in the DEFAULT tier and fails when a target names a path that no
+  longer exists.
+- **Config:** remove `RetentionConfig`, the `Retention` field, the `RETENTION_*` entries in
+  `Parse`, and the retention block in `Validate` — including the check that
+  `RETENTION_PROCESSED_EVENTS` exceeds `NATS_STREAM_MAX_AGE`, which then has nothing left to
+  protect. Its cases in `internal/platform/config/config_test.go` go too.
+- **Tests:** delete `internal/platform/outbox/prune_integration_test.go` — **but move
+  `outboxState`, `insertOutbox`, `explain` and `containsAny` out of it first.**
+  `observer_integration_test.go` is their only other user and will not compile without them.
+  This is the step both earlier drafts of this paragraph missed.
+
+You then own the fact that both tables grow without bound — fine for a service publishing a few
+thousand events a day, not fine for one publishing a few thousand a second.
+
+**Keeping the outbox but not its metrics.** Delete `internal/platform/outbox/observer.go`,
+`internal/platform/migrations/00004_outbox_observability.sql` and
+`internal/platform/outbox/observer_integration_test.go`. Then:
+
+- **Wiring:** in `cmd/worker/main.go` remove the observer goroutine, the registry and the admin
+  server — returning that binary to opening no listener at all — and the imports that leaves
+  unused.
+- **Config:** remove `OutboxConfig.ObserveInterval` and its `OUTBOX_OBSERVE_INTERVAL` entry.
+- **Deploy:** drop the `admin` port, `ADMIN_ADDR` and `POD_IP` from
+  `deploy/k8s/base/worker.yaml`, and the `9091:9090` mapping plus `ADMIN_ADDR` and
+  `OUTBOX_OBSERVE_INTERVAL` from compose. Remove `9091` from `requireFreePorts` in
+  `test/e2e/compose_test.go`, and delete `TestTheWorkerExposesOutboxHealth` and
+  `TestQuarantinedRowsBecomeVisible` from `test/e2e/events_test.go`.
+- **Metrics:** `observability.NewProcessRegistry` loses its only caller. Keep it or delete it,
+  but do not leave its doc comment claiming `cmd/worker` uses it.
+
+Understand what you are giving up: a quarantined row and a wedged relay both become invisible
+again, and the worker has no probes precisely because those metrics were the alternative.
 
 ---
 
@@ -241,8 +280,6 @@ JWT verification, the JWKS cache, and the hostile-issuer test suite.
 - **Taskfile:** `verify:e2e` passes `-p 1` only because two e2e packages publish the same host
   ports. With `test/e2e/oidc/` gone there is one package left and the flag is no longer needed,
   though leaving it costs nothing.
-- **Config:** remove `OIDCConfig`, the `OIDC` field, its `OIDC_*` entries, and the
-  `AUTH_MODE=oidc` block in `Validate`.
 - **Dependencies:** `github.com/golang-jwt/jwt/v5` leaves `go.mod`.
 - **Compose:** remove the `keycloak` service and the `auth` profile.
 

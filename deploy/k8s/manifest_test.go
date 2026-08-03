@@ -22,6 +22,7 @@ package k8s
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 	"time"
 
@@ -69,6 +70,15 @@ type container struct {
 		Requests map[string]string `yaml:"requests"`
 		Limits   map[string]string `yaml:"limits"`
 	} `yaml:"resources"`
+
+	Env []envVar `yaml:"env"`
+}
+
+// envVar is one entry of a container's env list. Order matters -- see
+// TestEnvVarReferencesAreDeclaredBeforeUse.
+type envVar struct {
+	Name  string `yaml:"name"`
+	Value string `yaml:"value"`
 }
 
 type probe struct {
@@ -339,6 +349,63 @@ func TestAdminPortIsNotInTheService(t *testing.T) {
 			t.Errorf("the Service exposes the admin port (%s/%d).\n\n"+
 				"It carries /metrics and /debug/pprof. Anything in the cluster that can resolve "+
 				"this Service could then dump the heap.", p.Name, p.Port)
+		}
+	}
+}
+
+// envVarRef matches a $(VAR) reference in an env value.
+var envVarRef = regexp.MustCompile(`\$\(([A-Za-z_][A-Za-z0-9_]*)\)`)
+
+// TestEnvVarReferencesAreDeclaredBeforeUse catches a forward reference the kubelet silently
+// leaves unexpanded.
+//
+// # The bug this was written for
+//
+// Both Deployments read the pod IP into ADMIN_ADDR so the admin surface binds somewhere a
+// cluster-local scraper can reach and nothing outside can:
+//
+//   - name: ADMIN_ADDR
+//     value: "$(POD_IP):9090"
+//   - name: POD_IP
+//     valueFrom: {fieldRef: {fieldPath: status.podIP}}
+//
+// That is broken, and it shipped. The kubelet expands $(VAR) in a single IN-ORDER pass over
+// the container's env list, resolving each entry against only the variables defined BEFORE it;
+// an unresolved reference is left in the string verbatim rather than reported. So the container
+// receives ADMIN_ADDR="$(POD_IP):9090" literally, net.Listen rejects it, and the admin listener
+// never binds -- no /metrics, no pprof, and no error that names the cause.
+//
+// # Why nothing else caught it
+//
+// The end-to-end tier runs the full stack and scrapes the worker's /metrics successfully,
+// because compose sets ADMIN_ADDR to a literal 0.0.0.0:9090. The only environment that performs
+// this expansion is Kubernetes, and no test had ever started one. `kubectl kustomize` builds
+// the manifest happily too -- the reference is valid YAML and valid k8s; it is only the ORDER
+// that is wrong, and nothing in the toolchain checks order.
+//
+// So the guard is here, where it costs nothing and reads the shipped file.
+func TestEnvVarReferencesAreDeclaredBeforeUse(t *testing.T) {
+	t.Parallel()
+
+	for name, d := range everyDeployment(t) {
+		for _, c := range d.Spec.Template.Spec.Containers {
+			declared := map[string]bool{}
+
+			for _, e := range c.Env {
+				for _, m := range envVarRef.FindAllStringSubmatch(e.Value, -1) {
+					ref := m[1]
+					if declared[ref] {
+						continue
+					}
+					t.Errorf("base/%s: container %q sets %s=%q, but %s is not declared until "+
+						"AFTER it in the same env list.\n\n"+
+						"The kubelet expands $(VAR) against earlier entries only, and leaves an "+
+						"unresolved reference in place verbatim -- so this container starts with "+
+						"the literal string %q. Move %s above %s.",
+						name, c.Name, e.Name, e.Value, ref, e.Value, ref, e.Name)
+				}
+				declared[e.Name] = true
+			}
 		}
 	}
 }
