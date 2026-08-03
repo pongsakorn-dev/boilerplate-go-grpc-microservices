@@ -166,9 +166,16 @@ tasks:
       - go run ./cmd/devtool race
 
   lint:
-    desc: golangci-lint
+    desc: golangci-lint, including every build-tagged tier
     cmds:
-      - go run {{.GOLANGCI}} run
+      # --build-tags IS REQUIRED, and its absence hid four tiers from the linter entirely.
+      #
+      # golangci-lint only analyses files that satisfy the current build constraints, so with
+      # no tags the e2e, integration, codegen, rename and profile suites -- roughly a third of
+      # the test code, and the part that runs least often -- were never linted at all. Two
+      # errorlint findings had been sitting in test/e2e since M10 and surfaced the first time
+      # anyone passed the flag.
+      - go run {{.GOLANGCI}} run --build-tags=e2e,integration,codegen,rename,profile
 
   fmt:
     desc: Format all Go code

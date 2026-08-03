@@ -1,6 +1,8 @@
 package test
 
 import (
+	"bytes"
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -8,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/example/gomicro/internal/testutil"
 )
@@ -161,4 +164,68 @@ func TestPinnedToolsBuild(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestGoModIsTidy catches manifest drift, which is invisible until it misleads somebody.
+//
+// # What actually went wrong
+//
+// This repository ran for eleven milestones with `gorm.io/gorm`, `gorm.io/driver/postgres`,
+// `github.com/jackc/pgx/v5`, `github.com/testcontainers/testcontainers-go`,
+// `github.com/nats-io/nats.go`, `github.com/nats-io/nats-server/v2`,
+// `github.com/pressly/goose/v3`, `github.com/redis/go-redis/v9`,
+// `github.com/alicebob/miniredis/v2` and `github.com/golang-jwt/jwt/v5` all marked `// indirect`
+// in go.mod -- while being imported directly by its own code. Nothing detected it. It surfaced
+// only because an unrelated change needed `go mod tidy`, which then swept up twenty-four lines
+// of unrelated churn into a test-backfill diff.
+//
+// The `// indirect` marker is what a reader uses to answer "what did WE choose to depend on?",
+// which is the first question in any dependency review and the one this repo's own rules turn
+// on -- see TestBannedToolsAreNotToolDependencies above, and the README's argument for keeping
+// buf and go-task out of the module graph. A manifest where that marker lies makes the answer
+// wrong for everybody who reads it afterwards.
+//
+// # Why -diff rather than running tidy and diffing by hand
+//
+// `go mod tidy -diff` computes exactly what tidy would write and exits non-zero without
+// touching anything, so this guard cannot leave a modified go.mod behind on a failure -- which
+// a copy-run-compare version would, on the run where it fails, in a working tree somebody is
+// mid-change on.
+func TestGoModIsTidy(t *testing.T) {
+	t.Parallel()
+
+	root := testutil.RepoRoot(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "go", "mod", "tidy", "-diff")
+	cmd.Dir = root
+
+	// GOPROXY=off keeps this in the default tier honestly.
+	//
+	// tidy resolves the module graph, and against a cold cache it would reach the network --
+	// which the default tier promises never to need. With the cache warm it does not, and with
+	// the proxy off a cold cache fails loudly as a cache problem rather than silently becoming
+	// a network test.
+	cmd.Env = append(os.Environ(), "GOPROXY=off", "GOFLAGS=-mod=mod")
+
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return // tidy would change nothing
+	}
+
+	// A non-zero exit with no diff means tidy itself failed -- most likely a cold module
+	// cache with the proxy off. That is a broken environment, not drift, and saying which
+	// saves somebody a confusing half hour.
+	if len(bytes.TrimSpace(out)) == 0 {
+		t.Skipf("`go mod tidy -diff` could not run (%v); the module cache is probably cold. "+
+			"Run `go mod download` and try again.", err)
+	}
+
+	t.Errorf("go.mod or go.sum is not tidy:\n\n%s\n\n"+
+		"Run `go mod tidy`. The usual cause is a dependency that is used directly but still "+
+		"marked `// indirect` -- which makes go.mod misreport what this repository actually "+
+		"chose to depend on, and that marker is the first thing anyone reviewing dependencies "+
+		"reads.", string(out))
 }

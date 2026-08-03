@@ -30,6 +30,8 @@ import (
 //
 // Measured by hand during M10 at 5.7s against a 30s timeout. This is that measurement, executed.
 func TestSigtermReachesTheProcessAndItDrains(t *testing.T) {
+	requireStack(t)
+
 	// Restart it afterwards: later tests in this package share the stack.
 	t.Cleanup(func() { restart(t, "orderd") })
 
@@ -99,6 +101,8 @@ func TestSigtermReachesTheProcessAndItDrains(t *testing.T) {
 //
 // WatchOrders is server-streaming, so it is genuinely still open when the stop begins.
 func TestAnInFlightRequestSurvivesShutdown(t *testing.T) {
+	requireStack(t)
+
 	t.Cleanup(func() { restart(t, "orderd") })
 
 	client := dialGRPC(t)

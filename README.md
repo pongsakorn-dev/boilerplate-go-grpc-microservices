@@ -293,7 +293,7 @@ compile-time guarantee. That is the only way `go test ./...` is safe with Docker
 | Codegen | `task verify:codegen` | network | **17.6s** — regenerates and byte-compares |
 | Profile | `task verify:profile` | none | **17s** — executes [`docs/DELETING.md`](docs/DELETING.md): removes each optional subsystem in the documented order and rebuilds after each |
 | Integration | `task verify:int` | Docker | **20s** with the image cached. **Skips**, never fails, without Docker |
-| End-to-end | `task verify:e2e` | Docker + compose | **~140s** — the shipped images and compose file, real SIGTERM, and a second stack running `AUTH_MODE=oidc` against a real Keycloak |
+| End-to-end | `task verify:e2e` | Docker + compose | **~140s** — the shipped images and compose file, real SIGTERM, and a second stack running `AUTH_MODE=oidc` against a real Keycloak. **Skips visibly**, never fails, without Docker |
 <!-- fork-tool:begin -->
 | Rename | `task verify:rename` | none | **26s** — renames a copy of this repo, then builds and tests it |
 <!-- fork-tool:end -->
@@ -332,6 +332,8 @@ merely to pass today:
 | `TestRootLicenseNamesItsCopyrightHolder` | The root LICENSE losing its copyright holder to a rename substitution |
 | `TestEveryTenantScopedTableHasAGuardedModel` | A new tenant table whose model forgot `TenantColumn`, so every query silently returns every tenant's rows |
 | `TestNoExemptionOutlivesItsTable` | That guard's allowlist outliving the table it excuses |
+| `TestGoModIsTidy` | `go.mod` misreporting what this repo depends on — a direct dependency left marked `// indirect` |
+| `TestEveryEndToEndTestSkipsWhenTheStackIsMissing` | An e2e test that runs against a stack nobody started, instead of skipping |
 | `TestTaskTargetsReferenceRealPaths` | A task target pointing at a file that does not exist |
 | `TestBannedToolsAreNotToolDependencies` | A build tool entering the production module graph |
 | `TestErrorsAreMappedBeforeLoggingObservesThem` | Interceptor order regressing to `codes.Unknown` |

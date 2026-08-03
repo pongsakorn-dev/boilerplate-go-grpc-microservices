@@ -30,6 +30,8 @@ import (
 // NATS_URL, a stream the consumer's filter does not match, a worker that never started -- looks
 // identical from outside: the order is created, and the read model silently never updates.
 func TestTheEventPathReachesTheProjection(t *testing.T) {
+	requireStack(t)
+
 	before := orderCount(t, "dev-tenant")
 
 	const n = 3
@@ -73,6 +75,8 @@ func TestTheEventPathReachesTheProjection(t *testing.T) {
 // one subject and consumed from another that happened to overlap. Asking NATS directly is the
 // independent check.
 func TestTheStreamHoldsWhatWasPublished(t *testing.T) {
+	requireStack(t)
+
 	createOrder(t, "E2E-STREAM-1")
 
 	waitFor(t, "the EVENTS stream to receive a message", 60*time.Second, func() (bool, string) {
@@ -170,6 +174,8 @@ func orderCount(t *testing.T, tenant string) int {
 // be correct, and be visible to nobody. Only a test that scrapes from outside the container
 // can tell those two states apart.
 func TestTheWorkerExposesOutboxHealth(t *testing.T) {
+	requireStack(t)
+
 	body := scrapeWorkerMetrics(t)
 
 	// The three series an operator alerts on, named exactly. A rename silently breaks every
@@ -203,6 +209,8 @@ func TestTheWorkerExposesOutboxHealth(t *testing.T) {
 // what is under test here is the observability path -- database to gauge to scrape -- not the
 // relay's decision to quarantine, which relay_integration_test.go already covers.
 func TestQuarantinedRowsBecomeVisible(t *testing.T) {
+	requireStack(t)
+
 	// Start from whatever the stack already has, since earlier tests share it.
 	before := metricValue(t, scrapeWorkerMetrics(t), "gomicro_outbox_quarantined_rows")
 
@@ -288,6 +296,8 @@ func metricValue(t *testing.T, exposition, name string) float64 {
 // its parent's SpanContext, which is exactly the property that makes tracing safe to leave
 // instrumented everywhere and exported nowhere.
 func TestTheTraceReachesTheOutboxRow(t *testing.T) {
+	requireStack(t)
+
 	// A fixed, recognisable trace id, in W3C form: version-traceid-spanid-flags. The 01 flag
 	// says sampled, which is what makes a downstream propagator keep it.
 	const traceID = "4bf92f3577b34da6a3ce929d0e0e4736"

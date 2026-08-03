@@ -96,6 +96,8 @@ func createOrder(t *testing.T, sku string) string {
 // TestTheStackServesTrafficOverBothSurfaces is the baseline: the real images, wired by the real
 // compose file, answer on both ports.
 func TestTheStackServesTrafficOverBothSurfaces(t *testing.T) {
+	requireStack(t)
+
 	id := createOrder(t, "E2E-SKU-1")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -122,6 +124,8 @@ func TestTheStackServesTrafficOverBothSurfaces(t *testing.T) {
 // still pass -- the in-memory store satisfies the same contract. The difference only shows up
 // as data that vanishes on restart, which is exactly the failure a deployment test should catch.
 func TestThePersistedStoreIsReallyPostgres(t *testing.T) {
+	requireStack(t)
+
 	id := createOrder(t, "E2E-SKU-PERSIST")
 
 	out := psql(t, fmt.Sprintf("SELECT count(*) FROM orders WHERE id = '%s'", id))
@@ -148,6 +152,8 @@ func psql(t *testing.T, query string) string {
 // against an empty schema and fail its first query, intermittently, depending on which
 // container won.
 func TestMigrationsRanBeforeTheServerAccepted(t *testing.T) {
+	requireStack(t)
+
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 
@@ -228,6 +234,8 @@ func highestMigrationVersion(t *testing.T) string {
 // service cannot be turned into a shell by the usual means. It is one `FROM` line away from
 // being untrue, and nothing else in the repository would notice.
 func TestTheImageHasNoShell(t *testing.T) {
+	requireStack(t)
+
 	for _, shell := range []string{"/bin/sh", "/bin/bash", "/busybox/sh"} {
 		t.Run(shell, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
@@ -289,6 +297,8 @@ func imageRef(t *testing.T, service string) string {
 // service directly. The only way to catch it is to check that the command DISTINGUISHES: it
 // must succeed against a serving process and fail against nothing.
 func TestTheHealthCommandDiscriminates(t *testing.T) {
+	requireStack(t)
+
 	// It succeeds where a server is running -- the running container, probing itself exactly
 	// as the compose healthcheck does.
 	if out := composeExec(t, "orderd", "/orderd", "-health"); !strings.Contains(out, "SERVING") {

@@ -58,10 +58,30 @@ const (
 	realmURL = "http://keycloak:8080/realms/gomicro"
 )
 
+// unavailable explains why the stack could not be started, or is nil.
+//
+// See the sibling e2e package for the full reasoning: an early os.Exit(0) makes `go test` print
+// "ok" for a tier that ran nothing, which reads exactly like a pass -- and here it would hide
+// the only automated check that AUTH_MODE=oidc verifies anything at all.
+var unavailable error
+
+// requireStack skips the calling test when the OIDC stack is not running. Every test in this
+// package must call it first; test/e2e/skips_test.go enforces that for both packages.
+func requireStack(t *testing.T) {
+	t.Helper()
+
+	if unavailable != nil {
+		t.Skipf("the OIDC compose stack is not available: %v", unavailable)
+	}
+}
+
 func TestMain(m *testing.M) {
 	if err := requireDocker(); err != nil {
 		fmt.Fprintf(os.Stderr, "e2e/oidc: %v\n", err)
-		os.Exit(0) // skip, not fail
+
+		// Run the tests anyway, so each one reports SKIP instead of the package reporting ok.
+		unavailable = err
+		os.Exit(m.Run())
 	}
 
 	down()
@@ -96,6 +116,8 @@ func TestMain(m *testing.M) {
 // authenticating anybody, whatever AUTH_MODE says and whatever its unit tests prove about the
 // verifier in isolation.
 func TestAnAnonymousCallIsRefused(t *testing.T) {
+	requireStack(t)
+
 	client := orderv1.NewOrderServiceClient(dial(t))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -116,6 +138,8 @@ func TestAnAnonymousCallIsRefused(t *testing.T) {
 // Keycloak signs, orderd fetches JWKS from the issuer, validates signature, issuer, audience
 // and expiry, maps claims to a principal, and the policy grants orders:write.
 func TestARealServiceTokenIsAccepted(t *testing.T) {
+	requireStack(t)
+
 	token := serviceToken(t)
 	client := orderv1.NewOrderServiceClient(dial(t))
 
@@ -152,6 +176,8 @@ func TestARealServiceTokenIsAccepted(t *testing.T) {
 // it proves the policy is read from the token's scopes rather than from the fact that a token
 // was present at all -- authenticated-therefore-authorized being the usual way this breaks.
 func TestScopesAreEnforcedAcrossTheRealBoundary(t *testing.T) {
+	requireStack(t)
+
 	token := userToken(t, "alice", "alice")
 	client := orderv1.NewOrderServiceClient(dial(t))
 
@@ -184,6 +210,8 @@ func TestScopesAreEnforcedAcrossTheRealBoundary(t *testing.T) {
 // TestAGarbageTokenIsRefused covers the other direction: something that LOOKS like a
 // credential must not be treated as one.
 func TestAGarbageTokenIsRefused(t *testing.T) {
+	requireStack(t)
+
 	client := orderv1.NewOrderServiceClient(dial(t))
 
 	for _, tc := range []struct{ name, token string }{
@@ -213,6 +241,8 @@ func TestAGarbageTokenIsRefused(t *testing.T) {
 // The compose healthcheck (`orderd -health`) exercises the same path, so the stack reaching
 // "healthy" at all is itself part of this assertion.
 func TestHealthStaysPublicUnderOIDC(t *testing.T) {
+	requireStack(t)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -354,7 +384,7 @@ func requireDocker() error {
 	defer cancel()
 
 	if err := exec.CommandContext(ctx, "docker", "info").Run(); err != nil {
-		return fmt.Errorf("no Docker daemon; skipping the OIDC e2e tier (%v)", err)
+		return fmt.Errorf("no Docker daemon; skipping the OIDC e2e tier: %w", err)
 	}
 	return nil
 }

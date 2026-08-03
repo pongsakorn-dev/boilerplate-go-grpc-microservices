@@ -323,10 +323,7 @@ func TestRunDrainsABacklogAndStops(t *testing.T) {
 	go func() { done <- relay.Run(ctx, time.Hour) }()
 
 	deadline := time.After(5 * time.Second)
-	for {
-		if unpublishedCount(t, db) == 0 {
-			break
-		}
+	for unpublishedCount(t, db) != 0 {
 		select {
 		case <-deadline:
 			t.Fatalf("the backlog did not clear: %d rows still unpublished.\n\n"+
