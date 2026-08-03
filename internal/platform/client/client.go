@@ -19,6 +19,22 @@
 //	                     accident. See Error.
 //	tracing              otelgrpc as a StatsHandler, matching the server, so a trace crosses
 //	                     the hop.
+//	metrics              grpc_client_* labelled by upstream, sharing the server's histogram
+//	                     buckets so the two ends of a hop are comparable. Opt-in: see below.
+//
+// # Wiring the metrics
+//
+// Options.Metrics is nil by default and publishes nothing. Pass the app's shared registry and
+// each upstream gets its own labelled series:
+//
+//	opts := client.New(cfg, "dns:///inventory:50051")
+//	opts.Metrics = app.Metrics()
+//	conn, err := client.Dial(cfg, opts)
+//
+// One line, and without it you can see that your service is slow but not that its upstream is.
+// It is opt-in rather than automatic because Dial takes a config.Config, which carries no
+// registry -- and a package-global one is exactly the process-wide mutable state
+// observability.Metrics exists to avoid.
 //
 // # It has no production call site yet
 //
@@ -85,6 +101,19 @@ type Options struct {
 	// MaxRecvBytes bounds a response. Zero uses the server's own limit from config, so the
 	// two ends of a hop agree by construction rather than by coincidence.
 	MaxRecvBytes int
+
+	// Metrics publishes grpc_client_* series for this connection, labelled with the upstream.
+	//
+	// NIL MEANS NO CLIENT METRICS, which is a real choice and not an oversight -- but it is
+	// the wrong one for anything long-running. Without these you can see that your service is
+	// slow and not that its upstream is, which is the single most common wasted hour in an
+	// incident. Pass the app's shared *observability.Metrics; Dial calls ClientFor(Target) so
+	// each upstream gets its own labelled series and repeated dials to the same target share
+	// one collector rather than panicking on a duplicate registration.
+	//
+	// Nil is left workable because tests build connections by the dozen and a metrics registry
+	// per bufconn is noise.
+	Metrics *observability.Metrics
 }
 
 // Insecure disables transport security for this connection.
@@ -150,8 +179,8 @@ func Dial(cfg config.Config, opts Options) (*grpc.ClientConn, error) {
 			}),
 		)),
 
-		grpc.WithChainUnaryInterceptor(opts.unaryIdentity(), opts.unaryBudget(), opts.unaryErrors()),
-		grpc.WithChainStreamInterceptor(opts.streamIdentity(), opts.streamBudget()),
+		grpc.WithChainUnaryInterceptor(opts.unaryChain()...),
+		grpc.WithChainStreamInterceptor(opts.streamChain()...),
 
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(opts.MaxRecvBytes)),
 
@@ -181,6 +210,32 @@ func Dial(cfg config.Config, opts Options) (*grpc.ClientConn, error) {
 		return nil, fmt.Errorf("client: dial %s: %w", opts.Target, err)
 	}
 	return conn, nil
+}
+
+// unaryChain assembles the outbound interceptors, outermost first.
+//
+// METRICS GO OUTERMOST, and the position is load-bearing rather than aesthetic.
+//
+// The budget interceptor can fail a call BEFORE it reaches the wire -- when too little of the
+// caller's deadline remains to be worth dialling, it returns DeadlineExceeded without making a
+// request at all. Placed below metrics, those refusals are counted, which is what you want:
+// from the caller's point of view the upstream call failed, and a dashboard that showed only
+// the calls that were actually attempted would hide an upstream so slow that this service had
+// stopped trying to reach it -- the exact failure the budget exists to create.
+func (c *Options) unaryChain() []grpc.UnaryClientInterceptor {
+	chain := []grpc.UnaryClientInterceptor{}
+	if c.Metrics != nil {
+		chain = append(chain, c.Metrics.ClientFor(c.Target).UnaryClientInterceptor())
+	}
+	return append(chain, c.unaryIdentity(), c.unaryBudget(), c.unaryErrors())
+}
+
+func (c *Options) streamChain() []grpc.StreamClientInterceptor {
+	chain := []grpc.StreamClientInterceptor{}
+	if c.Metrics != nil {
+		chain = append(chain, c.Metrics.ClientFor(c.Target).StreamClientInterceptor())
+	}
+	return append(chain, c.streamIdentity(), c.streamBudget())
 }
 
 // applyDefaults fills the zero values so a hand-built Options is still safe.
