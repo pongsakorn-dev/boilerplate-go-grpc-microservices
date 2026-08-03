@@ -140,6 +140,13 @@ func (p *Publisher) Publish(ctx context.Context, m outbox.Message) error {
 	msg.Header.Set(HeaderAggregateID, m.AggregateID)
 	msg.Header.Set(HeaderOccurredAt, m.OccurredAt.UTC().Format(time.RFC3339Nano))
 
+	// Only when there is one. An empty traceparent header is worse than an absent one: W3C
+	// requires a specific shape, and a consumer's propagator handed "" may either ignore it or
+	// treat the context as explicitly untraced, depending on the library.
+	if m.TraceParent != "" {
+		msg.Header.Set(HeaderTraceParent, m.TraceParent)
+	}
+
 	ack, err := p.js.PublishMsg(ctx, msg)
 	if err != nil {
 		return classify(err)

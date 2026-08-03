@@ -28,6 +28,8 @@ package gateway
 import (
 	"context"
 	"net/http"
+	"net/textproto"
+	"strings"
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"google.golang.org/grpc"
@@ -50,12 +52,45 @@ func NewMux(ctx context.Context, conn *grpc.ClientConn) (*runtime.ServeMux, erro
 		// status code. Without this they are rendered in grpc-gateway's default shape while
 		// every other error in the service uses ours.
 		runtime.WithStreamErrorHandler(handleStreamError),
+
+		runtime.WithIncomingHeaderMatcher(incomingHeaders),
 	)
 
 	if err := orderv1.RegisterOrderServiceHandler(ctx, mux, conn); err != nil {
 		return nil, err
 	}
 	return mux, nil
+}
+
+// incomingHeaders decides which HTTP headers become gRPC metadata.
+//
+// THE DEFAULT MATCHER DROPS traceparent, which silently severed trace context for every caller
+// of the REST edge.
+//
+// grpc-gateway forwards only headers prefixed with `Grpc-Metadata-`, plus a fixed list of
+// permanent HTTP headers. W3C Trace Context postdates that list and is not on it, so an
+// instrumented HTTP client sending a perfectly good traceparent had it discarded at the edge:
+// the gRPC handler began a fresh root span, the outbox row recorded THAT trace, and the
+// caller's trace ended at the gateway with no error and nothing in any log.
+//
+// Measured rather than reasoned. An end-to-end test sent the same traceparent over both
+// surfaces and read the outbox row that resulted: the gRPC path carried the caller's trace id
+// through to the row, the HTTP path wrote an empty trace_parent.
+//
+// tracestate travels with it. It is the vendor half of the same standard, and forwarding one
+// without the other discards sampling decisions that some backends encode there.
+func incomingHeaders(key string) (string, bool) {
+	switch textproto.CanonicalMIMEHeaderKey(key) {
+	case "Traceparent", "Tracestate":
+		// Lower-cased: gRPC metadata keys are lower-case, and the W3C propagator looks for
+		// exactly "traceparent".
+		return strings.ToLower(key), true
+	default:
+		// Everything else keeps grpc-gateway's own rules. Widening this further is a decision
+		// about what a caller may inject into the service's own metadata, so it belongs one
+		// header at a time rather than as a blanket forward.
+		return runtime.DefaultHeaderMatcher(key)
+	}
 }
 
 // jsonMarshaler configures JSON in both directions.

@@ -17,6 +17,8 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"gorm.io/gorm"
 
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+
 	"github.com/example/gomicro/internal/order"
 	"github.com/example/gomicro/internal/order/orderpg"
 	"github.com/example/gomicro/internal/order/ordertest"
@@ -488,4 +490,68 @@ func tableNames(t *testing.T, db *sql.DB) []string {
 		out = append(out, name)
 	}
 	return out
+}
+
+// TestTheOutboxRowCapturesTheTrace is the WRITE half of trace propagation.
+//
+// events/trace_test.go proves a stored traceparent survives the broker and reaches the
+// handler. It cannot prove there is one to store: that happens here, in the adapter, at the
+// only moment the request's context still exists. Between them the two tests cover the whole
+// path; either alone passes while the trace is lost.
+func TestTheOutboxRowCapturesTheTrace(t *testing.T) {
+	f := newFixture(t)
+	ctx := gormx.WithTenant(context.Background(), "acme")
+
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.AlwaysSample()))
+	tctx, span := tp.Tracer("test").Start(ctx, "the causing request")
+	wantTraceID := span.SpanContext().TraceID().String()
+	defer span.End()
+
+	if err := f.store.Publish(tctx, order.Event{
+		TenantID:    "acme",
+		AggregateID: "11111111-1111-4111-8111-111111111111",
+		Type:        "order.created",
+		OccurredAt:  time.Now(),
+	}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	db := f.sqlDB(t)
+	var traceParent string
+	err := db.QueryRow(`SELECT coalesce(trace_parent, '') FROM outbox ORDER BY id DESC LIMIT 1`).
+		Scan(&traceParent)
+	if err != nil {
+		t.Fatalf("read the outbox row: %v", err)
+	}
+
+	if traceParent == "" {
+		t.Fatal("the outbox row has no trace_parent.\n\n" +
+			"The request's context is the only place this exists, and it is gone by the time " +
+			"the relay runs. Not capturing it here means every asynchronous effect starts its " +
+			"own trace with nothing linking it to the request that caused it.")
+	}
+	// W3C format: version-traceid-spanid-flags. The trace id has to be the REQUEST's, or the
+	// event joins some other trace, which is worse than joining none.
+	if !strings.Contains(traceParent, wantTraceID) {
+		t.Errorf("trace_parent is %q, which does not carry the request's trace id %s",
+			traceParent, wantTraceID)
+	}
+}
+
+// TestAnUntracedWriteIsStillAccepted covers the path with no span at all -- a backfill, a
+// migration, a test. The column is nullable on purpose and must stay that way.
+func TestAnUntracedWriteIsStillAccepted(t *testing.T) {
+	f := newFixture(t)
+	ctx := gormx.WithTenant(context.Background(), "acme")
+
+	if err := f.store.Publish(ctx, order.Event{
+		TenantID:    "acme",
+		AggregateID: "11111111-1111-4111-8111-111111111111",
+		Type:        "order.created",
+		OccurredAt:  time.Now(),
+	}); err != nil {
+		t.Fatalf("an untraced publish was rejected: %v\n\n"+
+			"A row written outside any span is valid; it simply produces an event that begins "+
+			"its own trace.", err)
+	}
 }

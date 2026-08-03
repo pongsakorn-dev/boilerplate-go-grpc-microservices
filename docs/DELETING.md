@@ -166,8 +166,9 @@ property, whatever its README says.
   - `internal/order/ordertest/contract.go`: remove the two transactional subtests — they exist to
     assert the outbox invariant and assert nothing without it.
 - **Schema:** drop the `outbox` table and its index from
-  `internal/platform/migrations/00001_orders.sql`, delete `00003_retention.sql`, and delete
-  `00002_events.sql` entirely if you also did step 4.
+  `internal/platform/migrations/00001_orders.sql`, delete `00003_retention.sql`,
+  `00004_outbox_observability.sql` and `00005_outbox_trace.sql`, and delete `00002_events.sql`
+  entirely if you also did step 4.
 - **Config:** remove `OutboxConfig`, the `Outbox` field, and its `OUTBOX_*` entries. Remove
   `RetentionConfig`, the `Retention` field, the `RETENTION_*` entries, and the retention block
   in `Validate` — including the check that `RETENTION_PROCESSED_EVENTS` exceeds

@@ -58,6 +58,14 @@ const (
 	HeaderAggregateID = "X-Aggregate-Id"
 	HeaderOccurredAt  = "X-Occurred-At"
 
+	// HeaderTraceParent is the ONE header here that is not X-prefixed, and it must not be.
+	//
+	// "traceparent" is the W3C Trace Context standard name. Every tracing backend, sidecar and
+	// instrumentation library looks for exactly that spelling, so renaming it to match the
+	// house style above would make the trace invisible to all of them while looking tidier.
+	// The house style loses.
+	HeaderTraceParent = "traceparent"
+
 	// HeaderDLQReason explains why a dead-lettered message was given up on. Without it, a
 	// DLQ is a pile of messages with no indication of what went wrong.
 	HeaderDLQReason = "X-Dlq-Reason"

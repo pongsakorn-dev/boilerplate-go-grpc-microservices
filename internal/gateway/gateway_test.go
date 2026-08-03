@@ -4,9 +4,15 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
+
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"google.golang.org/grpc"
 
 	"github.com/example/gomicro/internal/platform/auth/testjwks"
 	"github.com/example/gomicro/internal/platform/config"
@@ -310,4 +316,84 @@ func oidcMode(iss *testjwks.Issuer) func(*config.Config) {
 
 func bearer(token string) map[string]string {
 	return map[string]string{"Authorization": "Bearer " + token}
+}
+
+// TestTheRESTEdgeForwardsTraceContext pins the header matcher, and it is behavioural rather
+// than a unit test of the mapping function because the mapping function was never the doubt --
+// whether grpc-gateway consults it on the path that matters was.
+//
+// This shipped broken. grpc-gateway's default matcher forwards `Grpc-Metadata-*` and a fixed
+// list of permanent HTTP headers; W3C Trace Context is on neither, so a traceparent from an
+// instrumented HTTP client was dropped at the edge. The gRPC surface carried it perfectly, so
+// every trace-related test passed and only the REST half was severed -- silently, with the
+// handler starting a fresh root span as if the caller had sent nothing.
+func TestTheRESTEdgeForwardsTraceContext(t *testing.T) {
+	// A real SDK provider so spans are recorded. The dead OTLP sink is the same trick
+	// observability/tracing_test.go uses: NewTracerProvider returns a no-op provider when no
+	// endpoint is set, and a no-op provider records nothing to assert on.
+	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(error) {}))
+	endpoint := discardOTLPSink(t)
+
+	srv, _ := testutil.NewTestGateway(t, func(c *config.Config) {
+		c.Telemetry.OTLPEndpoint = endpoint
+		c.Telemetry.TraceSampleRatio = 1.0
+	})
+
+	tp, ok := otel.GetTracerProvider().(*sdktrace.TracerProvider)
+	if !ok {
+		t.Fatalf("the global tracer provider is %T, not an SDK provider", otel.GetTracerProvider())
+	}
+	recorder := tracetest.NewSpanRecorder()
+	tp.RegisterSpanProcessor(recorder)
+	t.Cleanup(func() { tp.UnregisterSpanProcessor(recorder) })
+
+	const traceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/v1/orders", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("traceparent", "00-"+traceID+"-00f067aa0ba902b7-01")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /v1/orders: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	spans := recorder.Ended()
+	if len(spans) == 0 {
+		t.Fatal("the request produced no spans at all; the assertion below would be vacuous")
+	}
+
+	for _, s := range spans {
+		if s.SpanContext().TraceID().String() == traceID {
+			return // the caller's trace context reached the RPC
+		}
+	}
+
+	var got []string
+	for _, s := range spans {
+		got = append(got, s.Name()+"="+s.SpanContext().TraceID().String())
+	}
+	t.Errorf("no span joined the caller's trace %s; saw %v.\n\n"+
+		"The REST edge is dropping traceparent, so an HTTP caller's trace ends at the gateway "+
+		"and everything the request causes -- including the outbox row and the projection that "+
+		"follows it -- belongs to a different trace with nothing linking them.", traceID, got)
+}
+
+// discardOTLPSink accepts OTLP connections and refuses the export quickly, so the exporter
+// does not retry against a refused port for five seconds during shutdown.
+func discardOTLPSink(t *testing.T) string {
+	t.Helper()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for the OTLP sink: %v", err)
+	}
+	grpcSrv := grpc.NewServer()
+	go func() { _ = grpcSrv.Serve(lis) }()
+	t.Cleanup(grpcSrv.Stop)
+
+	return lis.Addr().String()
 }

@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -271,4 +272,82 @@ func metricValue(t *testing.T, exposition, name string) float64 {
 	}
 	t.Fatalf("no sample named %q in the exposition", name)
 	return 0
+}
+
+// TestTheTraceReachesTheOutboxRow is the trace-propagation assertion that only the shipped
+// stack can make.
+//
+// The unit and integration tiers cover each link: orderpg writes the traceparent, the relay
+// selects it, the publisher sends it, the consumer resumes it. What none of them exercise is
+// the REAL request path in front of all that -- the gateway, otelgrpc's server handler, the
+// global propagator installed at startup, and the interceptor chain -- deciding whether the
+// caller's trace context ever reaches the code that writes the row.
+//
+// A traceparent is sent in as a caller would, and the row that comes out has to carry the same
+// trace id. It works with no collector configured because a non-recording span still carries
+// its parent's SpanContext, which is exactly the property that makes tracing safe to leave
+// instrumented everywhere and exported nowhere.
+func TestTheTraceReachesTheOutboxRow(t *testing.T) {
+	// A fixed, recognisable trace id, in W3C form: version-traceid-spanid-flags. The 01 flag
+	// says sampled, which is what makes a downstream propagator keep it.
+	const traceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+	const traceParent = "00-" + traceID + "-00f067aa0ba902b7-01"
+
+	orderID := createOrderTraced(t, "E2E-TRACE-1", traceParent)
+
+	stored := strings.TrimSpace(psql(t, fmt.Sprintf(
+		"SELECT coalesce(trace_parent, '') FROM outbox WHERE aggregate_id = '%s'", orderID)))
+
+	if stored == "" {
+		t.Fatalf("the outbox row for order %s has no trace_parent.\n\n"+
+			"The caller's trace context did not reach the code that writes the row, so every "+
+			"asynchronous effect of this request starts a new trace with nothing linking it "+
+			"back.", orderID)
+	}
+	if !strings.Contains(stored, traceID) {
+		t.Errorf("the outbox row carries %q, which does not contain the caller's trace id %s.\n\n"+
+			"A trace was captured, but not the caller's -- so the event joins some unrelated "+
+			"trace, which is worse than joining none.", stored, traceID)
+	}
+}
+
+// createOrderTraced posts an order carrying a W3C traceparent, as an instrumented caller would.
+func createOrderTraced(t *testing.T, sku, traceParent string) string {
+	t.Helper()
+
+	body := fmt.Sprintf(`{"customer_id":"e2e-traced","items":[
+		{"sku":%q,"quantity":1,"unit_price":{"currency_code":"USD","units":"3","nanos":0}}]}`, sku)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, gatewayURL+"/v1/orders", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("traceparent", traceParent)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /v1/orders: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /v1/orders returned %s", resp.Status)
+	}
+
+	var decoded struct {
+		Order struct {
+			OrderID string `json:"order_id"`
+		} `json:"order"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		t.Fatalf("decode the response: %v", err)
+	}
+	if decoded.Order.OrderID == "" {
+		t.Fatal("the response carries no order id")
+	}
+	return decoded.Order.OrderID
 }

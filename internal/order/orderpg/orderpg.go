@@ -9,6 +9,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"gorm.io/gorm"
 
+	"go.opentelemetry.io/otel/propagation"
+
 	"github.com/example/gomicro/internal/order"
 	"github.com/example/gomicro/internal/platform/gormx"
 )
@@ -252,11 +254,37 @@ func (s *Store) Publish(ctx context.Context, e order.Event) error {
 		EventType:   e.Type,
 		Payload:     payload,
 		OccurredAt:  e.OccurredAt.UTC(),
+
+		// CAPTURED IN THE ADAPTER, deliberately, and not in the domain.
+		//
+		// order.Event has no trace field and must not grow one: internal/order imports no
+		// telemetry SDK and test/layout_test.go enforces that, so the domain could not read a
+		// span even if it wanted to. This adapter already sits outside that boundary -- it
+		// imports GORM -- which makes it the first place on the write path allowed to look.
+		//
+		// It is also the LAST place that can. The request's context ends when the handler
+		// returns; the relay picks this row up later, from another process, with nothing left
+		// to recover the trace from.
+		TraceParent: traceParentOf(ctx),
 	}
 
 	// Session with NewDB false keeps the transaction, if any; the outbox table is not
 	// tenant-scoped in gormx's sense, so no tenant context is required here.
 	return s.db.WithContext(ctx).Create(&row).Error
+}
+
+// traceParentOf renders the active span as a W3C traceparent, or "" when there is none.
+//
+// propagation.TraceContext directly rather than otel.GetTextMapPropagator(), for two reasons.
+// The global is a composite that also carries Baggage, and baggage is caller-supplied data with
+// no size bound -- storing it in a database column per event is an unbounded write amplifier
+// nobody asked for. And the global is set up by observability.NewTracerProvider, so depending
+// on it here would make this function's behaviour depend on process startup order, which is
+// exactly the kind of thing that works in production and returns "" in a test.
+func traceParentOf(ctx context.Context) string {
+	carrier := propagation.MapCarrier{}
+	propagation.TraceContext{}.Inject(ctx, carrier)
+	return carrier.Get("traceparent")
 }
 
 // Events reads everything in the outbox, oldest first.

@@ -35,7 +35,8 @@ import (
 // AND failed_at IS NULL skips QUARANTINED rows -- see quarantine below. Without it, a row
 // that can never be published is reclaimed on every drain and blocks everything behind it.
 const claimSQL = `
-SELECT id, tenant_id, aggregate_id, event_type, payload, occurred_at
+SELECT id, tenant_id, aggregate_id, event_type, payload, occurred_at,
+       coalesce(trace_parent, '')
 FROM outbox
 WHERE published_at IS NULL
   AND failed_at IS NULL
@@ -113,7 +114,8 @@ func (r *Relay) DrainOnce(ctx context.Context) (int, error) {
 	var batch []Message
 	for rows.Next() {
 		var m Message
-		if err := rows.Scan(&m.ID, &m.TenantID, &m.AggregateID, &m.EventType, &m.Payload, &m.OccurredAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.TenantID, &m.AggregateID, &m.EventType, &m.Payload,
+			&m.OccurredAt, &m.TraceParent); err != nil {
 			_ = rows.Close()
 			return 0, fmt.Errorf("scan: %w", err)
 		}
