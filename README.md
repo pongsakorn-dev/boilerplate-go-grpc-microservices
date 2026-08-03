@@ -291,6 +291,7 @@ compile-time guarantee. That is the only way `go test ./...` is safe with Docker
 |---|---|---|---|
 | Default | `go test ./...` | none | **12s** cold cache, **1.5s** cached |
 | Codegen | `task verify:codegen` | network | **17.6s** — regenerates and byte-compares |
+| Profile | `task verify:profile` | none | **17s** — executes [`docs/DELETING.md`](docs/DELETING.md): removes each optional subsystem in the documented order and rebuilds after each |
 | Integration | `task verify:int` | Docker | **20s** with the image cached. **Skips**, never fails, without Docker |
 | End-to-end | `task verify:e2e` | Docker + compose | **~140s** — the shipped images and compose file, real SIGTERM, and a second stack running `AUTH_MODE=oidc` against a real Keycloak |
 <!-- fork-tool:begin -->
@@ -1563,20 +1564,16 @@ were the last two gaps. The backfill closed three specifically: the server harde
 the health-check trace filter, and the structural half of the tenant guard — all three of which
 were code that ran in production and that no test observed.
 
-What remains is operational rather than architectural. Nothing below blocks using this
-template; each is a thing a fork will want and a thing this repo would rather name than
-half-build. They are ordered by dependency:
-
-| | What is left | Depends on |
-|---|---|---|
-| 1 | An executable `DELETING.md` — the `profile` tier the plan named | — |
-
-That is the last item. Everything else on this list has shipped: retention as
-[`cmd/prune`](cmd/prune/main.go), outbox health as
+**Nothing is left on the roadmap.** The operational follow-ups that were listed here have all
+shipped: retention as [`cmd/prune`](cmd/prune/main.go), outbox health as
 [`outbox.Observer`](internal/platform/outbox/observer.go), OIDC coverage as
 [`test/e2e/oidc`](test/e2e/oidc/oidc_test.go), client metrics as
-[`Metrics.ClientFor`](internal/platform/observability/metrics.go), and trace propagation
-through the broker as [`outbox.trace_parent`](internal/platform/migrations/00005_outbox_trace.sql).
+[`Metrics.ClientFor`](internal/platform/observability/metrics.go), trace propagation through
+the broker as [`outbox.trace_parent`](internal/platform/migrations/00005_outbox_trace.sql), and
+the `profile` tier as [`test/minimal_profile_test.go`](test/minimal_profile_test.go).
+
+What is left is in *Known gaps* below, and each entry there is a decision rather than an
+omission — a thing this template would rather name than half-build.
 
 Every "reduced", "split" and "cut" above came out of a review that asked what this template
 over-engineers. [ADR 0002](docs/adr/0002-what-was-cut.md) records what was removed and the two

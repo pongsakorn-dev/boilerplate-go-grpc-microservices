@@ -152,6 +152,14 @@ tasks:
     cmds:
       - go test -tags=codegen ./test/...
 
+  verify:profile:
+    desc: Execute docs/DELETING.md -- delete each optional subsystem in order and rebuild
+    cmds:
+      # -count=1 for the same reason verify:e2e uses it: the inputs here are a Markdown file
+      # and the repository's own file list, neither of which Go's test cache knows about, so
+      # editing DELETING.md and re-running would report a cached PASS.
+      - go test -tags=profile -count=1 -timeout 30m ./test/...
+
   test:race:
     desc: Race detector. Needs cgo, so it is guarded -- see cmd/devtool.
     cmds:
