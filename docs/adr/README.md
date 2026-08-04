@@ -20,7 +20,7 @@ Every locked decision, and where its reasoning actually is. If a link here goes 
 | 1 | Scope: a platform starter, not a product | [README — Why this template](../../README.md) |
 | 2 | grpc-go + grpc-gateway, JSON edge in client mode | [`internal/gateway/`](../../internal/gateway/) — "client mode, and why it is the whole design" |
 | 3 | One `go.mod`, `gen/` committed | [`buf.gen.yaml`](../../buf.gen.yaml) and [README — Toolchain notes](../../README.md) |
-| 4 | Domain never imports `gen/`, GORM, gRPC or OTel | [`test/layout_test.go`](../../test/layout_test.go) — the rule is the test |
+| 4 | Domain never imports `gen/`, GORM, gRPC or OTel | [`test/layout_test.go`](../../test/layout_test.go) — the rule is the test; [ADR 0005](0005-ports-and-adapters-without-the-ceremony.md) for the shape it implies |
 | 5 | GORM over sqlc, and what replaces what it gives up | [README — Persistence](../../README.md); [`internal/platform/gormx/`](../../internal/platform/gormx/) |
 | 6 | goose SQL migrations, never run on boot | [`cmd/migrate/`](../../cmd/migrate/); [README — Migrations never run on boot](../../README.md) |
 | 7 | `tenant_id` column + a fail-closed GORM callback | [`internal/platform/gormx/tenant.go`](../../internal/platform/gormx/tenant.go) |
@@ -45,6 +45,7 @@ Beyond the numbered set, the arguments worth reading before forking:
 | Why the caller's token is never forwarded | [`internal/platform/client/identity.go`](../../internal/platform/client/identity.go) |
 | Why the tenant is not in a NATS subject | [`internal/platform/events/events.go`](../../internal/platform/events/events.go) |
 | Why generated code is regenerated, not rewritten | [ADR 0004](0004-generated-code-is-regenerated-not-rewritten.md) |
+| Why this is hexagonal without saying so, and what was dropped | [ADR 0005](0005-ports-and-adapters-without-the-ceremony.md) |
 | What you can delete, in an order that works | [`docs/DELETING.md`](../DELETING.md) |
 
 ---
@@ -59,3 +60,4 @@ Only for decisions with no code to sit next to.
 | [0002](0002-what-was-cut.md) | What was cut, and the test every cut had to pass |
 | [0003](0003-the-repo-does-not-live-in-a-sync-folder.md) | The repository does not live in a synchronising folder |
 | [0004](0004-generated-code-is-regenerated-not-rewritten.md) | Generated protobuf code is regenerated, never rewritten |
+| [0005](0005-ports-and-adapters-without-the-ceremony.md) | Ports and adapters, without the ceremony |

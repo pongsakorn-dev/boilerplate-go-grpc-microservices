@@ -211,6 +211,153 @@ func TestReadmeStatusTableHasNoStaleMilestones(t *testing.T) {
 	}
 }
 
+// diagramPath matches a repo-relative package path inside a diagram node label. The trailing
+// /* form is allowed and checked as the directory without it.
+var diagramPath = regexp.MustCompile(`\b(?:cmd|internal|gen|proto|deploy|test|tools)/[A-Za-z0-9_./*-]*[A-Za-z0-9_*]`)
+
+// TestDiagramsNameRealPackages closes the direction TestReadmeDocumentsEveryPackage
+// deliberately leaves open.
+//
+// That guard is forward-only: every real directory must appear in the layout tree. The
+// reverse -- documentation naming a package that does NOT exist -- was left out on purpose,
+// because prose contains slashes and parsing it strictly produces false positives that teach
+// people to disable the test. That reasoning is sound for prose and wrong for diagrams.
+//
+// A mermaid node label is not prose. It is a short, structured string, and checking it costs
+// nothing. Leaving it unchecked let the architecture diagram -- the first structural picture
+// anyone sees, at the top of the Architecture section -- spend the repository's whole life
+// naming the Postgres adapter "gormstore", a package that has never existed under any name
+// in any commit. The real one is internal/order/orderpg, it shipped, and it has integration
+// tests. The diagram also styled it as pending work.
+//
+// The failure mode is specific and bad: a diagram is what a reader trusts BEFORE they know
+// enough to check it, so it is the worst place in the document to be wrong and the least
+// likely place for a reader to notice.
+func TestDiagramsNameRealPackages(t *testing.T) {
+	t.Parallel()
+
+	root := testutil.RepoRoot(t)
+
+	var checked int
+	for _, rel := range testutil.TrackedFiles(t) {
+		if filepath.Ext(rel) != ".md" {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
+		if err != nil {
+			continue
+		}
+
+		inDiagram := false
+		for i, line := range strings.Split(strings.ReplaceAll(string(b), "\r\n", "\n"), "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "```") {
+				inDiagram = strings.HasPrefix(strings.TrimSpace(line), "```mermaid")
+				continue
+			}
+			if !inDiagram {
+				continue
+			}
+			for _, cited := range diagramPath.FindAllString(line, -1) {
+				checked++
+				// internal/platform/* means "the packages under it", so check the parent.
+				dir := strings.TrimSuffix(strings.TrimSuffix(cited, "*"), "/")
+				if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(dir))); err == nil {
+					continue
+				}
+				t.Errorf("%s:%d diagram names %q, which is not a directory in this repo",
+					rel, i+1, cited)
+			}
+		}
+	}
+
+	if checked == 0 {
+		t.Fatal("found no package paths in any diagram -- this guard would silently pass forever")
+	}
+}
+
+// delimiterRow matches a GitHub-flavoured-markdown table delimiter: |---|---| and its
+// alignment variants |:--|--:|:-:|.
+var delimiterRow = regexp.MustCompile(`^\|[\s:|-]*-[\s:|-]*\|$`)
+
+// TestMarkdownTablesAreWellFormed catches the defect that makes a section unreadable in the
+// one place people actually read it.
+//
+// A GFM table is a header row, a delimiter row, then body rows. Break the delimiter and the
+// rows do not become an ugly table -- they stop being a table at all and render as one
+// paragraph of literal pipe characters. There is no warning: the file is valid markdown, and
+// in a plain-text editor it still lines up perfectly.
+//
+// That is exactly what happened to the configuration reference. A paragraph was inserted mid
+// table, terminating it, and the nine AUTH_MODE and OIDC_* rows after it became prose --
+// which is to say the entire authentication configuration reference was unreadable on GitHub,
+// while looking completely fine to everyone editing it locally.
+//
+// It is worth a guard rather than a fix because the failure is invisible to the author, the
+// reviewer, and every other test in this repository. The rule is mechanical, so a machine
+// should be the one checking it.
+func TestMarkdownTablesAreWellFormed(t *testing.T) {
+	t.Parallel()
+
+	root := testutil.RepoRoot(t)
+
+	var checked int
+	for _, rel := range testutil.TrackedFiles(t) {
+		if filepath.Ext(rel) != ".md" {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
+		if err != nil {
+			continue
+		}
+
+		lines := strings.Split(strings.ReplaceAll(string(b), "\r\n", "\n"), "\n")
+
+		// Fenced code blocks are skipped: a shell transcript or an ASCII diagram may
+		// legitimately begin a line with a pipe, and it is not a table.
+		inFence := false
+
+		for i := 0; i < len(lines); i++ {
+			line := strings.TrimSpace(lines[i])
+			if strings.HasPrefix(line, "```") || strings.HasPrefix(line, "~~~") {
+				inFence = !inFence
+				continue
+			}
+			if inFence || !strings.HasPrefix(line, "|") {
+				continue
+			}
+
+			// The start of a run of table-shaped lines. Find where it ends.
+			start := i
+			for i+1 < len(lines) && strings.HasPrefix(strings.TrimSpace(lines[i+1]), "|") {
+				i++
+			}
+			run := lines[start : i+1]
+			checked++
+
+			// A lone table-shaped line is not a table either -- GFM needs at least a header
+			// and a delimiter -- so it renders as literal pipes just the same.
+			if len(run) < 2 {
+				t.Errorf("%s:%d is a table row on its own, so it renders as literal text:\n  %s",
+					rel, start+1, strings.TrimSpace(run[0]))
+				continue
+			}
+			if !delimiterRow.MatchString(strings.TrimSpace(run[1])) {
+				t.Errorf("%s:%d starts a table whose second line is not a |---|---| delimiter:\n"+
+					"  %s\n  %s\n\n"+
+					"Without it GitHub renders every row below as one paragraph of pipe\n"+
+					"characters. The usual cause is a paragraph inserted into the middle of a\n"+
+					"longer table, which silently splits it in two and leaves the second half\n"+
+					"with no header.",
+					rel, start+1, strings.TrimSpace(run[0]), strings.TrimSpace(run[1]))
+			}
+		}
+	}
+
+	if checked == 0 {
+		t.Fatal("found no markdown tables at all -- this guard would silently pass forever")
+	}
+}
+
 // readmeSection returns the text between a heading and the next top-level heading.
 func readmeSection(t *testing.T, root, heading string) string {
 	t.Helper()
