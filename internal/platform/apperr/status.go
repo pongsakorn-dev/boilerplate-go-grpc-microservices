@@ -17,6 +17,11 @@ import (
 //     `pq: duplicate key value violates unique constraint "users_email_key"`
 //     leaks your schema and confirms an account exists.
 //
+//     "Unclassified" excludes context.Canceled and context.DeadlineExceeded, which
+//     classify names explicitly. They are the caller's own doing, not a fault of
+//     this service, and calling them Internal is both a lie to the client and a
+//     permanent noise floor under the Internal error-rate alert.
+//
 //  2. Every status carries ErrorInfo{Reason, Domain}. Reason is the stable code clients
 //     branch on; the human-readable message explicitly is not a contract.
 func ToStatus(err error, domain string) *status.Status {
@@ -26,7 +31,8 @@ func ToStatus(err error, domain string) *status.Status {
 
 	ae, ok := From(err)
 	if !ok {
-		ae = Wrap(err, KindInternal, "INTERNAL", err.Error())
+		kind, reason, message := classify(err)
+		ae = Wrap(err, kind, reason, message)
 	}
 
 	st := status.New(ae.Kind.GRPCCode(), ae.ClientMessage())

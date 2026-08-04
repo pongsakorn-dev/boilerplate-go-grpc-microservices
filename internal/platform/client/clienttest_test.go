@@ -181,4 +181,9 @@ func unavailableTimes(n int) func(int) error {
 	}
 }
 
-func codeOf(err error) codes.Code { return status.Code(err) }
+// There is deliberately NO codeOf(err) = status.Code(err) helper here any more.
+//
+// It existed, and it worked on the *client.Error values this package returns -- which it
+// could only do by reaching through them to the upstream's status. That is the leak
+// client.Error exists to prevent, made to look like ordinary test usage. Read the upstream's
+// code from the typed field instead: client.From(err) then .Code.

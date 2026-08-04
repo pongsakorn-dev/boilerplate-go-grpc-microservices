@@ -104,8 +104,19 @@ func TestAMethodWithNoPolicyIsNotRetried(t *testing.T) {
 	if err == nil {
 		t.Fatal("CreateOrder succeeded despite the upstream failing")
 	}
-	if codeOf(err) != codes.Unavailable {
-		t.Errorf("code = %s, want Unavailable", codeOf(err))
+	// Read the upstream's code off the *client.Error, NOT with status.Code(err).
+	//
+	// This line used to be `codeOf(err) != codes.Unavailable`, and it passed -- which was
+	// itself the evidence for a bug. status.Code walks the chain, so it could only have
+	// answered Unavailable by reaching through the *client.Error to the upstream's status.
+	// That is the exact leak the type exists to prevent, demonstrated in this package's own
+	// test suite. Asking the type directly says what the test means and cannot regress.
+	upErr, ok := client.From(err)
+	if !ok {
+		t.Fatalf("err is not a *client.Error: %T (%v)", err, err)
+	}
+	if upErr.Code != codes.Unavailable {
+		t.Errorf("upstream code = %s, want Unavailable", upErr.Code)
 	}
 	if n := up.count(); n != 1 {
 		t.Errorf("CreateOrder reached the upstream %d times, want exactly 1.\n\n"+

@@ -91,10 +91,27 @@ message CreateOrderRequest {
     max_items: 100
   }];
 
-  // Optional. When present, the RPC is replayable: sending the same key twice yields
-  // one order and two byte-identical responses. The client retry policy in
-  // internal/platform/client/servicecfg.json only retries CreateOrder when this is set,
-  // because retrying a non-idempotent mutation is how a template ships duplicate orders.
+  // Optional. ACCEPTED AND VALIDATED, BUT NOT YET HONOURED -- sending the same key twice
+  // creates two orders. Do not build on it until you implement the mechanism.
+  //
+  // The field is reserved here deliberately. Adding it later is wire-compatible but is a
+  // breaking change for every client that then has to start sending it, and keeping the
+  // validation rule below means a fork that implements idempotency inherits well-formed
+  // keys from day one rather than a mix of UUIDs and free text.
+  //
+  // What was here before claimed the opposite: that the RPC was replayable, yielding one
+  // order and two byte-identical responses, per a retry policy in a file it named
+  // servicecfg.json. No handler has ever read this field, and no such file has ever
+  // existed. The real one, internal/platform/client/serviceconfig.go, says plainly that
+  // this repository has no idempotency-key mechanism -- which is why retries are enabled
+  // on reads and on no mutation at all.
+  //
+  // Idempotency was cut; docs/adr/0002-what-was-cut.md records it as the most
+  // consequential of the cuts and names what implementing it costs.
+  //
+  // A wrong comment matters more here than almost anywhere else in the repository: protoc
+  // copies it verbatim into gen/go/order/v1/order.pb.go and into the published OpenAPI
+  // document, so it reaches people who read a generated client and never open this file.
   string idempotency_key = 3 [
     (buf.validate.field).string.uuid = true,
     (buf.validate.field).ignore = IGNORE_IF_ZERO_VALUE
@@ -142,6 +159,8 @@ message CancelOrderRequest {
 
   string reason = 2 [(buf.validate.field).string.max_len = 512];
 
+  // Reserved and validated, not honoured. Same status as CreateOrderRequest's -- the
+  // reasoning is written there once rather than twice.
   string idempotency_key = 3 [
     (buf.validate.field).string.uuid = true,
     (buf.validate.field).ignore = IGNORE_IF_ZERO_VALUE

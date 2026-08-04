@@ -73,8 +73,24 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("upstream %s: %s failed: %s", e.Target, e.Method, e.Code)
 }
 
-// Unwrap exposes the original status error, so errors.Is and status.FromError still work for
-// callers that genuinely need the wire detail.
+// Unwrap exposes the cause, so errors.Is still works through the boundary.
+//
+// THE CAUSE IS NEVER A *status.Error, and that is load-bearing rather than incidental.
+//
+// This used to return the upstream's status error verbatim, with a comment saying it was
+// there "so errors.Is and status.FromError still work". status.FromError working was the
+// bug. It walks the chain with errors.As, so it reached straight through this type and
+// answered with the UPSTREAM's code -- which meant ErrorMap saw a valid status that was not
+// an *apperr.Error and forwarded it verbatim, and the callee's NotFound became ours.
+//
+// That is precisely the failure the type comment above says is structurally impossible. The
+// doc was not wrong about the design; Unwrap quietly defeated it, and the guarantee held
+// only for as long as nobody returned one of these directly.
+//
+// Nothing is lost by refusing to hand out the status: everything on the wire that a caller
+// could want has already been destructured into Code, Reason, Domain, Message and
+// RetryAfter. The status object carried no extra information -- only the status-ness that
+// made the leak possible.
 func (e *Error) Unwrap() error { return e.err }
 
 // From extracts an upstream Error from an error chain.
@@ -160,7 +176,17 @@ func newUpstreamError(target, method string, err error) error {
 		Method:  method,
 		Code:    st.Code(),
 		Message: st.Message(),
-		err:     err,
+
+		// The CAUSE IS FLATTENED TO TEXT, deliberately, rather than kept as the status.
+		//
+		// Keeping `err` here is the obvious thing and it silently un-does this whole type:
+		// Unwrap would hand the status back to errors.As, so status.FromError(clientErr)
+		// would answer with the upstream's code and ErrorMap would forward it to our
+		// caller. See the note on Unwrap.
+		//
+		// The text is preserved because it is what an operator reads in the log; the
+		// status object is not, because it is what the error model reads on the way out.
+		err: errors.New(st.Code().String() + ": " + st.Message()),
 	}
 
 	for _, detail := range st.Details() {
