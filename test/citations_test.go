@@ -2,6 +2,7 @@ package test
 
 import (
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -175,6 +176,62 @@ func TestCommentsDoNotCiteMissingTestFunctions(t *testing.T) {
 var sourcePathRE = regexp.MustCompile(
 	`\b(?:cmd|internal|proto|deploy|docs|tools|test)/[A-Za-z0-9_./-]+\.(?:go|proto|json|ya?ml|sql|md)\b`)
 
+// packageDirRE matches a cited PACKAGE DIRECTORY -- a repo path with no file extension.
+//
+// A second pattern rather than a looser first one. Requiring at least two path segments and
+// no dot keeps it away from ordinary prose, and keeps the two failure messages distinct:
+// a missing file is usually a typo, a missing directory is usually a subsystem that was
+// never built.
+var packageDirRE = regexp.MustCompile(
+	`\b(?:cmd|internal|proto|deploy|tools)/[a-z0-9_]+(?:/[a-z0-9_]+)*\b`)
+
+// cutRegister is the ADR whose subject is packages that deliberately do not exist. Naming
+// one is its purpose, so the directory check does not apply to it.
+const cutRegister = "docs/adr/0002-what-was-cut.md"
+
+// namesAnAbsence reports whether a line is saying a thing does not exist, rather than
+// asserting that it does.
+//
+// Kept deliberately short. Every phrase here is a licence to name a package that is not in
+// the tree, so a long list would turn the guard off by degrees -- and the guard's whole value
+// is that it fires on the present-tense claim, which is the form that misleads.
+func namesAnAbsence(line string) bool {
+	for _, marker := range []string{"cut", "never existed", "does not exist", "no such"} {
+		if strings.Contains(line, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// standsAlone reports whether the match at [start,end) is a whole path rather than part of a
+// longer one.
+//
+// RE2 has no lookaround, so the boundaries are checked here. Two cases, both of which fired
+// dozens of times before this existed:
+//
+//	internal/order/money.go   -> matches "internal/order/money", followed by '.'
+//	.../buf/cmd/buf@v1.72.0   -> matches "cmd/buf", preceded by '/'
+func standsAlone(line string, start, end int) bool {
+	if start > 0 {
+		switch prev := line[start-1]; {
+		case prev == '/', prev == '.', prev == '-':
+			return false
+		case prev >= 'a' && prev <= 'z', prev >= 'A' && prev <= 'Z', prev >= '0' && prev <= '9':
+			return false
+		}
+	}
+	if end < len(line) {
+		switch next := line[end]; {
+		case next == '/', next == '.', next == '-', next == '@':
+			return false
+		case next >= 'a' && next <= 'z', next >= 'A' && next <= 'Z', next >= '0' && next <= '9':
+			return false
+		}
+	}
+	return true
+}
+
 // TestCommentsDoNotCiteMissingSourceFiles closes the hole the two guards above left open.
 //
 // They check cited TEST files and cited test FUNCTIONS, because the motivating drift was
@@ -199,10 +256,15 @@ func TestCommentsDoNotCiteMissingSourceFiles(t *testing.T) {
 	root := testutil.RepoRoot(t)
 
 	tracked := map[string]bool{}
+	dirs := map[string]bool{}
 	for _, rel := range testutil.TrackedFiles(t) {
 		tracked[rel] = true
+		// Every ancestor directory of a tracked file exists, by definition.
+		for d := path.Dir(rel); d != "." && d != "/"; d = path.Dir(d) {
+			dirs[d] = true
+		}
 	}
-	if len(tracked) == 0 {
+	if len(tracked) == 0 || len(dirs) == 0 {
 		t.Fatal("found no tracked files -- this guard would silently pass forever")
 	}
 
@@ -245,6 +307,44 @@ func TestCommentsDoNotCiteMissingSourceFiles(t *testing.T) {
 					continue
 				}
 				violations = append(violations, violation{rel, cited})
+			}
+
+			// And cited DIRECTORIES, which the pattern above cannot see because it requires
+			// a file extension.
+			//
+			// That blind spot had a live example. internal/order/service.go said idempotency
+			// "is applied as a wrapper at the API boundary (internal/platform/idempotency)",
+			// present tense, naming a package that has never existed at any commit -- the
+			// mechanism was cut. A path with no dot in it slipped straight past a guard
+			// written specifically to catch cited things that are not there.
+			//
+			// The match must stand alone, which is most of the work. Without the boundary
+			// check the pattern fires on the STEM of every file path (internal/order/money,
+			// from money.go) and on every module path containing one of these segments
+			// (cmd/buf, from github.com/bufbuild/buf/cmd/buf) -- 38 false positives against
+			// this repository, which is how a guard gets deleted rather than fixed.
+			// Naming a package in order to say it does NOT exist is the opposite of a false
+			// claim. Same shape as the future-tense allowance above -- a promise and a
+			// disclaimer are both honest about absence, and only the present tense asserts
+			// something checkable.
+			//
+			// ADR 0002 is exempt WHOLESALE rather than line by line: it is the register of
+			// what was cut, so every package it names is one that should not be in the tree.
+			// Requiring each entry to repeat a magic word to be believed would be checking
+			// the document's prose style rather than its truth.
+			if rel == cutRegister || namesAnAbsence(line) {
+				continue
+			}
+
+			for _, loc := range packageDirRE.FindAllStringIndex(line, -1) {
+				if !standsAlone(line, loc[0], loc[1]) {
+					continue
+				}
+				cited := line[loc[0]:loc[1]]
+				if dirs[cited] {
+					continue
+				}
+				violations = append(violations, violation{rel, cited + "/"})
 			}
 		}
 	}

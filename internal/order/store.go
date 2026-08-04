@@ -74,8 +74,12 @@ type Page struct {
 	NextPageToken string
 }
 
-// Page size bounds. The server always echoes the size it actually used, so a caller that
-// asks for 10000 can tell it got 1000.
+// Page size bounds.
+//
+// The clamp is silent: there is no field in ListOrdersResponse reporting the size actually
+// used. This comment claimed the opposite ("the server always echoes the size it actually
+// used, so a caller that asks for 10000 can tell it got 1000"), and so did the .proto, which
+// ships that sentence to every consumer of the generated client.
 const (
 	DefaultPageSize int32 = 50
 	MaxPageSize     int32 = 1000

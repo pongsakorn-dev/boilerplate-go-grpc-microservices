@@ -534,7 +534,17 @@ func (x *GetOrderResponse) GetOrder() *Order {
 
 type ListOrdersRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Server clamps this to a documented maximum and echoes the size actually used.
+	// Server clamps this to a documented maximum: 0 means the default of 50, and anything
+	// above 1000 is silently reduced to 1000.
+	//
+	// THE CLAMPED SIZE IS NOT REPORTED BACK. This said the server "echoes the size actually
+	// used", and there is no field in ListOrdersResponse to echo it in -- so a caller asking
+	// for 10000 receives 1000 rows with nothing saying why, and the documented way to find out
+	// did not exist. Count the orders you got, or read the maximum here.
+	//
+	// Adding a page_size to the response would be an additive, wire-compatible change and is a
+	// reasonable thing for a fork to do; it is not done here because the template would rather
+	// describe what it has than ship a field to make an old comment true.
 	PageSize int32 `protobuf:"varint,1,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
 	// Opaque. Callers must treat it as a blob -- it encodes the keyset cursor, and its
 	// internal shape is not part of the API contract.

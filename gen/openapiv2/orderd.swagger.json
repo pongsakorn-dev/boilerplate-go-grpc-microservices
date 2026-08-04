@@ -36,7 +36,7 @@
         "parameters": [
           {
             "name": "page_size",
-            "description": "Server clamps this to a documented maximum and echoes the size actually used.",
+            "description": "Server clamps this to a documented maximum: 0 means the default of 50, and anything\nabove 1000 is silently reduced to 1000.\n\nTHE CLAMPED SIZE IS NOT REPORTED BACK. This said the server \"echoes the size actually\nused\", and there is no field in ListOrdersResponse to echo it in -- so a caller asking\nfor 10000 receives 1000 rows with nothing saying why, and the documented way to find out\ndid not exist. Count the orders you got, or read the maximum here.\n\nAdding a page_size to the response would be an additive, wire-compatible change and is a\nreasonable thing for a fork to do; it is not done here because the template would rather\ndescribe what it has than ship a field to make an old comment true.",
             "in": "query",
             "required": false,
             "type": "integer",
