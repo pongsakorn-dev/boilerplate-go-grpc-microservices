@@ -534,17 +534,21 @@ func (x *GetOrderResponse) GetOrder() *Order {
 
 type ListOrdersRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Server clamps this to a documented maximum: 0 means the default of 50, and anything
-	// above 1000 is silently reduced to 1000.
+	// 0 means the server default of 50. Above 1000 is REJECTED with InvalidArgument by the
+	// rule below -- not clamped, and not served with fewer rows.
 	//
-	// THE CLAMPED SIZE IS NOT REPORTED BACK. This said the server "echoes the size actually
-	// used", and there is no field in ListOrdersResponse to echo it in -- so a caller asking
-	// for 10000 receives 1000 rows with nothing saying why, and the documented way to find out
-	// did not exist. Count the orders you got, or read the maximum here.
+	// Two previous versions of this comment were wrong in opposite directions, which is worth
+	// knowing because the field has two mechanisms behind it and only one is reachable here.
+	// It first claimed the server "echoes the size actually used"; ListOrdersResponse has no
+	// field to echo it in. It was then corrected to say an oversized request is "silently
+	// reduced to 1000" -- describing order.ClampPageSize, which is real but sits BEHIND this
+	// validation rule and so never sees an oversized request that arrived over the wire.
 	//
-	// Adding a page_size to the response would be an additive, wire-compatible change and is a
-	// reasonable thing for a fork to do; it is not done here because the template would rather
-	// describe what it has than ship a field to make an old comment true.
+	// A caller therefore needs no way to discover a clamped size: they either asked for
+	// something legal and got it, or were told no. The clamp still supplies the 0 -> 50
+	// default and still guards a caller reaching the domain directly rather than over the wire.
+	// interceptor/validate_test.go::TestAnOversizedPageSizeIsRejectedNotClamped pins which of
+	// the two a client meets.
 	PageSize int32 `protobuf:"varint,1,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`
 	// Opaque. Callers must treat it as a blob -- it encodes the keyset cursor, and its
 	// internal shape is not part of the API contract.

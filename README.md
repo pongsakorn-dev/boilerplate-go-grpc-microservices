@@ -368,6 +368,8 @@ merely to pass today:
 | `TestAStreamingRestErrorIsNotTheUnaryShape` | The documented difference between the two REST error shapes silently ceasing to be true |
 | `TestCommentsDoNotCiteMissingTests` | A comment claiming a proof that does not exist |
 | `TestCommentsDoNotCiteMissingSourceFiles` | A comment citing a **source** file *or package directory* that was never written — usually a mechanism that was never built |
+| `TestTheAbsenceAllowanceIsNotASubstring` | That guard's *exemption* matching inside unrelated words, so it reports a clean run over lines it never examined |
+| `TestAnOversizedPageSizeIsRejectedNotClamped` | Docs describing the clamp when validation rejects first — two mechanisms on one field, and only one reachable |
 | `TestContextErrorsAreNotOurFault` | A client hang-up reported as `Internal`, putting a floor of disconnects under the alert on-call pages on |
 | `TestAnUpstreamErrorCannotBeReturnedByAccident` | An upstream's `NotFound` reaching your caller as if it were about *their* request |
 | `TestVendoredProtosKeepTheirLicenseHeaders` | Apache-2.0 attribution being stripped from vendored protos |
@@ -1258,8 +1260,15 @@ Errors use one shape, modelled on AIP-193 — a **symbolic** code, the stable `r
 branch on, and the `google.rpc` details a gRPC client would receive:
 
 ```json
-{"error":{"code":"NOT_FOUND","reason":"ORDER_NOT_FOUND","message":"order not found","domain":"orderd"}}
+{"error":{"code":"NotFound","reason":"ORDER_NOT_FOUND","message":"order not found","domain":"orderd"}}
 ```
+
+**`code` is CamelCase, not SCREAMING_SNAKE.** It is `codes.Code.String()` from grpc-go —
+`NotFound`, `ResourceExhausted`, `Unauthenticated`. This example said `"NOT_FOUND"`, which is
+the spelling of `google.rpc.Code` and of `apperr`'s own `reason`, and is a value this server
+has never emitted. A client author who took the example literally would branch on a string
+that never arrives, and a branch that never matches fails silently — so they would find out
+from a bug report rather than a stack trace.
 
 grpc-gateway's default body is `{"code": 5, "message": "..."}` — a numeric gRPC code,
 meaningless to a client that never speaks gRPC, and no reason field at all. The HTTP status

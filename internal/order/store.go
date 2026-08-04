@@ -76,10 +76,15 @@ type Page struct {
 
 // Page size bounds.
 //
-// The clamp is silent: there is no field in ListOrdersResponse reporting the size actually
-// used. This comment claimed the opposite ("the server always echoes the size it actually
-// used, so a caller that asks for 10000 can tell it got 1000"), and so did the .proto, which
-// ships that sentence to every consumer of the generated client.
+// MaxPageSize is NOT what an over-large API request meets. The .proto puts `lte: 1000` on
+// page_size, so protovalidate rejects one with InvalidArgument before any handler runs, and
+// the clamp below never sees it. What the clamp is actually for is the 0 -> DefaultPageSize
+// fallback, and bounding a caller that reaches order.Service directly instead of over the
+// wire -- an in-process worker, a test, a fork that adds a second entry point.
+//
+// Keeping both is deliberate: the domain must not depend on a transport-layer rule for its
+// own safety. Saying so here is the point, because the two mechanisms look redundant right up
+// until someone deletes the one they are not currently exercising.
 const (
 	DefaultPageSize int32 = 50
 	MaxPageSize     int32 = 1000

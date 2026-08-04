@@ -189,19 +189,70 @@ var packageDirRE = regexp.MustCompile(
 // one is its purpose, so the directory check does not apply to it.
 const cutRegister = "docs/adr/0002-what-was-cut.md"
 
+// absenceMarker matches a phrase that says a thing does NOT exist.
+//
+// WORD-BOUNDARIED, and it was not. The markers were matched with strings.Contains, so "cut"
+// matched inside "execute" and "cross-cutting" -- and this repository says both constantly.
+// Measured at the time of the fix: of 156 lines the allowance skipped, 80 were skipped only
+// because a marker appeared inside an unrelated word. More than half the exemption was
+// accidental, and one of the lines it silenced was the architecture diagram in the README.
+//
+// A guard whose OFF switch is a substring is worse than no guard: it reports a clean run over
+// a corpus it never looked at. Every allowance here has to be a word.
+var absenceMarker = regexp.MustCompile(`(?i)\b(?:cut|never existed|does not exist|no such)\b`)
+
 // namesAnAbsence reports whether a line is saying a thing does not exist, rather than
 // asserting that it does.
 //
-// Kept deliberately short. Every phrase here is a licence to name a package that is not in
-// the tree, so a long list would turn the guard off by degrees -- and the guard's whole value
-// is that it fires on the present-tense claim, which is the form that misleads.
+// The list is kept deliberately short. Every phrase is a licence to name a package that is
+// not in the tree, so a long list would turn the guard off by degrees -- and the guard's
+// whole value is that it fires on the present-tense claim, which is the form that misleads.
 func namesAnAbsence(line string) bool {
-	for _, marker := range []string{"cut", "never existed", "does not exist", "no such"} {
-		if strings.Contains(line, marker) {
-			return true
+	return absenceMarker.MatchString(line)
+}
+
+// TestTheAbsenceAllowanceIsNotASubstring tests the guard's OFF switch, which is the part of a
+// guard nobody thinks to test.
+//
+// The allowance was written with strings.Contains, so "cut" matched inside "execute" and
+// "cross-cutting" and silently exempted 80 of the 156 lines it touched. Nothing failed --
+// that is the point. A too-eager exemption makes a guard report success over a corpus it
+// never examined, which is strictly worse than not having it, because the green run is
+// evidence to whoever reads it.
+//
+// The negative cases below are taken from real lines in this repository.
+func TestTheAbsenceAllowanceIsNotASubstring(t *testing.T) {
+	t.Parallel()
+
+	exempt := []string{
+		"the second service and the cache were cut",
+		"Cut with the second service: a generator nobody runs",
+		"naming a package that has never existed",
+		"a file that does not exist",
+		"there is no such package",
+	}
+	for _, line := range exempt {
+		if !namesAnAbsence(line) {
+			t.Errorf("namesAnAbsence(%q) = false, want true -- a line disclaiming a package "+
+				"must be allowed to name it", line)
 		}
 	}
-	return false
+
+	notExempt := []string{
+		"`test/quickstart_test.go` executes it",
+		"platform/                 cross-cutting, service-agnostic",
+		"removes each optional subsystem in the documented order and rebuilds after each",
+		"the circuit is closed",
+		"executed by the profile tier",
+	}
+	for _, line := range notExempt {
+		if namesAnAbsence(line) {
+			t.Errorf("namesAnAbsence(%q) = true, want false.\n\n"+
+				"A marker matched inside an unrelated word, so this line is exempt from the "+
+				"package-directory check for no reason. That is how the allowance came to "+
+				"silence more than half the lines it saw.", line)
+		}
+	}
 }
 
 // standsAlone reports whether the match at [start,end) is a whole path rather than part of a
