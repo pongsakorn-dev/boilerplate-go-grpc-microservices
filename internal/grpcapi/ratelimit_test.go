@@ -3,6 +3,7 @@ package grpcapi_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/alicebob/miniredis/v2"
 	"google.golang.org/grpc/codes"
@@ -60,6 +61,62 @@ func TestRateLimitIsACTUALLYWIREDINTOTheChain(t *testing.T) {
 	}
 	if allowed != 3 {
 		t.Errorf("%d requests were allowed, want exactly the configured burst of 3", allowed)
+	}
+}
+
+// TestOpeningAStreamSpendsQuotaToo closes the cheapest way around the quota above.
+//
+// The stream chain had no rate limiting at all, and WatchOrders runs a List against the
+// database on every open. So the throttled tenant in the test above could keep issuing the
+// same query, without limit, by asking for it as a stream instead. A quota that a caller can
+// step around by choosing a different RPC for the same data is not a quota.
+//
+// The subtlety worth naming: a stream OPEN is the billable event here, not a stream message.
+// WatchOrders sends a snapshot and then idles, so per-message billing would measure how long
+// a client stayed connected rather than how much work it asked for.
+func TestOpeningAStreamSpendsQuotaToo(t *testing.T) {
+	t.Parallel()
+
+	mr := miniredis.RunT(t)
+
+	conn := testutil.NewTestServer(t, func(c *config.Config) {
+		c.Redis.Addr = mr.Addr()
+		c.Redis.RateLimitPerMinute = 60
+		c.Redis.RateLimitBurst = 2
+	})
+	client := orderv1.NewOrderServiceClient(conn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Opening a stream returns before the server has necessarily run the chain, so the
+	// rejection surfaces on the first Recv rather than from WatchOrders itself.
+	var lastErr error
+	opened := 0
+	for range 10 {
+		stream, err := client.WatchOrders(ctx, &orderv1.WatchOrdersRequest{})
+		if err == nil {
+			_, err = stream.Recv()
+		}
+		if err == nil {
+			opened++
+			continue
+		}
+		lastErr = err
+		break
+	}
+
+	if lastErr == nil {
+		t.Fatalf("all 10 stream opens succeeded with a burst of 2.\n\n"+
+			"The stream chain is not enforcing the quota, so a tenant that has exhausted its "+
+			"limit on ListOrders can keep running the same query by opening WatchOrders "+
+			"instead. (opened=%d)", opened)
+	}
+	if got := status.Code(lastErr); got != codes.ResourceExhausted {
+		t.Fatalf("throttled stream returned %v, want ResourceExhausted: %v", got, lastErr)
+	}
+	if opened != 2 {
+		t.Errorf("%d streams opened, want exactly the configured burst of 2", opened)
 	}
 }
 

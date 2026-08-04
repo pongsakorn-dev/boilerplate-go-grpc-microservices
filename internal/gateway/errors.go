@@ -7,7 +7,6 @@ import (
 
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -30,8 +29,15 @@ type errorBody struct {
 }
 
 type errorDetail struct {
-	// Code is the SYMBOLIC gRPC code, e.g. "NOT_FOUND". A symbol survives being read in a
+	// Code is the SYMBOLIC gRPC code, e.g. "NotFound". A symbol survives being read in a
 	// log; the integer 5 does not.
+	//
+	// The spelling is grpc-go's codes.Code.String(), which is CamelCase -- "NotFound",
+	// "ResourceExhausted", "Unauthenticated". This comment used to give the example as
+	// "NOT_FOUND", which is the SCREAMING_SNAKE_CASE of google.rpc.Code and of apperr's
+	// Reason, and is not what this field ever contained. A client author who took the
+	// example literally would branch on a value that never arrives -- and would find out
+	// from a bug report, since a non-matching branch fails silently.
 	Code string `json:"code"`
 
 	// Reason is the stable identifier clients branch on, e.g. "ORDER_NOT_FOUND". It comes
@@ -108,18 +114,43 @@ func handleError(
 	}
 }
 
-// handleStreamError renders an error that arrives mid-stream.
+// THERE IS DELIBERATELY NO handleStreamError HERE, and the absence is the honest answer
+// rather than an oversight.
 //
-// By then the 200 has been sent and the status cannot change, so the error becomes a trailing
-// chunk in the response body. grpc-gateway requires a *status.Status here, which forces the
-// shape -- so this returns the same fields under the same names rather than a second format.
-func handleStreamError(_ context.Context, err error) *status.Status {
-	st := status.Convert(err)
-	if st.Code() == codes.OK {
-		return st
-	}
-	return st
-}
+// One was registered via runtime.WithStreamErrorHandler, under a comment saying that without
+// it streaming errors "are rendered in grpc-gateway's default shape while every other error
+// in the service uses ours". Its body was:
+//
+//	st := status.Convert(err)
+//	if st.Code() == codes.OK { return st }
+//	return st
+//
+// Both branches return the same value, and runtime.DefaultStreamErrorHandler is literally
+// `return status.Convert(err)`. It was the default, re-implemented, described as replacing
+// the default.
+//
+// The comment could not have been satisfied by writing more code, which is the part worth
+// keeping. StreamErrorHandlerFunc returns a *status.Status, and the runtime marshals it as
+// `{"error": <google.rpc.Status>}` -- so the extension point chooses WHICH status is
+// rendered, never the JSON shape. errorBody's symbolic "code": "NOT_FOUND" and top-level
+// "reason" are unreachable from here at any level of effort.
+//
+// So a mid-stream error over REST looks like this, and it differs from every unary error:
+//
+//	{"error":{"code":8,"message":"request quota exceeded","details":[...]}}
+//
+// The code is NUMERIC and the reason lives inside details as an ErrorInfo. Two further
+// consequences, neither obvious:
+//
+//   - A stream that fails BEFORE its first message has not written a header yet, so the HTTP
+//     status comes from grpc-gateway's own HTTPStatusFromCode -- not apperr's table. They
+//     agree today for every Kind this service emits; nothing enforces that they keep agreeing.
+//   - A stream that fails AFTER its first message has already sent 200, so the failure is a
+//     trailing chunk in a successful response. A REST client that checks only the status code
+//     will read a truncated result as complete.
+//
+// A fork that needs one JSON error shape across both surfaces cannot get it from this seam;
+// it needs its own streaming handler wrapping the mux.
 
 // writeGRPCMetadata copies server metadata onto the HTTP response.
 //

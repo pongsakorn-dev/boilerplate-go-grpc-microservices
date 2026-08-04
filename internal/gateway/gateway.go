@@ -48,11 +48,11 @@ func NewMux(ctx context.Context, conn *grpc.ClientConn) (*runtime.ServeMux, erro
 		runtime.WithMarshalerOption(runtime.MIMEWildcard, jsonMarshaler()),
 		runtime.WithErrorHandler(handleError),
 
-		// Streaming errors arrive after the response has begun, so they cannot change the
-		// status code. Without this they are rendered in grpc-gateway's default shape while
-		// every other error in the service uses ours.
-		runtime.WithStreamErrorHandler(handleStreamError),
-
+		// NO WithStreamErrorHandler. The seam cannot produce this service's error shape --
+		// it returns a *status.Status and the runtime fixes the JSON around it -- so a custom
+		// handler here could only be the default wearing a different name. It was exactly
+		// that for most of this repo's life. errors.go documents what a streaming REST error
+		// actually looks like, and why it is not errorBody.
 		runtime.WithIncomingHeaderMatcher(incomingHeaders),
 	)
 
