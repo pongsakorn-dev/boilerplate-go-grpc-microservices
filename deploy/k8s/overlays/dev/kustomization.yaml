@@ -14,8 +14,25 @@ resources:
 # Copying dev/ is a two-minute job that produces something true; shipping two directories of
 # guesses produces something that looks authoritative and is not.
 
+# EVERY image the base declares, not just the one the overlay was written for.
+#
+# This listed orderd alone, so `kubectl kustomize overlays/dev` rendered orderd:dev beside a
+# bare `gomicro/worker` and `gomicro/prune` -- no tag at all, which Kubernetes resolves to
+# :latest and pulls with imagePullPolicy: Always.
+#
+# The three are not independent. orderd writes the outbox, worker drains it, prune deletes
+# from it, and all three share one database schema and one set of goose migrations. Running
+# them at different builds is precisely the state a migration is most likely to break, and it
+# is silent: every pod starts, every probe passes, and the disagreement only appears as rows
+# that stop moving.
+#
+# TestEveryBaseImageIsRetagged fails if the base gains a fourth image and this list does not.
 images:
   - name: gomicro/orderd
+    newTag: dev
+  - name: gomicro/worker
+    newTag: dev
+  - name: gomicro/prune
     newTag: dev
 
 replicas:

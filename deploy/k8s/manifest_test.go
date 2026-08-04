@@ -412,6 +412,102 @@ func TestEnvVarReferencesAreDeclaredBeforeUse(t *testing.T) {
 }
 
 // envIndexPatch matches a JSON-patch path that addresses an env entry by POSITION.
+// baseImage matches an `image: repo/name` line, capturing the repository.
+var baseImage = regexp.MustCompile(`(?m)^\s*image:\s*([^\s:]+)`)
+
+// TestEveryBaseImageIsRetagged stops an overlay from pinning some of a release and not the
+// rest.
+//
+// # The bug
+//
+// The dev overlay's images: block named gomicro/orderd and nothing else, while the base
+// declares three: orderd (deployment.yaml), worker (worker.yaml) and prune
+// (prune-cronjob.yaml). `kubectl kustomize overlays/dev` therefore rendered
+//
+//	image: gomicro/orderd:dev
+//	image: gomicro/worker
+//	image: gomicro/prune
+//
+// -- two of them with NO TAG, which Kubernetes reads as :latest.
+//
+// # Why it matters more than a missing tag usually does
+//
+// These three are one release. orderd writes the outbox, worker drains it, prune deletes from
+// it, and they share a schema whose migrations are embedded in the binaries. A deploy that
+// moves one and leaves the others is the exact condition a migration breaks under, and
+// nothing reports it: all three pods start, all probes pass, and the symptom is rows that
+// quietly stop moving.
+//
+// # Why nothing caught it
+//
+// Every existing manifest test reads the BASE. The overlay is what decides which build runs,
+// and the failure is an ABSENCE -- a name not present in a list -- which no assertion about
+// rendered output would notice unless it knew what to expect. Comparing the two directories
+// is the only form that can.
+func TestEveryBaseImageIsRetagged(t *testing.T) {
+	t.Parallel()
+
+	declared := map[string]string{} // image -> file that declares it
+	err := filepath.WalkDir("base", func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || filepath.Ext(path) != ".yaml" {
+			return err
+		}
+		b, readErr := os.ReadFile(path)
+		if readErr != nil {
+			t.Fatalf("read %s: %v", path, readErr)
+		}
+		for _, m := range baseImage.FindAllStringSubmatch(string(b), -1) {
+			declared[m[1]] = filepath.ToSlash(path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk base/: %v", err)
+	}
+	if len(declared) == 0 {
+		t.Fatal("found no images in base/; this guard would pass forever")
+	}
+
+	overlays, err := os.ReadDir("overlays")
+	if err != nil {
+		t.Fatalf("read overlays/: %v", err)
+	}
+
+	var checked int
+	for _, entry := range overlays {
+		if !entry.IsDir() {
+			continue
+		}
+		kust := filepath.Join("overlays", entry.Name(), "kustomization.yaml")
+		b, readErr := os.ReadFile(kust)
+		if readErr != nil {
+			continue
+		}
+		checked++
+		text := string(b)
+
+		for image, source := range declared {
+			// "- name: <image>" under images:. Matching the whole token avoids gomicro/order
+			// appearing to satisfy gomicro/orderd.
+			if regexp.MustCompile(`name:\s*`+regexp.QuoteMeta(image)+`\s*$`).MatchString(text) ||
+				strings.Contains(text, "name: "+image+"\n") {
+				continue
+			}
+			t.Errorf("%s does not retag %s, which %s declares.\n\n"+
+				"kustomize leaves an unlisted image exactly as the base wrote it -- and the base\n"+
+				"carries no tag, so it renders bare and Kubernetes resolves it to :latest. The\n"+
+				"overlay then deploys one component at the pinned build and the rest at whatever\n"+
+				"latest happens to be. orderd, worker and prune share a schema; running them at\n"+
+				"different builds is what a migration breaks under, silently.",
+				filepath.ToSlash(kust), image, source)
+		}
+	}
+
+	if checked == 0 {
+		t.Fatal("found no overlay kustomization.yaml; this guard would pass forever")
+	}
+}
+
 var envIndexPatch = regexp.MustCompile(`/env/\d+`)
 
 // TestNoOverlayPatchesEnvByIndex forbids the reference that silently retargets.
