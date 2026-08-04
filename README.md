@@ -359,6 +359,8 @@ merely to pass today:
 | `TestTraceHandlerSurvivesWith` | Derived loggers silently losing trace correlation |
 | `TestPprofIsOnDefaultServeMuxButWeNeverServeIt` | Profiling endpoints on a public listener |
 | `TestAdmissionReleasesSlotOnPanic` | A panicking handler permanently consuming a slot |
+| `TestTheLivenessProbeIsNotShed` | Load shedding failing the liveness probe, so the kubelet restarts pods out of an overloaded service |
+| `TestTheProbeExemptionDoesNotLeakToOtherMethods` | That exemption widening into a shed-control bypass any caller can name |
 | `TestCommentsDoNotCiteMissingTests` | A comment claiming a proof that does not exist |
 | `TestCommentsDoNotCiteMissingSourceFiles` | A comment citing a **source** file that was never written — usually a mechanism that was never built |
 | `TestContextErrorsAreNotOurFault` | A client hang-up reported as `Internal`, putting a floor of disconnects under the alert on-call pages on |
@@ -408,7 +410,7 @@ merely to pass today:
 
 ### The pattern worth stealing: one contract, two implementations
 
-`ordertest.RunStoreContract` is a single suite of 15 behaviours. It runs unchanged against
+`ordertest.RunStoreContract` is a single suite of 16 behaviours. It runs unchanged against
 the in-memory store (microseconds, no Docker) and — from M4 — against real Postgres in
 testcontainers.
 
@@ -416,6 +418,14 @@ That is what makes the fast tier *trustworthy*. When a business test uses the in
 store and passes, it passes against behaviour real Postgres has also been shown to have. A
 hand-written fake that nothing holds to a contract is just a second implementation of your
 bugs — and unlike a generated mock, a fake can be *proven* equivalent to the real thing.
+
+The sixteenth behaviour is the clearest example of why the suite is shared. A page token
+whose id has been edited — while keeping the filter hash valid, which is possible because the
+hash covers the *filter*, not the id — used to return no error at all from the in-memory
+store and `invalid input syntax for type uuid` from Postgres, i.e. a **500 for
+caller-supplied input**. Two implementations, two different wrong answers, and a unit test
+against either one alone would have argued the other was fine. `order.decodeCursor` now
+rejects a non-uuid id, so both agree on `InvalidArgument`.
 
 Assertions only Postgres can make (SQLSTATE mapping, `FOR UPDATE SKIP LOCKED` disjointness,
 index usage) live in the adapter's own test file, not in the shared contract.
@@ -1096,6 +1106,17 @@ Admission runs first so a flood is shed *without paying for signature verificati
 limiter runs after auth because its key is the tenant, and the tenant comes from the verified
 token — before auth the only available key is client-controlled, which is not a quota but a
 suggestion.
+
+**`grpc.health.v1.Health/Check` is exempt from admission**, and the exemption is not a
+convenience. Health is registered on the *same* server as the business methods — deliberately,
+because Kubernetes' native `grpc:` probe dials the port that actually serves traffic — so the
+probe runs through the chain like any other RPC. Without the exemption, saturation answered the
+kubelet with `ResourceExhausted`, the liveness probe failed, and the pod was **restarted**:
+a replica removed from an already-overloaded service, its traffic pushed onto the pods next in
+line. A shedder that kills the thing proving you are alive turns overload into a rolling
+outage, and the restarts read like the cause rather than the symptom. The exemption is pinned
+to that one method — `Health/Watch` and any lookalike stay subject to the limit, or it becomes
+a bypass a caller can select by name.
 
 Shipping only the local one is the common mistake: a per-replica limit set at "100rps"
 silently becomes 100 × replicas, resets on every deploy, and changes meaning every time the

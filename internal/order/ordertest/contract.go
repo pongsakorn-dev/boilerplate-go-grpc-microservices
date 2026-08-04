@@ -2,6 +2,8 @@ package ordertest
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -11,6 +13,36 @@ import (
 
 	"github.com/example/gomicro/internal/order"
 )
+
+// tamperCursorID rewrites the id inside an opaque page token, leaving everything else --
+// including the filter hash -- intact.
+//
+// It works on the decoded JSON rather than on order's unexported cursor struct, which is the
+// point: this is what an ADVERSARY can do with nothing but a token they were legitimately
+// given and five minutes. If the encoding changes, this helper fails loudly here rather than
+// silently testing nothing.
+func tamperCursorID(t *testing.T, token, newID string) string {
+	t.Helper()
+
+	raw, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		t.Fatalf("the page token is not base64url, so this helper is out of date: %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("the page token is not JSON, so this helper is out of date: %v", err)
+	}
+	if _, ok := fields["i"]; !ok {
+		t.Fatalf("the page token has no %q field; this helper is out of date: %v", "i", fields)
+	}
+	fields["i"] = newID
+
+	b, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatalf("re-encode: %v", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
 
 // Harness is one store implementation, ready to test.
 type Harness struct {
@@ -266,6 +298,43 @@ func RunStoreContract(t *testing.T, newHarness Factory) {
 		_, err := h.Store.List(ctx, RefTenant, order.ListFilter{PageToken: "!!!not-base64!!!"})
 		if !errors.Is(err, order.ErrInvalidPageToken) {
 			t.Fatalf("got %v, want ErrInvalidPageToken", err)
+		}
+	})
+
+	// A token whose ID has been TAMPERED WITH but whose filter hash is still correct.
+	//
+	// This one belongs in the contract rather than in a unit test because it is the case
+	// where the two implementations genuinely disagreed. The in-memory store compares ids as
+	// strings and shrugs; Postgres compares against a uuid column and raises `invalid input
+	// syntax for type uuid`, which surfaced as a 500 for input the caller supplied.
+	//
+	// The filter hash is not a defence here, and that is the subtle part. It covers tenant,
+	// status and customer -- the fields that change the result set -- and deliberately not
+	// the id. So a caller decodes a token they were legitimately given, edits the id,
+	// re-encodes, and the hash still matches.
+	t.Run("a page token with a tampered id is rejected", func(t *testing.T) {
+		h := newHarness(t)
+		for i := 1; i <= 3; i++ {
+			mustCreate(t, h, NewOrder(WithID(SeqID(i)), WithCreatedAt(RefTime.Add(time.Duration(i)*time.Second))))
+		}
+		page, err := h.Store.List(ctx, RefTenant, order.ListFilter{PageSize: 1})
+		if err != nil {
+			t.Fatalf("List: %v", err)
+		}
+		if page.NextPageToken == "" {
+			t.Fatal("expected a next page token")
+		}
+
+		tampered := tamperCursorID(t, page.NextPageToken, "'; DROP TABLE orders; --")
+
+		// Same filter as the token was issued for, so the hash check passes and the id check
+		// is the only thing standing between this and the query.
+		_, err = h.Store.List(ctx, RefTenant, order.ListFilter{PageSize: 1, PageToken: tampered})
+		if !errors.Is(err, order.ErrInvalidPageToken) {
+			t.Fatalf("got %v, want ErrInvalidPageToken.\n\n"+
+				"A tampered id reached the store. Against Postgres that is a uuid parse error "+
+				"from the driver, which nothing classifies, so the caller gets a 500 for input "+
+				"they sent -- and it should have been an InvalidArgument.", err)
 		}
 	})
 

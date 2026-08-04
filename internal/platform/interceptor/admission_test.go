@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/example/gomicro/internal/platform/apperr"
+	"github.com/example/gomicro/internal/platform/observability"
 )
 
 var testInfo = &grpc.UnaryServerInfo{FullMethod: "/order.v1.OrderService/CreateOrder"}
@@ -85,6 +86,131 @@ func TestAdmissionShedsExcessLoadImmediately(t *testing.T) {
 
 	close(release)
 	wg.Wait()
+}
+
+// TestTheLivenessProbeIsNotShed is the difference between a survivable overload and a
+// rolling outage.
+//
+// grpcapi registers the health server on the same grpc.Server as the business methods --
+// correctly, because Kubernetes' native grpc: probe dials the port that actually serves
+// traffic. That means Health/Check goes through this interceptor like anything else, and
+// with no exemption it was answered with ResourceExhausted the moment the service saturated.
+//
+// Follow that through. The liveness probe fails, so the kubelet RESTARTS the pod. A replica
+// disappears from a service that was already at its limit, its share of the traffic moves to
+// the pods that remain, and the next one saturates. A load shedder that kills the thing
+// proving you are alive converts overload into cascading failure -- and the restarts look
+// like the cause rather than the consequence, so the incident points at the wrong thing.
+//
+// The test fills every slot for real rather than reaching into the limiter, and asserts both
+// halves: the probe is answered, AND an ordinary method is still being shed. The second half
+// is what stops this passing vacuously if the limit ever fails to engage.
+func TestTheLivenessProbeIsNotShed(t *testing.T) {
+	t.Parallel()
+
+	const limit = 2
+
+	release := make(chan struct{})
+	entered := make(chan struct{}, limit)
+
+	intercept := Admission(limit)
+	blocking := func(ctx context.Context, req any) (any, error) {
+		entered <- struct{}{}
+		<-release
+		return "ok", nil
+	}
+
+	var wg sync.WaitGroup
+	for range limit {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = intercept(context.Background(), nil, testInfo, blocking)
+		}()
+	}
+	for range limit {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("handlers did not start")
+		}
+	}
+	defer func() {
+		close(release)
+		wg.Wait()
+	}()
+
+	// Half one: the limiter really is full, so the exemption below is not vacuous.
+	if _, err := intercept(context.Background(), nil, testInfo, blocking); err == nil {
+		t.Fatal("an ordinary method was admitted past a full limiter, so this test proves nothing")
+	}
+
+	// Half two: the probe is answered anyway.
+	healthInfo := &grpc.UnaryServerInfo{FullMethod: observability.HealthCheckMethod}
+	served := func(ctx context.Context, req any) (any, error) { return "SERVING", nil }
+
+	resp, err := intercept(context.Background(), nil, healthInfo, served)
+	if err != nil {
+		t.Fatalf("the liveness probe was shed: %v.\n\n"+
+			"The kubelet reads that as a dead pod and restarts it -- removing a replica from "+
+			"a service that is already overloaded, and moving its traffic onto the pods that "+
+			"are next to fall over.", err)
+	}
+	if resp != "SERVING" {
+		t.Errorf("resp = %v, want the handler's own answer", resp)
+	}
+}
+
+// TestTheProbeExemptionDoesNotLeakToOtherMethods is the other side of the exemption.
+//
+// An exemption written as a prefix match, or extended to "anything on the health service",
+// would be a free pass an attacker can name. This pins it to the one method the kubelet
+// actually calls.
+func TestTheProbeExemptionDoesNotLeakToOtherMethods(t *testing.T) {
+	t.Parallel()
+
+	intercept := Admission(1)
+
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	blocking := func(ctx context.Context, req any) (any, error) {
+		entered <- struct{}{}
+		<-release
+		return "ok", nil
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = intercept(context.Background(), nil, testInfo, blocking)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the handler did not start")
+	}
+	defer func() {
+		close(release)
+		wg.Wait()
+	}()
+
+	// Neighbouring methods on the same service, and a lookalike, all stay subject to the limit.
+	for _, method := range []string{
+		"/grpc.health.v1.Health/Watch",
+		"/grpc.health.v1.Health/CheckSomethingElse",
+		"/grpc.health.v1.HealthAdmin/Check",
+		"/order.v1.OrderService/Check",
+	} {
+		t.Run(method, func(t *testing.T) {
+			info := &grpc.UnaryServerInfo{FullMethod: method}
+			if _, err := intercept(context.Background(), nil, info, blocking); err == nil {
+				t.Errorf("%s was admitted past a full limiter.\n\n"+
+					"Only %s is exempt. A broader match is a shed-control bypass that any "+
+					"caller can select by choosing a method name.", method, observability.HealthCheckMethod)
+			}
+		})
+	}
 }
 
 // TestAdmissionReleasesSlotOnPanic is the leak this interceptor is most likely to have.
