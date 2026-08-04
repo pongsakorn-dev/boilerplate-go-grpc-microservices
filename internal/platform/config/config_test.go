@@ -671,3 +671,48 @@ func TestInsecureIssuerIsRefusedInProduction(t *testing.T) {
 		}
 	})
 }
+
+// TestGatewayCanActuallyBeDisabled covers a documented off-switch that was unreachable.
+//
+// README says `GATEWAY_ADDR=""` disables the REST edge, and internal/app honours an empty
+// GatewayAddr by binding nothing. The link between them was broken: parser.str treats an empty
+// environment value as "not set" and substitutes the default, so GATEWAY_ADDR="" produced
+// ":8080" and the edge bound anyway. A service intended to speak only gRPC published a full
+// HTTP surface, exactly contrary to its own configuration.
+//
+// The disabled path WAS tested -- gateway_test.go sets cfg.GatewayAddr = "" on the parsed
+// struct and correctly asserts nothing binds. That is a path no deployment can take, so it
+// proved the app's behaviour and never the parser's. This test goes through config.Parse,
+// which is the only route a real process has.
+func TestGatewayCanActuallyBeDisabled(t *testing.T) {
+	t.Parallel()
+
+	t.Run("explicitly empty disables it", func(t *testing.T) {
+		t.Parallel()
+
+		cfg, err := config.Parse(map[string]string{"GATEWAY_ADDR": ""})
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if cfg.GatewayAddr != "" {
+			t.Errorf("GATEWAY_ADDR=\"\" produced %q, want \"\".\n\n"+
+				"The documented way to switch off the REST edge does nothing, so a service "+
+				"meant to serve only gRPC binds and publishes an HTTP surface anyway.",
+				cfg.GatewayAddr)
+		}
+	})
+
+	t.Run("unset still takes the default", func(t *testing.T) {
+		t.Parallel()
+
+		// The control. Distinguishing "set to empty" from "not set" is the entire fix, so a
+		// version that simply dropped the default would pass the case above and be wrong.
+		cfg, err := config.Parse(map[string]string{})
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if cfg.GatewayAddr != ":8080" {
+			t.Errorf("an unset GATEWAY_ADDR produced %q, want \":8080\"", cfg.GatewayAddr)
+		}
+	})
+}

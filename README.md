@@ -323,6 +323,7 @@ merely to pass today:
 | `TestInternalErrorsNeverLeakAndNeverLose` | Driver text reaching a client, or vanishing from the log |
 | `TestSecretIsRedactedThroughEveryEscapeRoute` | A password escaping via fmt, JSON **or** slog |
 | `TestValidateRejectsDevAuthInProduction` | `AUTH_MODE=dev` reaching production |
+| `TestGatewayCanActuallyBeDisabled` | A documented off-switch that the parser turns back on — `GATEWAY_ADDR=""` reading as unset and publishing HTTP anyway |
 | `TestTraceHandlerPassesTheStdlibConformanceSuite` | A wrapping slog handler breaking `WithGroup` |
 | `TestTraceHandlerSurvivesWith` | Derived loggers silently losing trace correlation |
 | `TestPprofIsOnDefaultServeMuxButWeNeverServeIt` | Profiling endpoints on a public listener |
@@ -347,6 +348,7 @@ merely to pass today:
 | `TestSlowRefreshDoesNotStallCachedVerifications` | One unauthenticated request stalling all auth |
 | `TestDiscoveryRecoversAfterAFailedFirstAttempt` | A pod serving Unauthenticated forever after an IdP blip |
 | `TestRealmSetsTheAudienceOnEveryTokenIssuingClient` | The Keycloak realm losing its audience mapper |
+| `TestUnitsBoundLeavesRoomForNanos` | A money bound that guards the multiplication but not the `+Nanos` after it, so a *valid* amount wraps to negative |
 | `TestStatusRoundTripsThroughItsName` | Stored status names drifting from the Go constants |
 | `TestTenantScopedOfUnwrapsEveryShapeGORMProduces` | The tenant guard silently not applying to `Find(&[]T{})` |
 | `TestTenantGuardFailsClosed` | A query with no tenant returning **every tenant's rows** |
@@ -367,6 +369,8 @@ merely to pass today:
 | `TestAllThreeProbesAreNativeGRPC` | A probe checking a port that isn't the one serving traffic |
 | `TestResourcesAreDeclaredWithNoCPULimit` | A CPU limit causing CFS-throttled p99 latency |
 | `TestAdminPortIsNotInTheService` | pprof reachable by anything in the cluster |
+| `TestNoOverlayPatchesEnvByIndex` | An overlay addressing `env/5` by position, silently retargeting the moment the base reorders |
+| `TestCloseDrainsOutsideIn` | The gateway shutting down *after* the gRPC server it forwards to — 500s on every deploy |
 
 ### The pattern worth stealing: one contract, two implementations
 

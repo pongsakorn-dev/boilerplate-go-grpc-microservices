@@ -291,3 +291,52 @@ func usdOrPanic(units int64, nanos int32) order.Money {
 	}
 	return m
 }
+
+// TestUnitsBoundLeavesRoomForNanos pins an off-by-one that silently wrapped int64.
+//
+// maxUnits was (MaxInt64 / NanosPerUnit) = 9223372036, and its comment said it "bounds Units so
+// that Units*NanosPerUnit cannot overflow int64". That is true of the MULTIPLICATION and false
+// of the expression it actually guards: totalNanos computes Units*NanosPerUnit + Nanos.
+//
+//	maxUnits * NanosPerUnit  = 9223372036000000000
+//	MaxInt64                 = 9223372036854775807
+//	headroom for Nanos       =          854775807
+//	Nanos may legally reach  =          999999999
+//
+// So for Units == maxUnits and Nanos above 854775807, totalNanos wrapped negative -- silently,
+// with no error -- and Add, Sub, Compare and the ordering they imply all returned nonsense for
+// a Money value that Validate had already accepted. Wrapping in a MONEY type is the failure this
+// whole integral representation exists to prevent, so it is worth a named test.
+func TestUnitsBoundLeavesRoomForNanos(t *testing.T) {
+	t.Parallel()
+
+	// The largest value the type accepts. If the bound is right, this is representable and
+	// arithmetic on it is monotonic; if it is wrong, the sum wraps to a negative number.
+	extreme, err := order.NewMoney("USD", order.MaxUnits(), 999_999_999)
+	if err != nil {
+		t.Fatalf("the maximum representable Money was rejected: %v", err)
+	}
+
+	one, err := order.NewMoney("USD", 0, 1)
+	if err != nil {
+		t.Fatalf("NewMoney(0,1): %v", err)
+	}
+
+	// Compare is implemented over totalNanos, so a wrap shows up as the largest value in the
+	// type comparing LESS than one nanounit.
+	got, err := extreme.Compare(one)
+	if err != nil {
+		t.Fatalf("comparing the maximum Money returned an error: %v", err)
+	}
+	if got != 1 {
+		t.Errorf("the maximum Money compares %d against 0.000000001, want 1.\n\n"+
+			"totalNanos overflowed int64 and wrapped negative, so every comparison and every "+
+			"sum involving a near-maximum amount is silently wrong -- in the type that exists "+
+			"precisely so money arithmetic cannot be silently wrong.", got)
+	}
+
+	// And adding to it must be refused rather than wrapping.
+	if _, err := extreme.Add(one); err == nil {
+		t.Error("adding to the maximum Money succeeded; overflow must be an error, not a wrap")
+	}
+}

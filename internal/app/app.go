@@ -490,27 +490,42 @@ func (a *App) Close(ctx context.Context) error {
 	case <-ctx.Done():
 	}
 
-	// Step 2: everything else, innermost-last.
-	//
-	// a.steps holds resource closers in CONSTRUCTION order (database opened before the
-	// server, and so on). Shutdown iterates backwards, so they release in the reverse of
-	// the order they were acquired -- the server stops before the pool it depends on.
+	// Step 2: everything else, innermost-last. See shutdownSteps for the ordering.
+	return Shutdown(ctx, a.shutdownSteps())
+}
+
+// shutdownSteps builds the ordered step list Close executes.
+//
+// SEPARATE FROM Close SO THE ORDER IS A VALUE A TEST CAN READ, which is the whole reason this
+// function exists. The ordering was wrong once -- the gateway shut down after the gRPC server
+// it forwards to -- and it was wrong for eleven milestones because nothing could observe it:
+// Close returns only an error, Shutdown logs no step names, and a test that builds its own
+// slice tests Shutdown's iteration rather than this list. (One did, and passed under the bug.)
+//
+// a.steps holds resource closers in CONSTRUCTION order (database opened before the server, and
+// so on). Shutdown iterates backwards, so they release in the reverse of the order they were
+// acquired -- the server stops before the pool it depends on.
+func (a *App) shutdownSteps() []Step {
 	steps := append([]Step(nil), a.steps...)
 
-	// The GATEWAY stops before the gRPC server it depends on.
+	// APPEND ORDER IS THE REVERSE OF EXECUTION ORDER. Shutdown walks the slice BACKWARDS, so
+	// the LAST step appended runs FIRST.
 	//
-	// Reversed, an in-flight HTTP request would find its in-process connection closed
-	// underneath it and return a 500 for a request that was about to succeed -- during every
-	// deploy. This is the same "drain outside-in" reasoning as the health flip above, applied
-	// one layer down.
-	if a.gatewaySrv != nil {
-		steps = append(steps, Step{
-			Name:    "gateway-server",
-			Timeout: 5 * time.Second,
-			Fn:      func(ctx context.Context) error { return a.gatewaySrv.Shutdown(ctx) },
-		})
-	}
-
+	// That inversion was got wrong here, and the comment beside it described the behaviour it
+	// was supposed to produce rather than the behaviour it produced. The gateway was appended
+	// BEFORE the gRPC server, which means it shut down AFTER it -- so an in-flight HTTP request
+	// found its in-process gRPC connection closed underneath it and returned 500 for a request
+	// that was about to succeed, on every deploy. Precisely the failure the old comment warned
+	// against, caused by the code the comment was attached to.
+	//
+	// Desired execution order, outside-in:
+	//
+	//	1. gateway   stop accepting HTTP first; it is the outermost surface
+	//	2. grpc      drain RPCs, including any the gateway just handed over
+	//	3. admin     last, so /metrics stays scrapeable for the whole drain
+	//	4. a.steps   in reverse acquisition order (pools, brokers, ...)
+	//
+	// so they are appended in exactly the opposite order below.
 	steps = append(steps,
 		Step{
 			Name:    "admin-server",
@@ -541,7 +556,17 @@ func (a *App) Close(ctx context.Context) error {
 		},
 	)
 
-	return Shutdown(ctx, steps)
+	// LAST APPENDED, SO IT RUNS FIRST. The gateway is the outermost surface and must stop
+	// accepting before the gRPC server it forwards to goes away.
+	if a.gatewaySrv != nil {
+		steps = append(steps, Step{
+			Name:    "gateway-server",
+			Timeout: 5 * time.Second,
+			Fn:      func(ctx context.Context) error { return a.gatewaySrv.Shutdown(ctx) },
+		})
+	}
+
+	return steps
 }
 
 // closeOpened releases anything already constructed when New fails partway.
