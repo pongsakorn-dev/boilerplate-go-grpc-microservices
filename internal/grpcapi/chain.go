@@ -118,24 +118,36 @@ func NewServer(d Deps) (*grpc.Server, error) {
 		interceptor.Validate(d.Validator),
 	}
 
-	// The stream chain is SHORTER than the unary one, and that is a known gap rather than
-	// an oversight: it has no Admission and no Validate.
+	// The stream chain is SHORTER than the unary one. It has no Admission and no Validate,
+	// and each absence is a decision rather than an omission.
+	//
+	// This comment used to say the same thing while the chain was also missing RateLimit --
+	// a comment written specifically to enumerate the gaps, which had gone stale and made the
+	// chain look audited. That gap was a real bypass, not untidiness: WatchOrders runs a List
+	// against the database on every open, so a tenant out of quota on the unary ListOrders
+	// could keep issuing the query by opening streams. RateLimitStream now closes it, and the
+	// note on that function explains what per-stream billing does and does not measure.
 	//
 	// Validate is genuinely not applicable -- a unary interceptor sees one request message,
 	// while a stream's messages arrive inside the handler, so per-message validation has to
 	// live there.
 	//
-	// Admission is a real open question. Holding a concurrency slot for the entire life of
-	// a long-lived watch would let ten idle subscribers exhaust a limiter sized for the
-	// database pool, which is worse than not limiting them. Today streams are bounded only
-	// by grpc.MaxConcurrentStreams (250). A fork that adds streaming work touching the
-	// database MUST revisit this -- see docs/adr/ when it lands.
+	// Admission stays out, and it is not inconsistent with adding the quota. Admission holds
+	// a concurrency SLOT for the life of the call, so ten idle subscribers would exhaust a
+	// limiter sized for the database pool -- worse than not limiting them. A quota check
+	// costs one token at open and holds nothing. Streams remain bounded by
+	// grpc.MaxConcurrentStreams (250); a fork whose streams do sustained database work MUST
+	// revisit that.
+	//
+	// chain_test.go asserts the two chains' interceptor sets against this list, so the next
+	// addition to one of them cannot leave this paragraph describing the other.
 	stream := []grpc.StreamServerInterceptor{
 		interceptor.RecoveryStream(d.Log, d.Cfg.ServiceName),
 		d.Metrics.Server.StreamServerInterceptor(),
 		interceptor.LoggingStream(d.Log),
 		interceptor.ErrorMapStream(d.Cfg.ServiceName),
 		interceptor.AuthStream(d.Verifier, d.Policy, d.Log),
+		interceptor.RateLimitStream(d.Limiter, d.Log),
 		interceptor.DeadlineStream(d.Cfg.Server.MaxTimeout),
 	}
 

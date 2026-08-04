@@ -361,6 +361,9 @@ merely to pass today:
 | `TestAdmissionReleasesSlotOnPanic` | A panicking handler permanently consuming a slot |
 | `TestTheLivenessProbeIsNotShed` | Load shedding failing the liveness probe, so the kubelet restarts pods out of an overloaded service |
 | `TestTheProbeExemptionDoesNotLeakToOtherMethods` | That exemption widening into a shed-control bypass any caller can name |
+| `TestTheStreamChainGapsAreTheDeclaredOnes` | An interceptor on unary calls and not on streams — a bypass reachable by choosing a streaming RPC |
+| `TestOpeningAStreamSpendsQuotaToo` | A throttled tenant running the same query for free by opening `WatchOrders` instead |
+| `TestAStreamingRestErrorIsNotTheUnaryShape` | The documented difference between the two REST error shapes silently ceasing to be true |
 | `TestCommentsDoNotCiteMissingTests` | A comment claiming a proof that does not exist |
 | `TestCommentsDoNotCiteMissingSourceFiles` | A comment citing a **source** file that was never written — usually a mechanism that was never built |
 | `TestContextErrorsAreNotOurFault` | A client hang-up reported as `Internal`, putting a floor of disconnects under the alert on-call pages on |
@@ -1709,7 +1712,15 @@ rather than maintained.
 - **Streams have no admission control.** They are bounded only by
   `grpc.MaxConcurrentStreams`; a long-lived watch holding a concurrency slot sized for the
   database pool would be worse than not limiting it. A fork adding streaming work that
-  touches the database must revisit this.
+  touches the database must revisit this. Streams *are* rate limited — one unit per **open**,
+  not per message — and `TestTheStreamChainGapsAreTheDeclaredOnes` reads `chain.go` to check
+  that this list of exceptions is still the complete one.
+- **A streaming error over REST is not the unary JSON shape.** grpc-gateway's
+  `WithStreamErrorHandler` returns a `*status.Status` and the runtime fixes the JSON around
+  it, so `{"error":{"code":16,…}}` — a numeric code, reason buried in `details` — is the best
+  the seam allows. There is deliberately no custom handler; one existed and was the default
+  re-implemented. A stream that fails *after* its first message has already sent `200`, so a
+  client checking only the status code reads a truncated result as complete.
 - **`-race` does not run locally on Windows** (no cgo). It runs on Linux in CI.
 
 Each milestone lands on its own branch and ends with a green `task verify`.

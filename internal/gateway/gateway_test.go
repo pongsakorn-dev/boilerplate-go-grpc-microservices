@@ -13,6 +13,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 
 	"github.com/example/gomicro/internal/platform/auth/testjwks"
 	"github.com/example/gomicro/internal/platform/config"
@@ -299,6 +300,85 @@ func TestGatewayCanBeDisabled(t *testing.T) {
 	conn := testutil.NewTestServer(t, func(c *config.Config) { c.GatewayAddr = "" })
 	if conn == nil {
 		t.Fatal("the gRPC server should still work with the gateway disabled")
+	}
+}
+
+// TestAStreamingRestErrorIsNotTheUnaryShape pins a difference the code cannot remove, so
+// that the next person is not tempted to "fix" it with a handler that changes nothing.
+//
+// One was registered for exactly that reason. It was `status.Convert(err)` behind an if whose
+// branches both returned the same value -- identical to runtime.DefaultStreamErrorHandler --
+// under a comment claiming it replaced the default. Nobody was careless: the seam simply
+// cannot deliver what the comment wanted. StreamErrorHandlerFunc returns a *status.Status and
+// the runtime marshals `{"error": <google.rpc.Status>}` around it, so the JSON shape is not
+// the handler's to choose.
+//
+// The two surfaces are contrasted in one test on purpose. Asserting the streaming shape alone
+// would pass just as well if the unary shape regressed to match it, and the unary shape --
+// symbolic code, top-level reason -- is the one this service actually promises.
+func TestAStreamingRestErrorIsNotTheUnaryShape(t *testing.T) {
+	t.Parallel()
+
+	// An ANONYMOUS request is the fixture, because the rejection has to happen before the
+	// first message. Auth runs ahead of the handler, so the stream fails without ever being
+	// opened -- and, unlike a quota rejection, it returns immediately. A watch that succeeds
+	// holds its connection open until the deadline, which makes it useless as a test subject.
+	iss := testjwks.New(t)
+	srv, _ := testutil.NewTestGateway(t, oidcMode(iss))
+
+	unaryStatus, unaryBody, unaryRaw := doJSON(t, srv.URL, http.MethodGet, "/v1/orders", "", nil)
+
+	if unaryStatus != http.StatusUnauthorized {
+		t.Fatalf("anonymous unary call returned %d, want 401: %s", unaryStatus, unaryRaw)
+	}
+	unaryErr, ok := unaryBody["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("unary error body has no error object: %s", unaryRaw)
+	}
+	// The exact value, not merely "a string". An earlier draft asserted only the Go type and
+	// passed happily when the field was sabotaged to the empty string -- which is a string,
+	// and is useless to a client.
+	if unaryErr["code"] != codes.Unauthenticated.String() {
+		t.Errorf("unary code = %q, want %q.\n\n"+
+			"An integer is meaningless to a client that never sees gRPC, and the symbolic "+
+			"form is the shape this service promises: %s",
+			unaryErr["code"], codes.Unauthenticated.String(), unaryRaw)
+	}
+	if unaryErr["reason"] == nil || unaryErr["reason"] == "" {
+		t.Errorf("unary error has no top-level reason, which is what clients branch on: %s", unaryRaw)
+	}
+
+	streamStatus, streamBody, streamRaw := doJSON(t, srv.URL, http.MethodGet, "/v1/orders:watch", "", nil)
+
+	if streamStatus != http.StatusUnauthorized {
+		t.Fatalf("anonymous stream open returned %d, want 401: %s", streamStatus, streamRaw)
+	}
+	streamErr, ok := streamBody["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("stream error body has no error object: %s", streamRaw)
+	}
+
+	// The documented difference. If this ever starts matching the unary shape, grpc-gateway
+	// has gained a seam worth using and errors.go's explanation is out of date.
+	if _, isString := streamErr["code"].(string); isString {
+		t.Errorf("the streaming error carries a symbolic code %v.\n\n"+
+			"errors.go says this is impossible through WithStreamErrorHandler. If it is now "+
+			"possible, that comment needs rewriting and the handler needs writing: %s",
+			streamErr["code"], streamRaw)
+	}
+	if _, hasReason := streamErr["reason"]; hasReason {
+		t.Errorf("the streaming error has a top-level reason: %s.\n\n"+
+			"Same as above -- errors.go documents that reason survives only inside details.",
+			streamRaw)
+	}
+
+	// And the reason is not LOST, just relocated into details. A client can still find it; it
+	// just has to look somewhere else than on the unary path, which is the fact worth
+	// documenting rather than the fact worth fixing.
+	wantReason, _ := unaryErr["reason"].(string)
+	if wantReason != "" && !strings.Contains(streamRaw, wantReason) {
+		t.Errorf("the streaming error dropped the machine-readable reason %q entirely: %s",
+			wantReason, streamRaw)
 	}
 }
 

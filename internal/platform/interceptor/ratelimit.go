@@ -27,57 +27,100 @@ import (
 // for signature verification. Two mechanisms, two positions, two jobs.
 func RateLimit(limiter ratelimit.Limiter, log *slog.Logger) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-		principal, ok := auth.PrincipalFrom(ctx)
-		if !ok || principal.TenantID == "" {
-			// No principal means a Public method -- health, which the kubelet calls once a
-			// second from three probes on every pod. Rate limiting the liveness probe is how
-			// a service throttles itself out of its own Service endpoints.
-			return handler(ctx, req)
+		if err := checkQuota(ctx, limiter, log, info.FullMethod); err != nil {
+			return nil, err
 		}
-
-		key := limitKey(principal.TenantID, info.FullMethod)
-
-		result, err := limiter.Allow(ctx, key)
-		if err != nil {
-			// FAIL OPEN, and this is the opposite of what auth does two lines up the chain.
-			//
-			// The difference is what each protects. Auth protects DATA: without it a request
-			// may read something it must not, so an auth failure must deny. The limiter
-			// protects CAPACITY: without it requests are merely unthrottled. Failing closed
-			// here would mean an unreachable Redis rejects every request on every replica --
-			// converting "quotas are temporarily unenforced" into a total outage, and making
-			// the limiter a hard dependency of serving at all.
-			//
-			// It must be LOUD, though, or "the limiter has been off for a month" is a thing
-			// you discover from a bill. grpcprom already counts outcomes; this log names the
-			// cause.
-			log.WarnContext(ctx, "rate limiter unavailable, allowing the request",
-				slog.String("method", info.FullMethod),
-				slog.String("tenant", principal.TenantID),
-				slog.String("error", err.Error()))
-			return handler(ctx, req)
-		}
-
-		if !result.Allowed {
-			// Retry-After reaches BOTH surfaces.
-			//
-			// RetryInfo is the gRPC detail that clients and service meshes read to schedule a
-			// retry. The header is what survives transcoding to REST -- gateway/errors.go
-			// forwards `retry-after` specifically. Without them a well-behaved client retries
-			// immediately, and the retries become the load.
-			setRetryHeaders(ctx, result)
-
-			return nil, apperr.New(apperr.KindResourceExhausted, "RATE_LIMITED",
-				"request quota exceeded").
-				WithMetadata(map[string]string{"retry_after": result.RetryAfter.String()}).
-				WithDetails(&errdetails.RetryInfo{
-					RetryDelay: durationpb.New(result.RetryAfter),
-				})
-		}
-
-		setRemainingHeader(ctx, result)
 		return handler(ctx, req)
 	}
+}
+
+// RateLimitStream applies the same quota to a streaming RPC, ONCE AT STREAM OPEN.
+//
+// The stream chain used to have no rate limiting at all, and the comment in
+// internal/grpcapi/chain.go that exists specifically to enumerate the stream chain's gaps
+// listed Admission and Validate and did not mention this one. So the gap was not a decision
+// anybody had made -- it was a decision nobody had noticed needed making, described by a
+// comment that made the chain look audited.
+//
+// It was a real bypass rather than a tidiness problem. WatchOrders runs a List query against
+// the database on every open, so a tenant that had exhausted its quota on the unary
+// ListOrders could issue the same query without limit by opening streams instead. The
+// cheapest path around a quota should not be a different RPC for the same data.
+//
+// Admission is deliberately still absent from the stream chain, and the two are not
+// inconsistent. Admission holds a CONCURRENCY SLOT for as long as the call runs, so ten idle
+// watchers would occupy a limiter sized for the database pool -- worse than not limiting
+// them. A quota check costs one token at open and holds nothing.
+//
+// WHAT THIS DOES NOT DO: it bills one unit per stream, not per message. A stream that stays
+// open for an hour and sends ten thousand messages costs the same as one that opens and
+// closes. That is the right accounting for this template, whose only stream sends a snapshot
+// and then idles -- and it is the wrong accounting for a fork whose streams carry billable
+// per-message work. Such a fork should meter in the handler, where it knows what a unit is.
+func RateLimitStream(limiter ratelimit.Limiter, log *slog.Logger) grpc.StreamServerInterceptor {
+	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		if err := checkQuota(ss.Context(), limiter, log, info.FullMethod); err != nil {
+			return err
+		}
+		return handler(srv, ss)
+	}
+}
+
+// checkQuota is the whole decision, shared by both chains so they cannot drift.
+//
+// Returns nil when the call may proceed. The same shape as auth's authorize, and for the
+// same reason: two copies of a policy is two policies.
+func checkQuota(ctx context.Context, limiter ratelimit.Limiter, log *slog.Logger, fullMethod string) error {
+	principal, ok := auth.PrincipalFrom(ctx)
+	if !ok || principal.TenantID == "" {
+		// No principal means a Public method -- health, which the kubelet calls once a
+		// second from three probes on every pod. Rate limiting the liveness probe is how
+		// a service throttles itself out of its own Service endpoints.
+		return nil
+	}
+
+	key := limitKey(principal.TenantID, fullMethod)
+
+	result, err := limiter.Allow(ctx, key)
+	if err != nil {
+		// FAIL OPEN, and this is the opposite of what auth does two lines up the chain.
+		//
+		// The difference is what each protects. Auth protects DATA: without it a request
+		// may read something it must not, so an auth failure must deny. The limiter
+		// protects CAPACITY: without it requests are merely unthrottled. Failing closed
+		// here would mean an unreachable Redis rejects every request on every replica --
+		// converting "quotas are temporarily unenforced" into a total outage, and making
+		// the limiter a hard dependency of serving at all.
+		//
+		// It must be LOUD, though, or "the limiter has been off for a month" is a thing
+		// you discover from a bill. grpcprom already counts outcomes; this log names the
+		// cause.
+		log.WarnContext(ctx, "rate limiter unavailable, allowing the request",
+			slog.String("method", fullMethod),
+			slog.String("tenant", principal.TenantID),
+			slog.String("error", err.Error()))
+		return nil
+	}
+
+	if !result.Allowed {
+		// Retry-After reaches BOTH surfaces.
+		//
+		// RetryInfo is the gRPC detail that clients and service meshes read to schedule a
+		// retry. The header is what survives transcoding to REST -- gateway/errors.go
+		// forwards `retry-after` specifically. Without them a well-behaved client retries
+		// immediately, and the retries become the load.
+		setRetryHeaders(ctx, result)
+
+		return apperr.New(apperr.KindResourceExhausted, "RATE_LIMITED",
+			"request quota exceeded").
+			WithMetadata(map[string]string{"retry_after": result.RetryAfter.String()}).
+			WithDetails(&errdetails.RetryInfo{
+				RetryDelay: durationpb.New(result.RetryAfter),
+			})
+	}
+
+	setRemainingHeader(ctx, result)
+	return nil
 }
 
 // limitKey scopes the quota to one tenant and one method.
