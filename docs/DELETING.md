@@ -94,13 +94,22 @@ a substitute — see the README.
 - **Wiring:**
   - `internal/app/app.go`: remove `buildLimiter` and its call.
   - `internal/grpcapi/chain.go`: remove the `Limiter` field from `Deps`, its nil check in
-    `NewServer`, and `interceptor.RateLimit(...)` from the chain.
+    `NewServer`, and **both** `interceptor.RateLimit(...)` from the unary chain **and**
+    `interceptor.RateLimitStream(...)` from the stream chain. Missing the second leaves the
+    tree uncompilable after `ratelimit.go` is deleted — this line named only the unary one
+    until the streaming quota was added, and the guide was not updated with it.
+  - `internal/grpcapi/chainparity_test.go`: add `"RateLimit"` to `declaredStreamGaps`, or
+    delete the file. It asserts every interceptor in the unary chain has a streaming
+    counterpart unless the gap is written down, so removing one chain's entry and not the
+    other's fails it.
 - **Config:** remove `RedisConfig`, the `Redis` field, its `REDIS_*`/`RATE_LIMIT_*` entries in
   `Parse`, and the Redis block in `Validate`.
 - **Dependencies:** `github.com/redis/go-redis/v9` and `github.com/alicebob/miniredis/v2` leave
   `go.mod` after `go mod tidy`.
 - **Tests deleted with it:** `internal/platform/ratelimit/*_test.go`,
-  `internal/platform/interceptor/ratelimit_test.go`.
+  `internal/platform/interceptor/ratelimit_test.go`, and the streaming-quota cases in
+  `internal/grpcapi/ratelimit_test.go` (`TestOpeningAStreamSpendsQuotaToo`) and
+  `internal/gateway/gateway_test.go` (`TestRetryAfterReachesRestClientsUnderItsRealName`).
 - **Compose:** remove the `redis` service from `deploy/compose/docker-compose.yml`.
 
 ---

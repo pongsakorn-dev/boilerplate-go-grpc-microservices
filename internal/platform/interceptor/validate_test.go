@@ -181,6 +181,56 @@ func TestValidateEnforcesRulesDeclaredInTheProto(t *testing.T) {
 	}
 }
 
+// TestAnOversizedPageSizeIsRejectedNotClamped settles which of two mechanisms a caller meets.
+//
+// order.ClampPageSize reduces anything above MaxPageSize to MaxPageSize, and the .proto puts
+// `lte: 1000` on the same field. Both cannot be what a client experiences, and the .proto
+// comment claimed the wrong one: it said an oversized request was "silently reduced to 1000"
+// and that "a caller asking for 10000 receives 1000 rows". Validation runs first, so they
+// receive an error and no rows at all.
+//
+// That distinction is the whole difference between a forgiving API and a strict one, it is
+// what a client's error handling has to be written against, and the sentence asserting it
+// shipped into the generated Go and the published OpenAPI document.
+//
+// The clamp is not dead code -- it still supplies the 0 -> DefaultPageSize fallback, and it
+// still guards the domain against a caller that reaches order.Service directly rather than
+// over the wire.
+func TestAnOversizedPageSizeIsRejectedNotClamped(t *testing.T) {
+	t.Parallel()
+
+	intercept := Validate(newValidator(t))
+
+	var reached bool
+	handler := func(ctx context.Context, req any) (any, error) {
+		reached = true
+		return "ok", nil
+	}
+
+	req := &orderv1.ListOrdersRequest{PageSize: 10_000}
+
+	_, err := intercept(context.Background(), req, testInfo, handler)
+	if err == nil {
+		t.Fatal("page_size 10000 was accepted; the .proto declares lte: 1000")
+	}
+	if reached {
+		t.Error("the handler ran, so the clamp -- not validation -- would decide the outcome")
+	}
+	if kind := apperr.KindOf(err); kind != apperr.KindInvalidArgument {
+		t.Errorf("kind = %v, want InvalidArgument", kind)
+	}
+
+	// And the boundary itself is accepted, or the documented maximum would be off by one.
+	reached = false
+	if _, err := intercept(context.Background(),
+		&orderv1.ListOrdersRequest{PageSize: 1000}, testInfo, handler); err != nil {
+		t.Errorf("page_size 1000 was rejected, but 1000 is the documented maximum: %v", err)
+	}
+	if !reached {
+		t.Error("the handler did not run for the boundary value")
+	}
+}
+
 // TestValidateIgnoresAnEmptyOptionalField proves IGNORE_IF_ZERO_VALUE works: an absent
 // idempotency key must be allowed, while a malformed one must not.
 func TestValidateIgnoresAnEmptyOptionalField(t *testing.T) {
