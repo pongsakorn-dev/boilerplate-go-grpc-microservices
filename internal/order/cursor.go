@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"hash/fnv"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // Keyset pagination, not OFFSET.
@@ -52,6 +54,26 @@ func decodeCursor(token string, wantHash uint32) (cursor, error) {
 	}
 	if c.FilterHash != wantHash {
 		return cursor{}, fmt.Errorf("%w: token was issued for a different filter", ErrInvalidPageToken)
+	}
+
+	// THE ID IS VALIDATED HERE, and the FilterHash above is not a substitute for it.
+	//
+	// The hash covers tenant, status and customer -- the fields that change the RESULT SET.
+	// It deliberately does not cover the id, which means editing the id in an otherwise
+	// legitimate token leaves the hash correct: decode your own valid token, replace "i" with
+	// anything, re-encode, and every check above passes.
+	//
+	// That string is then interpolated into a keyset comparison against a uuid column, so
+	// Postgres rejects it with `invalid input syntax for type uuid`, the store returns a raw
+	// driver error, and the error model -- correctly, for an error nobody classified -- maps
+	// it to Internal. A 500, from caller-supplied input, on a request the caller could have
+	// been told was simply malformed.
+	//
+	// Validating here rather than in the adapter keeps the answer the same for every store:
+	// ordermem accepts anything, so a bug reachable only against Postgres would be invisible
+	// in the default test tier, which is where most of this repository's tests run.
+	if err := uuid.Validate(c.ID); err != nil {
+		return cursor{}, fmt.Errorf("%w: token id is not a uuid", ErrInvalidPageToken)
 	}
 	return c, nil
 }
