@@ -352,6 +352,8 @@ merely to pass today:
 | `TestAllProtoFieldsAreAcknowledged` | A new proto field silently never mapped |
 | `TestEveryKindIsMapped` | A new error Kind with no gRPC/HTTP row |
 | `TestInternalErrorsNeverLeakAndNeverLose` | Driver text reaching a client, or vanishing from the log |
+| `TestRedactionCoversMetadataAndNotOnlyTheMessage` | An `Internal` error redacting its message and shipping the same detail in `ErrorInfo.metadata` |
+| `TestRetryAfterReachesRestClientsUnderItsRealName` | Backoff advice arriving as `Grpc-Metadata-Retry-After`, which no HTTP client honours |
 | `TestSecretIsRedactedThroughEveryEscapeRoute` | A password escaping via fmt, JSON **or** slog |
 | `TestValidateRejectsDevAuthInProduction` | `AUTH_MODE=dev` reaching production |
 | `TestGatewayCanActuallyBeDisabled` | A documented off-switch that the parser turns back on — `GATEWAY_ADDR=""` reading as unset and publishing HTTP anyway |
@@ -365,7 +367,7 @@ merely to pass today:
 | `TestOpeningAStreamSpendsQuotaToo` | A throttled tenant running the same query for free by opening `WatchOrders` instead |
 | `TestAStreamingRestErrorIsNotTheUnaryShape` | The documented difference between the two REST error shapes silently ceasing to be true |
 | `TestCommentsDoNotCiteMissingTests` | A comment claiming a proof that does not exist |
-| `TestCommentsDoNotCiteMissingSourceFiles` | A comment citing a **source** file that was never written — usually a mechanism that was never built |
+| `TestCommentsDoNotCiteMissingSourceFiles` | A comment citing a **source** file *or package directory* that was never written — usually a mechanism that was never built |
 | `TestContextErrorsAreNotOurFault` | A client hang-up reported as `Internal`, putting a floor of disconnects under the alert on-call pages on |
 | `TestAnUpstreamErrorCannotBeReturnedByAccident` | An upstream's `NotFound` reaching your caller as if it were about *their* request |
 | `TestVendoredProtosKeepTheirLicenseHeaders` | Apache-2.0 attribution being stripped from vendored protos |
@@ -1135,6 +1137,13 @@ Shipping only the local one is the common mistake: a per-replica limit set at "1
 silently becomes 100 × replicas, resets on every deploy, and changes meaning every time the
 HPA scales.
 
+**`Retry-After` reaches REST clients under its real name.** grpc metadata normally arrives as
+`Grpc-Metadata-<key>`, and forwarding the limiter's advice that way meant every throttled HTTP
+client received a header no client, proxy or browser has any behaviour for — the limiter
+worked, the forwarding worked, the header arrived, and nothing backed off. The gateway now
+drops the prefix for standard headers only; `x-request-id` keeps it, because there is no
+standard behaviour to preserve.
+
 ### GCRA, not a token bucket
 
 A token bucket needs two values per key (tokens, last refill) read-modify-written atomically.
@@ -1439,8 +1448,13 @@ set two claim paths:
 
 A worked Keycloak realm is in [`deploy/keycloak/`](deploy/keycloak/) — including the
 **audience mapper**, which is the single most common OIDC integration failure: a Keycloak
-access token's default `aud` is `account`, not your API. That realm file has not yet been
-booted against a real Keycloak; see the note in its README.
+access token's default `aud` is `account`, not your API.
+
+It is **booted and verified automatically** by [`test/e2e/oidc`](test/e2e/oidc/oidc_test.go)
+on every `task verify:e2e`: the realm is imported into a real Keycloak 26.4, `orderd` runs
+against it with `AUTH_MODE=oidc`, and five assertions have to hold. Booting it found a real
+bug — Keycloak 26 moved `sub` into the `basic` client scope, so every *user* token this realm
+issued arrived without one while service-account tokens happened to work.
 
 ---
 

@@ -155,8 +155,19 @@ func handleError(
 // writeGRPCMetadata copies server metadata onto the HTTP response.
 //
 // grpc-gateway's default handler does this and a custom one that forgets it silently drops
-// anything a handler set via grpc.SetHeader -- which today is nothing, and tomorrow is the
-// Retry-After the rate limiter (M7) will want to send.
+// anything a handler set via grpc.SetHeader -- which is how the rate limiter's Retry-After
+// reaches a REST client at all.
+//
+// THE PREFIX IS DROPPED FOR STANDARD HEADERS, and keeping it made the forwarding pointless.
+//
+// Every value used to go out as runtime.MetadataHeaderPrefix+key, i.e.
+// `Grpc-Metadata-Retry-After`. Retry-After is an RFC 9110 header that HTTP clients, proxies
+// and browsers already act on; under that prefix it is an unrecognised string that nothing
+// honours. The rate limiter set it, the gateway forwarded it, a test could see it arriving,
+// and no client would ever have backed off -- which is the whole reason it is sent.
+//
+// x-request-id keeps the prefix. It is not a standard header, so there is no behaviour to
+// preserve, and the prefix marks it as having come from the gRPC side.
 func writeGRPCMetadata(ctx context.Context, w http.ResponseWriter) {
 	md, ok := runtime.ServerMetadataFromContext(ctx)
 	if !ok {
@@ -169,8 +180,12 @@ func writeGRPCMetadata(ctx context.Context, w http.ResponseWriter) {
 		if !isForwardable(key) {
 			continue
 		}
+		name := runtime.MetadataHeaderPrefix + key
+		if isStandardHTTPHeader(key) {
+			name = key
+		}
 		for _, v := range values {
-			w.Header().Add(runtime.MetadataHeaderPrefix+key, v)
+			w.Header().Add(name, v)
 		}
 	}
 }
@@ -186,4 +201,14 @@ func isForwardable(key string) bool {
 	default:
 		return false
 	}
+}
+
+// isStandardHTTPHeader reports whether a key must reach the client under its real name to
+// mean anything.
+//
+// Deliberately a separate, smaller list than isForwardable. Forwarding decides what a client
+// is ALLOWED to see; this decides what a client can ACT on. Conflating them would mean every
+// future addition to the allowlist silently claimed standard-header semantics.
+func isStandardHTTPHeader(key string) bool {
+	return key == "retry-after"
 }

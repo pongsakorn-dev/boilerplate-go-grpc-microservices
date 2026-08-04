@@ -73,9 +73,18 @@ func newUUIDv7() (string, error) {
 
 // CreateCommand is the input to Create.
 //
-// There is no idempotency key here on purpose. Idempotency is a transport-level concern
-// about retried requests, not a business rule, so it is applied as a wrapper at the API
-// boundary (internal/platform/idempotency) rather than threaded through the domain.
+// There is no idempotency key here on purpose, and there is no idempotency ANYWHERE in this
+// repository -- it was cut. See docs/adr/0002-what-was-cut.md.
+//
+// This used to say the mechanism "is applied as a wrapper at the API boundary
+// (internal/platform/idempotency)", present tense, naming a package that has never existed.
+// The reasoning in that sentence is still the right reasoning -- idempotency is a
+// transport-level concern about retried requests rather than a business rule, so it belongs
+// at the boundary and not threaded through the domain. It describes where a fork should put
+// it, not where this repository keeps it.
+//
+// CreateOrderRequest does carry an idempotency_key field. It is validated and ignored; the
+// note on it in the .proto says so.
 type CreateCommand struct {
 	TenantID   string
 	CustomerID string

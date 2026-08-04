@@ -37,11 +37,31 @@ func ToStatus(err error, domain string) *status.Status {
 
 	st := status.New(ae.Kind.GRPCCode(), ae.ClientMessage())
 
+	// METADATA IS REDACTED ALONGSIDE THE MESSAGE, and omitting that was a hole in rule 1.
+	//
+	// ClientMessage() replaces the text of a redacting Kind with "internal error". Metadata
+	// went out untouched, and it is the same wire object -- ErrorInfo carries reason, domain
+	// AND metadata, so a caller reading the details of an Internal error saw whatever the
+	// handler had attached for its own logs.
+	//
+	// It was not hypothetical. client.AsAppError attaches upstream, upstream_method and
+	// upstream_code, and its Kind for anything that is not a plain outage is KindInternal --
+	// so an untranslated upstream failure disclosed the address of an internal service and
+	// the name of an internal RPC to an external caller. The comment on that function says it
+	// relies on redaction to keep exactly that text out of the response.
+	//
+	// The information is not lost: Error() still carries the cause into the log, which is
+	// where "which upstream, which method" belongs.
+	metadata := ae.Metadata
+	if ae.Kind.Redacts() {
+		metadata = nil
+	}
+
 	details := []protoadapt.MessageV1{
 		protoadapt.MessageV1Of(&errdetails.ErrorInfo{
 			Reason:   ae.Reason,
 			Domain:   domain,
-			Metadata: ae.Metadata,
+			Metadata: metadata,
 		}),
 	}
 	for _, d := range ae.Details {

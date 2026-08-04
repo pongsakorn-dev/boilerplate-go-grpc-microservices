@@ -128,6 +128,70 @@ func TestInternalErrorsNeverLeakAndNeverLose(t *testing.T) {
 	}
 }
 
+// TestRedactionCoversMetadataAndNotOnlyTheMessage closes the half of rule 1 that was open.
+//
+// The redaction test above asserts on st.Message() alone, and that is exactly how far the
+// implementation went: ClientMessage() replaced the text, and ae.Metadata was copied to the
+// wire untouched. ErrorInfo carries reason, domain AND metadata, so everything a handler
+// attached for its own logs travelled with the "internal error" that was supposed to say
+// nothing.
+//
+// The live case was client.AsAppError, which attaches the upstream's address and method and
+// whose default Kind for anything but a plain outage is KindInternal. An external caller
+// therefore learned the hostname of an internal service and the name of an internal RPC --
+// from an error whose entire contract is that it discloses nothing.
+//
+// Asserting one channel of a two-channel disclosure is the pattern worth noticing here: the
+// test named for never-leaking passed throughout, because it only ever looked at the message.
+func TestRedactionCoversMetadataAndNotOnlyTheMessage(t *testing.T) {
+	t.Parallel()
+
+	secret := map[string]string{
+		"upstream":        "inventory.internal.svc.cluster.local:50051",
+		"upstream_method": "/inventory.v1.InventoryService/CheckStock",
+	}
+
+	for _, k := range AllKinds() {
+		t.Run(k.String(), func(t *testing.T) {
+			t.Parallel()
+
+			st := ToStatus(New(k, "SOME_REASON", "a message").WithMetadata(secret), "orderd")
+
+			var info *errdetails.ErrorInfo
+			for _, d := range st.Details() {
+				if ei, ok := d.(*errdetails.ErrorInfo); ok {
+					info = ei
+				}
+			}
+			if info == nil {
+				t.Fatalf("%s carries no ErrorInfo", k)
+			}
+
+			// The reason and domain always survive: they are the machine-readable contract,
+			// and neither says anything about internal state.
+			if info.GetReason() != "SOME_REASON" {
+				t.Errorf("reason = %q, want it to survive redaction", info.GetReason())
+			}
+
+			if k.Redacts() {
+				if len(info.GetMetadata()) != 0 {
+					t.Errorf("%s reached the wire carrying metadata %v.\n\n"+
+						"This Kind redacts its message precisely because it may describe "+
+						"internal state, and metadata is the same disclosure through a "+
+						"different field of the same object.", k, info.GetMetadata())
+				}
+				return
+			}
+
+			// And it must NOT be dropped for the Kinds that legitimately use it -- the rate
+			// limiter's retry_after is metadata on a ResourceExhausted.
+			if info.GetMetadata()["upstream"] != secret["upstream"] {
+				t.Errorf("%s lost its metadata; only redacting Kinds should", k)
+			}
+		})
+	}
+}
+
 // TestToStatusCarriesErrorInfo proves clients get something machine-readable.
 //
 // The message is explicitly not a contract -- it is English operator text and may change.

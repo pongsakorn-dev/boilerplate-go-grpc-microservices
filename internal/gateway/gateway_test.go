@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/alicebob/miniredis/v2"
 	"go.opentelemetry.io/otel"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -379,6 +380,60 @@ func TestAStreamingRestErrorIsNotTheUnaryShape(t *testing.T) {
 	if wantReason != "" && !strings.Contains(streamRaw, wantReason) {
 		t.Errorf("the streaming error dropped the machine-readable reason %q entirely: %s",
 			wantReason, streamRaw)
+	}
+}
+
+// TestRetryAfterReachesRestClientsUnderItsRealName is the difference between sending backoff
+// advice and sending a string nobody reads.
+//
+// The rate limiter sets `retry-after` in gRPC metadata, and the gateway forwards it -- but it
+// forwarded EVERY allowlisted key as runtime.MetadataHeaderPrefix+key, so a REST client
+// received `Grpc-Metadata-Retry-After`. Retry-After is an RFC 9110 header that HTTP clients,
+// proxies and browsers already honour; under that prefix it is an unrecognised string with no
+// behaviour attached to it.
+//
+// Nothing failed. The limiter worked, the forwarding worked, the header arrived. It simply
+// had no effect on any client, which is the entire reason it is sent -- and the symptom of
+// getting it wrong is a throttled client that keeps hammering, indistinguishable from a
+// client that ignores backoff on purpose.
+func TestRetryAfterReachesRestClientsUnderItsRealName(t *testing.T) {
+	t.Parallel()
+
+	mr := miniredis.RunT(t)
+	srv, _ := testutil.NewTestGateway(t, func(c *config.Config) {
+		c.Redis.Addr = mr.Addr()
+		c.Redis.RateLimitPerMinute = 60
+		c.Redis.RateLimitBurst = 1
+	})
+
+	// Spend the burst, then take the rejection.
+	var resp *http.Response
+	for range 4 {
+		r, err := http.Get(srv.URL + "/v1/orders")
+		if err != nil {
+			t.Fatalf("GET /v1/orders: %v", err)
+		}
+		_ = r.Body.Close()
+		if r.StatusCode == http.StatusTooManyRequests {
+			resp = r
+			break
+		}
+	}
+	if resp == nil {
+		t.Fatal("no request was throttled with a burst of 1, so this test proves nothing")
+	}
+
+	if got := resp.Header.Get("Retry-After"); got == "" {
+		t.Errorf("the 429 carries no Retry-After header. Present instead: %v\n\n"+
+			"A client that cannot see standard backoff advice retries immediately, and the "+
+			"retries become the load the limiter exists to shed.",
+			resp.Header)
+	}
+
+	// And the prefixed form must be gone, or a client sees the same advice twice under two
+	// names and has to guess which one is authoritative.
+	if got := resp.Header.Get("Grpc-Metadata-Retry-After"); got != "" {
+		t.Errorf("Retry-After is ALSO present as Grpc-Metadata-Retry-After = %q", got)
 	}
 }
 
