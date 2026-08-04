@@ -66,6 +66,9 @@ func TestKindMapping(t *testing.T) {
 		{KindResourceExhausted, codes.ResourceExhausted, http.StatusTooManyRequests},
 		{KindUnavailable, codes.Unavailable, http.StatusServiceUnavailable},
 		{KindInternal, codes.Internal, http.StatusInternalServerError},
+		// 499 is nginx's, not net/http's. See the kindInfo row for why it is worth it.
+		{KindCanceled, codes.Canceled, 499},
+		{KindDeadlineExceeded, codes.DeadlineExceeded, http.StatusGatewayTimeout},
 	}
 
 	if len(tests) != len(AllKinds()) {

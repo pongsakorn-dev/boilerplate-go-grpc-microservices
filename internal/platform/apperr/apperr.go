@@ -14,6 +14,7 @@
 package apperr
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -59,6 +60,23 @@ const (
 
 	// KindInternal: a bug. Never carries detail to the client.
 	KindInternal
+
+	// KindCanceled: the CALLER hung up. Not a failure of this service, and the single
+	// most important thing about it is that it is not KindInternal.
+	//
+	// Without a Kind of its own, a bare context.Canceled reaching ToStatus fell through
+	// to the unclassified branch and became codes.Internal -- so a client that cancelled
+	// its own RPC was told the server had broken, and every routine cancellation landed
+	// in the Internal error-rate series. That series is the one worth paging on, and a
+	// permanent floor of client disconnects is how it stops being trusted.
+	KindCanceled
+
+	// KindDeadlineExceeded: the caller's deadline elapsed while we were working.
+	//
+	// Distinct from KindUnavailable because the remedy differs: Unavailable says come
+	// back and retry, DeadlineExceeded says the work did not fit in the time you allowed.
+	// A client that retries the latter unchanged simply times out again.
+	KindDeadlineExceeded
 )
 
 // kindInfo is THE table. Adding a Kind without adding a row here fails
@@ -78,6 +96,13 @@ var kindInfo = map[Kind]struct {
 	KindResourceExhausted:  {codes.ResourceExhausted, http.StatusTooManyRequests, "RESOURCE_EXHAUSTED"},
 	KindUnavailable:        {codes.Unavailable, http.StatusServiceUnavailable, "UNAVAILABLE"},
 	KindInternal:           {codes.Internal, http.StatusInternalServerError, "INTERNAL"},
+
+	// 499 is nginx's "client closed request". It is not in net/http, and it is worth the
+	// oddity: counting a caller hanging up as a 5xx makes this service's own error-rate
+	// alert fire every time somebody closes a tab.
+	KindCanceled: {codes.Canceled, 499, "CANCELED"},
+
+	KindDeadlineExceeded: {codes.DeadlineExceeded, http.StatusGatewayTimeout, "DEADLINE_EXCEEDED"},
 }
 
 // HTTPStatusFromCode maps a gRPC code to an HTTP status using THE SAME TABLE.
@@ -98,18 +123,17 @@ func HTTPStatusFromCode(code codes.Code) int {
 			return info.Status
 		}
 	}
-	// codes.OK and codes.Canceled/DeadlineExceeded have no Kind. 500 is the safe default:
-	// an unmapped code means an error path nobody classified.
+	// Codes with no Kind at all. 500 is the safe default: an unmapped code means an error
+	// path nobody classified.
+	//
+	// Canceled and DeadlineExceeded USED TO LIVE HERE, as a second mapping outside the
+	// table -- and because nothing upstream could produce those codes (ToStatus turned a
+	// bare context error into Internal), the careful 499 and 504 answers below were
+	// unreachable. Two mappings, one of them dead, is exactly what one table exists to
+	// prevent. They are Kinds now.
 	switch code {
 	case codes.OK:
 		return http.StatusOK
-	case codes.Canceled:
-		// 499, nginx's "client closed request". Not in net/http, and worth distinguishing
-		// from a server fault: a cancelled request is the CALLER hanging up, and counting it
-		// as a 5xx makes your own error-rate alert fire every time someone closes a tab.
-		return 499
-	case codes.DeadlineExceeded:
-		return http.StatusGatewayTimeout
 	case codes.Unimplemented:
 		return http.StatusNotImplemented
 	default:
@@ -124,6 +148,7 @@ func AllKinds() []Kind {
 		KindUnknown, KindInvalidArgument, KindFailedPrecondition, KindNotFound,
 		KindAlreadyExists, KindPermissionDenied, KindUnauthenticated,
 		KindResourceExhausted, KindUnavailable, KindInternal,
+		KindCanceled, KindDeadlineExceeded,
 	}
 }
 
@@ -243,7 +268,35 @@ func KindOf(err error) Kind {
 	if ae, ok := From(err); ok {
 		return ae.Kind
 	}
-	return KindInternal
+	kind, _, _ := classify(err)
+	return kind
+}
+
+// classify names a failure that carries no *Error of its own, returning the Kind, the
+// stable Reason, and the Message.
+//
+// EXACTLY TWO sentinels are recognised, and the shortness of that list is deliberate:
+// everything else stays KindInternal, because an unclassified error is a code path nobody
+// thought about and a 500 is the safe direction to be wrong in.
+//
+// context's two sentinels earn their place because they are not failures of this service
+// at all. Before they were here, a handler returning ctx.Err() produced codes.Internal --
+// telling a caller who had just hung up that the server was broken, and burying the real
+// Internal rate under a floor of client disconnects.
+//
+// Both messages below are constants rather than err.Error(): they reach the client (only
+// KindInternal and KindUnknown redact), so they must carry nothing about internal state.
+func classify(err error) (kind Kind, reason, message string) {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return KindCanceled, "CANCELED", "the request was cancelled by the caller"
+	case errors.Is(err, context.DeadlineExceeded):
+		return KindDeadlineExceeded, "DEADLINE_EXCEEDED", "the request deadline elapsed"
+	default:
+		// err.Error() is safe here precisely BECAUSE the Kind redacts: it reaches the log
+		// and never the caller. See ClientMessage.
+		return KindInternal, "INTERNAL", err.Error()
+	}
 }
 
 // ClientMessage is the text safe to return to a caller.

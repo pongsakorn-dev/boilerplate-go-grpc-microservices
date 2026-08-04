@@ -167,3 +167,100 @@ func TestCommentsDoNotCiteMissingTestFunctions(t *testing.T) {
 		}
 	}
 }
+
+// sourcePathRE matches a repo-relative path to a NON-test source file mentioned in prose.
+//
+// Anchored on the repository's real top-level directories so that arbitrary prose
+// containing a slash cannot match, and restricted to extensions this repo actually uses.
+var sourcePathRE = regexp.MustCompile(
+	`\b(?:cmd|internal|proto|deploy|docs|tools|test)/[A-Za-z0-9_./-]+\.(?:go|proto|json|ya?ml|sql|md)\b`)
+
+// TestCommentsDoNotCiteMissingSourceFiles closes the hole the two guards above left open.
+//
+// They check cited TEST files and cited test FUNCTIONS, because the motivating drift was
+// about proofs. But the same comment can cite an ordinary source file just as wrongly, and
+// nothing looked -- which is how proto/order/v1/order.proto came to describe a retry policy
+// living in "internal/platform/client/servicecfg.json", a file that has never existed in
+// this repository at any commit.
+//
+// That citation is instructive about why prose-only claims rot invisibly. It was not a typo
+// for the real file (serviceconfig.go): it named a mechanism that was CUT, in a comment
+// asserting the RPC was idempotent when no handler reads the field. A reader had to open
+// three files to discover the paragraph was fiction, and a reader of the generated client
+// could not discover it at all -- protoc copies .proto comments verbatim into the .pb.go and
+// into the published OpenAPI document.
+//
+// A file path is the one part of a comment a machine can check. Checking it is cheap, and it
+// turns "this comment is out of date" from something a reviewer might notice into something
+// the build says out loud.
+func TestCommentsDoNotCiteMissingSourceFiles(t *testing.T) {
+	t.Parallel()
+
+	root := testutil.RepoRoot(t)
+
+	tracked := map[string]bool{}
+	for _, rel := range testutil.TrackedFiles(t) {
+		tracked[rel] = true
+	}
+	if len(tracked) == 0 {
+		t.Fatal("found no tracked files -- this guard would silently pass forever")
+	}
+
+	type violation struct{ file, cited string }
+	var violations []violation
+
+	for _, rel := range testutil.TrackedFiles(t) {
+		// gen/ is excluded for the same reason as above: a bad citation there is a symptom
+		// of the .proto, which IS checked, and reporting it sends someone to edit generated
+		// code. third_party is not ours to correct.
+		if strings.HasPrefix(rel, "gen/") || strings.HasPrefix(rel, "proto/third_party/") {
+			continue
+		}
+		if rel == selfExcluded {
+			continue
+		}
+		switch filepath.Ext(rel) {
+		case ".go", ".proto", ".yml", ".yaml", ".md":
+		default:
+			continue
+		}
+
+		b, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
+		if err != nil {
+			continue
+		}
+
+		for _, line := range strings.Split(strings.ReplaceAll(string(b), "\r\n", "\n"), "\n") {
+			// Same future-tense allowance as the test-file guard: a promise is not a claim.
+			if strings.Contains(line, " will ") || strings.Contains(line, "when it lands") {
+				continue
+			}
+			for _, cited := range sourcePathRE.FindAllString(line, -1) {
+				// Test files are the other guard's job; reporting them twice would send
+				// someone to fix the same line from two different error messages.
+				if strings.HasSuffix(cited, "_test.go") {
+					continue
+				}
+				if tracked[cited] {
+					continue
+				}
+				violations = append(violations, violation{rel, cited})
+			}
+		}
+	}
+
+	if len(violations) > 0 {
+		sort.Slice(violations, func(i, j int) bool { return violations[i].file < violations[j].file })
+		var b strings.Builder
+		for _, v := range violations {
+			b.WriteString("  " + v.file + " cites " + v.cited + "\n")
+		}
+		t.Errorf("comments cite source files that do not exist:\n%s\n"+
+			"A path is the one part of a comment a machine can verify. When it names a file\n"+
+			"that was never written, the sentence around it is usually describing a mechanism\n"+
+			"that was never built -- which is how this repository came to document an\n"+
+			"idempotency guarantee it had explicitly cut.\n\n"+
+			"Fix each by correcting the path, or by rewriting the claim to match what exists.",
+			b.String())
+	}
+}

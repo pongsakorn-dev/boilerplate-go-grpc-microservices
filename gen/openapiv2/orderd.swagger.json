@@ -231,7 +231,8 @@
           "type": "string"
         },
         "idempotency_key": {
-          "type": "string"
+          "type": "string",
+          "description": "Reserved and validated, not honoured. Same status as CreateOrderRequest's -- the\nreasoning is written there once rather than twice."
         }
       }
     },
@@ -286,7 +287,7 @@
         },
         "idempotency_key": {
           "type": "string",
-          "description": "Optional. When present, the RPC is replayable: sending the same key twice yields\none order and two byte-identical responses. The client retry policy in\ninternal/platform/client/servicecfg.json only retries CreateOrder when this is set,\nbecause retrying a non-idempotent mutation is how a template ships duplicate orders."
+          "description": "Optional. ACCEPTED AND VALIDATED, BUT NOT YET HONOURED -- sending the same key twice\ncreates two orders. Do not build on it until you implement the mechanism.\n\nThe field is reserved here deliberately. Adding it later is wire-compatible but is a\nbreaking change for every client that then has to start sending it, and keeping the\nvalidation rule below means a fork that implements idempotency inherits well-formed\nkeys from day one rather than a mix of UUIDs and free text.\n\nWhat was here before claimed the opposite: that the RPC was replayable, yielding one\norder and two byte-identical responses, per a retry policy in a file it named\nservicecfg.json. No handler has ever read this field, and no such file has ever\nexisted. The real one, internal/platform/client/serviceconfig.go, says plainly that\nthis repository has no idempotency-key mechanism -- which is why retries are enabled\non reads and on no mutation at all.\n\nIdempotency was cut; docs/adr/0002-what-was-cut.md records it as the most\nconsequential of the cuts and names what implementing it costs.\n\nA wrong comment matters more here than almost anywhere else in the repository: protoc\ncopies it verbatim into gen/go/order/v1/order.pb.go and into the published OpenAPI\ndocument, so it reaches people who read a generated client and never open this file."
         }
       }
     },

@@ -279,6 +279,16 @@ code), and above every interceptor that produces an error (so those get mapped a
 `internal/grpcapi/chain_test.go` caught this by asserting outcomes rather than reading the
 list.
 
+**A caller hanging up is not a server fault**, and `apperr` has Kinds for it — `KindCanceled`
+(`codes.Canceled`, HTTP 499) and `KindDeadlineExceeded` (`codes.DeadlineExceeded`, HTTP 504).
+Without them a handler returning `ctx.Err()` fell through to the unclassified branch and
+became `Internal`: the client that had just disconnected was told the server broke, and every
+routine cancellation was counted in the `Internal` error-rate series. That series is the one
+worth paging on, and a permanent floor of closed tabs is how it stops being trusted. The
+give-away that this was always a mistake: `HTTPStatusFromCode` already had a careful arm
+mapping `Canceled` to 499, explaining that exact reasoning — and nothing in the service could
+produce `codes.Canceled`, so the arm could never run.
+
 ---
 
 ## Testing
@@ -329,6 +339,9 @@ merely to pass today:
 | `TestPprofIsOnDefaultServeMuxButWeNeverServeIt` | Profiling endpoints on a public listener |
 | `TestAdmissionReleasesSlotOnPanic` | A panicking handler permanently consuming a slot |
 | `TestCommentsDoNotCiteMissingTests` | A comment claiming a proof that does not exist |
+| `TestCommentsDoNotCiteMissingSourceFiles` | A comment citing a **source** file that was never written — usually a mechanism that was never built |
+| `TestContextErrorsAreNotOurFault` | A client hang-up reported as `Internal`, putting a floor of disconnects under the alert on-call pages on |
+| `TestAnUpstreamErrorCannotBeReturnedByAccident` | An upstream's `NotFound` reaching your caller as if it were about *their* request |
 | `TestVendoredProtosKeepTheirLicenseHeaders` | Apache-2.0 attribution being stripped from vendored protos |
 | `TestRootLicenseNamesItsCopyrightHolder` | The root LICENSE losing its copyright holder to a rename substitution |
 | `TestEveryTenantScopedTableHasAGuardedModel` | A new tenant table whose model forgot `TenantColumn`, so every query silently returns every tenant's rows |
@@ -967,6 +980,14 @@ charged to a real customer, with no error anywhere. This repository ships no ide
 mechanism, so nothing would make a mutation safe to replay — mutations simply have no policy,
 and `TestAMethodWithNoPolicyIsNotRetried` proves the absence means what it should.
 
+`CreateOrderRequest` and `CancelOrderRequest` do carry an `idempotency_key` field. It is
+**reserved and validated, not honoured** — sending the same key twice creates two orders. It is
+present because adding it later, while wire-compatible, forces every client to start sending
+it. Its comment used to claim the opposite, citing a retry policy in a file that has never
+existed; since protoc copies `.proto` comments into the generated Go *and* the published
+OpenAPI document, that claim reached people who never opened the `.proto`. See
+[ADR 0002](docs/adr/0002-what-was-cut.md).
+
 `UNAVAILABLE` is the only retryable code. `RESOURCE_EXHAUSTED` is excluded deliberately: this
 service's own server returns it for three different things, one of which (a deadline that had
 already expired on arrival) can never succeed on a retry — and service config cannot express
@@ -1000,7 +1021,16 @@ your caller concludes *their order* does not exist. They retry with a different 
 the same answer forever.
 
 So an upstream failure arrives as a `*client.Error`, which is **not** a `*status.Error` and
-cannot be returned by accident. The default translation says what is true about *your* service:
+cannot be returned by accident.
+
+That sentence was true of the design and false of the code for most of this repository's life.
+`Unwrap` handed back the upstream's status, and `status.FromError` walks the chain — so the
+type answered as a status after all, and forwarding one leaked the callee's code exactly as
+described above. The cause is now flattened to text: everything from the wire is already in
+`Code`, `Reason`, `Domain`, `Message` and `RetryAfter`, so the status object carried nothing
+but the status-ness that made the leak possible.
+
+The default translation says what is true about *your* service:
 
 | Upstream said | Your caller sees | Why |
 |---|---|---|
