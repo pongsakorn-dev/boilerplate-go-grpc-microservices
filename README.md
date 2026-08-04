@@ -409,6 +409,7 @@ merely to pass today:
 | `TestResourcesAreDeclaredWithNoCPULimit` | A CPU limit causing CFS-throttled p99 latency |
 | `TestAdminPortIsNotInTheService` | pprof reachable by anything in the cluster |
 | `TestNoOverlayPatchesEnvByIndex` | An overlay addressing `env/5` by position, silently retargeting the moment the base reorders |
+| `TestEveryBaseImageIsRetagged` | An overlay pinning one component of a release and leaving the rest on `:latest` |
 | `TestCloseDrainsOutsideIn` | The gateway shutting down *after* the gRPC server it forwards to — 500s on every deploy |
 
 ### The pattern worth stealing: one contract, two implementations
@@ -537,6 +538,15 @@ because memory isn't compressible.
 namespaces, registry, secret manager or ingress. Copying `dev/` is a two-minute job producing
 something true; shipping two directories of guesses produces something that looks
 authoritative and isn't.
+
+**An overlay retags every image or none.** The base declares three — `orderd`, `worker` and
+`prune` — and `dev/` used to list only the first, so the other two rendered with no tag at all
+and Kubernetes resolved them to `:latest`. They are one release: orderd writes the outbox,
+worker drains it, prune deletes from it, and the migrations they share are embedded in the
+binaries. Deploying one at a pinned build and the rest at whatever `latest` is happens to be
+the exact condition a migration breaks under — and it is silent, because all three pods start
+and every probe passes. `TestEveryBaseImageIsRetagged` compares the two directories, so a
+fourth image cannot be added to the base without an overlay entry.
 
 ---
 
