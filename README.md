@@ -215,15 +215,22 @@ graph TD
     B --> D["internal/platform/*<br/><i>cross-cutting</i>"]
     C --> E["internal/order<br/><b>DOMAIN</b>"]
     C --> F["gen/go<br/><i>protobuf</i>"]
-    E -.->|"implemented by"| G["ordermem<br/><i>in-memory</i>"]
-    E -.->|"implemented by"| H["gormstore<br/><i>Postgres — M4</i>"]
+    E -.->|"implemented by"| G["internal/order/ordermem<br/><i>in-memory Store + Atomic</i>"]
+    E -.->|"implemented by"| H["internal/order/orderpg<br/><i>Postgres, via GORM</i>"]
+    E -.->|"implemented by"| I["internal/order/orderproj<br/><i>read model from broker events</i>"]
 
     style E fill:#2d5016,stroke:#4a7c22,color:#fff
-    style H stroke-dasharray: 5 5
 ```
 
 `internal/order` imports only the standard library and `google/uuid`. It has never heard of
 protobuf, gRPC, GORM, or OpenTelemetry.
+
+**This is hexagonal architecture** — ports and adapters — without the vocabulary or the folder
+ceremony. Four conventions that usually travel with it are deliberately absent: no
+`domain`/`application`/`infrastructure` tri-layer, no inbound ports, slicing by domain rather
+than by layer, and `platform/` as cross-cutting mechanism rather than "infrastructure".
+[ADR 0005](docs/adr/0005-ports-and-adapters-without-the-ceremony.md) gives the reasoning for
+each, the two real costs, and the escape seam for a fork that wants the full tri-layer.
 
 **Why this is worth the mapping code in `convert.go`:** it means a proto field rename is a
 change to one file instead of a database migration, and it means the business tests run in
@@ -305,7 +312,21 @@ compile-time guarantee. That is the only way `go test ./...` is safe with Docker
 | Integration | `task verify:int` | Docker | **20s** with the image cached. **Skips**, never fails, without Docker |
 | End-to-end | `task verify:e2e` | Docker + compose | **~140s** — the shipped images and compose file, real SIGTERM, and a second stack running `AUTH_MODE=oidc` against a real Keycloak. **Skips visibly**, never fails, without Docker |
 <!-- fork-tool:begin -->
-| Rename | `task verify:rename` | none | **26s** — renames a copy of this repo, then builds and tests it |
+There is a seventh tier that is not in the table above, because it deletes itself along with
+the tool it covers: `task verify:rename` (no Docker, **26s**) renames a copy of this whole
+repository, then builds and tests the result.
+
+It sits outside the table for a mechanical reason worth knowing if you add another removable
+section. `cmd/rename` strips whatever lies between its two `fork-tool` HTML-comment markers,
+and an HTML comment on its own line is a block-level element — so wrapping a table *row* in
+them terminates the table at the opening marker, and every row after it renders on GitHub as
+a paragraph of literal pipe characters. Which is what this row used to do. Removable content
+therefore lives in its own paragraph, never inside a table.
+
+(The markers are deliberately not spelled out here: `cmd/rename` searches for those exact
+strings, so quoting them in prose invents a marker and the tool fails on an unmatched pair.
+It does — that is how this paragraph was first written.)
+
 <!-- fork-tool:end -->
 
 ### Guard tests
@@ -1425,11 +1446,6 @@ misconfigured deploy into five rollout attempts.
 | `UPSTREAM_RESERVE_FRACTION` | `0.1` | Share of the remaining deadline kept back, so an upstream call fails **inside** your handler |
 | `UPSTREAM_MIN_BUDGET` | `50ms` | Below this a call is refused without dialling. There is no upstream **address** setting — see [Calling another service](#calling-another-service) |
 | `STORE_DRIVER` | `memory` | `memory` \| `postgres`. Postgres needs `POSTGRES_DSN` and a `migrate up` first |
-
-Settings for subsystems that do not exist yet are deliberately
-**absent** rather than present-and-ignored — a config field that reads as wired and is not is
-the same class of problem as a proto field that validates and is then dropped.
-
 | `AUTH_MODE` | `dev` | `dev` \| `oidc`. **Refused when `APP_ENV=production`**; an unknown value refuses to start |
 | `OIDC_ISSUER_URL` | | Required for `oidc`. Discovery finds the JWKS; `http://` is refused off loopback |
 | `OIDC_AUDIENCE` | | Required for `oidc`. **Never defaulted** — an empty audience accepts every token the issuer ever minted, including other applications' |
@@ -1443,6 +1459,10 @@ the same class of problem as a proto field that validates and is then dropped.
 | `GRPC_MAX_CONCURRENT_STREAMS` | `250` | grpc-go's default is effectively unbounded — this is a DoS control |
 | `GRPC_MAX_CONNECTION_AGE` | `30m` | Forces periodic GOAWAY so rolling deploys actually rebalance |
 | `SHUTDOWN_DRAIN_DELAY` | `5s` | Health flips to NOT_SERVING, then waits. Kubernetes deregisters asynchronously, so a pod that stops instantly still gets traffic |
+
+Settings for subsystems that do not exist yet are deliberately
+**absent** rather than present-and-ignored — a config field that reads as wired and is not is
+the same class of problem as a proto field that validates and is then dropped.
 
 Licensed under [Apache-2.0](LICENSE). Secrets use a [`Secret` type](internal/platform/config/config.go) that redacts through
 `String`, `MarshalJSON`, **and** `LogValue` — the three routes by which a password normally
