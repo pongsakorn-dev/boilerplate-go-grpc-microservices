@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -407,5 +408,63 @@ func TestEnvVarReferencesAreDeclaredBeforeUse(t *testing.T) {
 				declared[e.Name] = true
 			}
 		}
+	}
+}
+
+// envIndexPatch matches a JSON-patch path that addresses an env entry by POSITION.
+var envIndexPatch = regexp.MustCompile(`/env/\d+`)
+
+// TestNoOverlayPatchesEnvByIndex forbids the reference that silently retargets.
+//
+// # The bug
+//
+// The dev overlay patched `/spec/template/spec/containers/0/env/5/value` intending AUTH_MODE.
+// env/5 is STORE_DRIVER. So the overlay set STORE_DRIVER=dev -- which config.Validate refuses,
+// the only valid drivers being memory and postgres -- and left AUTH_MODE=oidc untouched. Every
+// orderd pod in the dev overlay failed validation and CrashLoopBackOffed before opening a
+// listener, while the comment beside the patch described the opposite.
+//
+// # Why nothing caught it
+//
+// `kubectl kustomize` renders the wrong patch perfectly happily: the index is in range and the
+// output is valid YAML, so `task verify:deploy` passes. Nothing type-checks a positional
+// reference, and nothing in this repo had ever applied the overlay to a cluster. Adding or
+// reordering ONE env entry in the base silently repoints every index below it -- and this repo
+// reorders env entries for real reasons (POD_IP must precede ADMIN_ADDR; see deployment.yaml).
+//
+// A strategic-merge patch addressing entries by NAME cannot retarget, so this bans the form
+// rather than checking the arithmetic.
+func TestNoOverlayPatchesEnvByIndex(t *testing.T) {
+	t.Parallel()
+
+	var checked int
+
+	err := filepath.WalkDir("overlays", func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || filepath.Ext(path) != ".yaml" {
+			return err
+		}
+		checked++
+
+		b, readErr := os.ReadFile(path)
+		if readErr != nil {
+			t.Fatalf("read %s: %v", path, readErr)
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			if !envIndexPatch.MatchString(line) {
+				continue
+			}
+			t.Errorf("%s addresses an env entry by index:\n\n  %s\n\n"+
+				"A positional reference retargets silently whenever the base's env list is "+
+				"reordered or an entry is inserted above it, and kustomize renders the wrong "+
+				"result without complaint. Patch by name with a strategic merge patch instead.",
+				filepath.ToSlash(path), strings.TrimSpace(line))
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk overlays/: %v", err)
+	}
+	if checked == 0 {
+		t.Fatal("found no overlay YAML; this guard would pass forever")
 	}
 }

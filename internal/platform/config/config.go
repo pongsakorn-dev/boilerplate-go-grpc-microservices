@@ -451,9 +451,10 @@ func ParseFor(env map[string]string, role Role) (Config, error) {
 		ServiceName: p.str("SERVICE_NAME", "orderd"),
 		Version:     p.str("VERSION", "dev"),
 
-		GRPCAddr:    p.str("GRPC_ADDR", ":50051"),
-		AdminAddr:   p.str("ADMIN_ADDR", "127.0.0.1:9090"),
-		GatewayAddr: p.str("GATEWAY_ADDR", ":8080"),
+		GRPCAddr:  p.str("GRPC_ADDR", ":50051"),
+		AdminAddr: p.str("ADMIN_ADDR", "127.0.0.1:9090"),
+		// strOptional, not str: an explicit empty value must survive. See strOptional.
+		GatewayAddr: p.strOptional("GATEWAY_ADDR", ":8080"),
 
 		LogLevel:  p.str("LOG_LEVEL", "info"),
 		LogFormat: p.str("LOG_FORMAT", "json"),
@@ -857,6 +858,26 @@ type parser struct {
 
 func (p *parser) str(key, def string) string {
 	if v, ok := p.env[key]; ok && v != "" {
+		return v
+	}
+	return def
+}
+
+// strOptional distinguishes "set to empty" from "not set", which str deliberately cannot.
+//
+// str treats an empty value as absent and substitutes the default, which is right for almost
+// everything here: an env var accidentally exported as "" should behave as if nobody set it.
+//
+// It is exactly wrong for a setting whose EMPTY VALUE IS A MEANINGFUL CHOICE. GATEWAY_ADDR is
+// the one: its default is ":8080" and the README documents `GATEWAY_ADDR=""` as the way to
+// switch the REST edge off. Through str that was unreachable -- the empty string fell through
+// to ":8080" and the edge bound anyway, so a service meant to speak only gRPC published a full
+// HTTP surface it never intended.
+//
+// The disabled path WAS tested, which is why this survived: the test assigned
+// cfg.GatewayAddr = "" directly on the parsed struct, a path no deployment can take.
+func (p *parser) strOptional(key, def string) string {
+	if v, ok := p.env[key]; ok {
 		return v
 	}
 	return def

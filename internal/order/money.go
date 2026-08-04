@@ -9,11 +9,35 @@ import (
 // NanosPerUnit is the number of nano-units in one whole currency unit.
 const NanosPerUnit = 1_000_000_000
 
-// maxUnits bounds Units so that Units*NanosPerUnit cannot overflow int64.
-// At roughly 9.2 billion whole units this is far past any real order total, but the
-// bound is checked rather than assumed -- silent wraparound in a money type is the
-// exact class of bug this package exists to prevent.
-const maxUnits = (1<<63 - 1) / NanosPerUnit
+// maxUnits bounds Units so that Units*NanosPerUnit + Nanos cannot overflow int64.
+//
+// THE +Nanos IS THE WHOLE POINT, and leaving it out was an off-by-one that silently wrapped.
+//
+// This was (1<<63-1)/NanosPerUnit = 9223372036, with a comment saying it bounded
+// "Units*NanosPerUnit". That bounds the MULTIPLICATION, and the expression it actually guards
+// is totalNanos, which adds Nanos on top:
+//
+//	9223372036 * NanosPerUnit = 9223372036000000000
+//	math.MaxInt64             = 9223372036854775807
+//	headroom left for Nanos   =          854775807
+//	Nanos may legally reach   =          999999999
+//
+// So a Money that Validate had already ACCEPTED -- Units at the bound, Nanos above 854775807 --
+// wrapped to a negative total with no error, and every Add, Sub and Compare involving it was
+// silently wrong. Wraparound in a money type is the exact class of bug this package exists to
+// prevent, which makes getting its own bound wrong the worst place to be off by one.
+//
+// Subtracting NanosPerUnit-1 before dividing reserves room for the largest legal Nanos:
+// 9223372035 * NanosPerUnit + 999999999 = 9223372035999999999, which fits.
+//
+// At roughly 9.2 billion whole units this is still far past any real order total, but the
+// bound is checked rather than assumed.
+const maxUnits = ((1<<63 - 1) - (NanosPerUnit - 1)) / NanosPerUnit
+
+// MaxUnits exposes the bound so a test can construct the largest representable Money without
+// duplicating the arithmetic -- a test that recomputed it would drift with the constant and
+// stop testing the boundary.
+func MaxUnits() int64 { return maxUnits }
 
 var (
 	// ErrCurrencyMismatch is returned when arithmetic mixes two currencies. There is
@@ -202,6 +226,19 @@ func fromTotalNanos(currencyCode string, total int64) (Money, error) {
 		CurrencyCode: currencyCode,
 		Units:        total / NanosPerUnit,
 		Nanos:        int32(total % NanosPerUnit),
+	}
+
+	// THE RESULT IS RANGE-CHECKED, so arithmetic cannot mint a value the constructor would
+	// refuse.
+	//
+	// combine already rejects a sum that overflows int64, but a sum can survive that and still
+	// land one unit above maxUnits -- adding a single nano to the largest representable Money
+	// does exactly that. Without this check Add returns it happily, and the caller holds a
+	// Money that NewMoney would have rejected and that errors on the NEXT operation instead.
+	// Failing here keeps "a Money value in hand is a valid Money value" true, which is the
+	// property every other guard in this file is built on.
+	if m.Units > maxUnits || m.Units < -maxUnits {
+		return Money{}, fmt.Errorf("%w: result units %d", ErrMoneyOverflow, m.Units)
 	}
 	return m, nil
 }

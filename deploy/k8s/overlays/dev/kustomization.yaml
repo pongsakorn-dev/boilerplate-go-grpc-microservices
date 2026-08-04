@@ -47,16 +47,37 @@ patches:
       metadata:
         name: orderd
 
+  # A STRATEGIC MERGE PATCH, addressing env entries BY NAME.
+  #
+  # This was a JSON patch addressing them by index, and the index was wrong: env/5 is
+  # STORE_DRIVER, not AUTH_MODE. So the overlay set STORE_DRIVER=dev -- a value
+  # config.Validate refuses, since the only valid drivers are memory and postgres -- and left
+  # AUTH_MODE=oidc. Every orderd pod in the dev overlay failed validation and CrashLoopBackOffed
+  # before opening a listener, while the comment below claimed the opposite was happening.
+  #
+  # An index into a list is a reference that silently retargets whenever the list is reordered,
+  # and nothing type-checks it: `kubectl kustomize` renders the wrong patch perfectly happily.
+  # Merging by name cannot retarget, which removes the whole class rather than this instance.
+  # env-var ordering in the base is load-bearing for a different reason too -- see the POD_IP
+  # note in deployment.yaml.
   - target:
       kind: Deployment
       name: orderd
     patch: |
-      - op: replace
-        path: /spec/template/spec/containers/0/env/0/value
-        value: development
-      # APP_ENV=development means config.Validate permits AUTH_MODE=dev, so a local cluster
-      # needs no identity provider. The base sets production + oidc; this is the deliberate,
-      # visible relaxation rather than a default that quietly differs.
-      - op: replace
-        path: /spec/template/spec/containers/0/env/5/value
-        value: dev
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: orderd
+      spec:
+        template:
+          spec:
+            containers:
+              - name: orderd
+                env:
+                  - name: APP_ENV
+                    value: development
+                  # APP_ENV=development means config.Validate permits AUTH_MODE=dev, so a local
+                  # cluster needs no identity provider. The base sets production + oidc; this is
+                  # the deliberate, visible relaxation rather than a default that quietly differs.
+                  - name: AUTH_MODE
+                    value: dev
